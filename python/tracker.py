@@ -194,6 +194,34 @@ class Tracker:
         """
         return self.odom.get_final_landmarks()
 
+    def save_state(self) -> bytes:
+        """
+        Serialize the complete mutable odometry tracker state into bytes.
+
+        Together with the construction inputs (rig + config) the checkpoint makes tracking a pure
+        function: a fresh tracker created with the same rig/config and restored with
+        :meth:`load_state` continues exactly where this tracker left off.
+        Supported for Multicamera and RGBD odometry modes. SLAM state is not included.
+        """
+        return self.odom.save_state()
+
+    def load_state(self, data: bytes) -> None:
+        """
+        Restore odometry tracker state from :meth:`save_state` bytes.
+
+        The tracker must have been constructed with the same rig and config as the tracker that
+        produced the buffer; all accumulated odometry state is replaced.
+        """
+        self.odom.load_state(data)
+
+    def save_state_to_file(self, path: str) -> None:
+        """Save the odometry tracker state checkpoint to a file (see :meth:`save_state`)."""
+        self.odom.save_state_to_file(path)
+
+    def load_state_from_file(self, path: str) -> None:
+        """Load an odometry tracker state checkpoint from a file (see :meth:`load_state`)."""
+        self.odom.load_state_from_file(path)
+
     def get_all_slam_poses(self, max_poses_count: int = 0) -> List[PoseStamped]:
         """
         Get all SLAM poses for each frame.

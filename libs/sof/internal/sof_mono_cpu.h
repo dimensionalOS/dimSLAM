@@ -53,6 +53,17 @@ public:
 
   void reset() final;
 
+  void save_state(serial::Writer& w) const final {
+    save_base_state(w);
+    last_keyframe_tracks_.save_state(w);
+    w.write_pod<uint8_t>(static_cast<uint8_t>(last_frame_state_));
+  }
+  void load_state(serial::Reader& r) final {
+    load_base_state(r);
+    last_keyframe_tracks_.load_state(r);
+    last_frame_state_ = static_cast<FrameState>(r.read_pod<uint8_t>());
+  }
+
 private:
   const camera::ICameraModel& intrinsics_;
 

@@ -17,6 +17,8 @@
 
 #include "map/map.h"
 
+#include <map>
+
 #include "common/log.h"
 
 namespace cuvslam::map {
@@ -256,6 +258,154 @@ void UnifiedMap::clear() {
   landmarks_from_keyframe_.clear();
   consecutive_keyframes_.clear();
   keyframes_from_landmark_.clear();
+}
+
+void UnifiedMap::save_state(serial::Writer& w) const {
+  std::scoped_lock lock(map_mutex_, gravity_mutex_);
+  w.write_tag(0x554D4150);  // "UMAP"
+
+  w.write_bool(gravity_.has_value());
+  if (gravity_.has_value()) {
+    w.write_eigen(*gravity_);
+  }
+
+  // Keyframes in deque order; the deque index becomes the keyframe identity in the stream.
+  w.write_size(consecutive_keyframes_.size());
+  Map<KeyframePtr, size_t> kf_index;
+  kf_index.reserve(consecutive_keyframes_.size());
+  for (const KeyframeWithPreint& kf_p : consecutive_keyframes_) {
+    kf_index.emplace(kf_p.keyframe, kf_index.size());
+    w.write_pod<int64_t>(kf_p.keyframe->time_ns());
+    const State state = kf_p.keyframe->get_state();
+    w.write_isometry(state.rig_from_w);
+    w.write_eigen(state.velocity);
+    w.write_eigen(state.acc_bias);
+    w.write_eigen(state.gyro_bias);
+    w.write_bool(kf_p.preintegration != nullptr);
+    if (kf_p.preintegration != nullptr) {
+      kf_p.preintegration->save_state(w);
+    }
+  }
+
+  // Landmark table keyed (and ordered) by track id — one shared Landmark instance per track id.
+  std::map<TrackId, LandmarkPtr> landmark_table;
+  for (const auto& [kf, landmarks] : landmarks_from_keyframe_) {
+    for (const auto& [track_id, lm_obs] : landmarks) {
+      landmark_table.emplace(track_id, lm_obs.landmark);
+    }
+  }
+  w.write_size(landmark_table.size());
+  for (const auto& [track_id, landmark] : landmark_table) {
+    w.write_pod(track_id);
+    const std::optional<Vector3T> pose = landmark->get_pose();
+    w.write_bool(pose.has_value());
+    if (pose.has_value()) {
+      w.write_eigen(*pose);
+    }
+  }
+
+  // Per-keyframe landmark entries, keyframes in deque order, entries sorted by track id.
+  w.write_size(landmarks_from_keyframe_.size());
+  for (const KeyframeWithPreint& kf_p : consecutive_keyframes_) {
+    const auto it = landmarks_from_keyframe_.find(kf_p.keyframe);
+    if (it == landmarks_from_keyframe_.end()) {
+      continue;
+    }
+    w.write_size(kf_index.at(kf_p.keyframe));
+    std::map<TrackId, const LandmarkAndObserv*> sorted_entries;
+    for (const auto& [track_id, lm_obs] : it->second) {
+      sorted_entries.emplace(track_id, &lm_obs);
+    }
+    w.write_size(sorted_entries.size());
+    for (const auto& [track_id, lm_obs] : sorted_entries) {
+      w.write_pod(track_id);
+      w.write_size(lm_obs->observations.size());
+      for (const camera::Observation& obs : lm_obs->observations) {
+        w.write_pod(obs.cam_id);
+        w.write_pod(obs.id);
+        w.write_eigen(obs.xy);
+        w.write_eigen(obs.xy_info);
+      }
+    }
+  }
+}
+
+void UnifiedMap::load_state(serial::Reader& r) {
+  std::scoped_lock lock(map_mutex_, gravity_mutex_);
+  r.expect_tag(0x554D4150, "UnifiedMap");
+
+  gravity_ = std::nullopt;
+  if (r.read_bool()) {
+    Vector3T g;
+    r.read_eigen(g);
+    gravity_ = g;
+  }
+
+  consecutive_keyframes_.clear();
+  landmarks_from_keyframe_.clear();
+  keyframes_from_landmark_.clear();
+
+  const size_t num_keyframes = r.read_size();
+  for (size_t i = 0; i < num_keyframes; ++i) {
+    const int64_t time_ns = r.read_pod<int64_t>();
+    State state;
+    r.read_isometry(state.rig_from_w);
+    r.read_eigen(state.velocity);
+    r.read_eigen(state.acc_bias);
+    r.read_eigen(state.gyro_bias);
+    consecutive_keyframes_.push_back({std::make_shared<KeyFrame>(state, time_ns)});
+    if (r.read_bool()) {
+      auto preint = std::make_shared<IMUPreintegration>();
+      preint->load_state(r);
+      consecutive_keyframes_.back().preintegration = std::move(preint);
+    }
+  }
+
+  Map<TrackId, LandmarkPtr> landmark_table;
+  const size_t num_landmarks = r.read_size();
+  landmark_table.reserve(num_landmarks);
+  for (size_t i = 0; i < num_landmarks; ++i) {
+    const TrackId track_id = r.read_pod<TrackId>();
+    LandmarkPtr landmark;
+    if (r.read_bool()) {
+      Vector3T pose;
+      r.read_eigen(pose);
+      landmark = std::make_shared<Landmark>(track_id, pose);
+    } else {
+      landmark = std::make_shared<Landmark>(track_id);
+    }
+    landmark_table.emplace(track_id, std::move(landmark));
+  }
+
+  const size_t num_kf_entries = r.read_size();
+  for (size_t i = 0; i < num_kf_entries; ++i) {
+    const size_t kf_idx = r.read_size();
+    if (kf_idx >= consecutive_keyframes_.size()) {
+      throw std::runtime_error("cuVSLAM state deserialization: keyframe index out of range");
+    }
+    const KeyframePtr& kf = consecutive_keyframes_[kf_idx].keyframe;
+    auto& landmarks = landmarks_from_keyframe_[kf];
+    const size_t num_entries = r.read_size();
+    for (size_t j = 0; j < num_entries; ++j) {
+      const TrackId track_id = r.read_pod<TrackId>();
+      LandmarkAndObserv& lm_obs = landmarks[track_id];
+      const auto lm_it = landmark_table.find(track_id);
+      if (lm_it == landmark_table.end()) {
+        throw std::runtime_error("cuVSLAM state deserialization: landmark id missing from table");
+      }
+      lm_obs.landmark = lm_it->second;
+      const size_t num_obs = r.read_size();
+      for (size_t k = 0; k < num_obs; ++k) {
+        camera::Observation obs;
+        obs.cam_id = r.read_pod<CameraId>();
+        obs.id = r.read_pod<TrackId>();
+        r.read_eigen(obs.xy);
+        r.read_eigen(obs.xy_info);
+        lm_obs.observations.try_push_back(obs);
+      }
+      keyframes_from_landmark_[track_id].insert(kf);
+    }
+  }
 }
 
 }  // namespace cuvslam::map

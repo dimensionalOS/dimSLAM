@@ -57,6 +57,15 @@ public:
 
   void reset() final;
 
+  void save_state(serial::Writer& w) const final {
+    save_base_state(w);
+    last_keyframe_tracks_.save_state(w);
+  }
+  void load_state(serial::Reader& r) final {
+    load_base_state(r);
+    last_keyframe_tracks_.load_state(r);
+  }
+
 private:
   const size_t max_points_to_track = 1e4;
   const camera::ICameraModel& intrinsics_;

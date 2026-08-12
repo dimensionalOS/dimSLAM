@@ -49,12 +49,16 @@ public:
 
   void reset() final;
 
+  void rebuild_prev_context(CameraId cam_id, const ImageSource& source, const ImageContextPtr& ctx) final;
+
 private:
   std::unordered_map<CameraId,                                            // primary cam id
                      std::unordered_map<CameraId,                         // secondary cam id
                                         std::unique_ptr<IFeatureTracker>  // tracker primary -> secondary
                                         >>
       secondary_from_primary_sof_;
+
+  Settings sof_settings_;
 
   void LaunchTrackingPrimaryToSecondary(CameraId primary_id, CameraId secondary_id, const Sources& curr_sources,
                                         Images& curr_images, const std::vector<camera::Observation>& primary_obs,

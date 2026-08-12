@@ -47,6 +47,15 @@ public:
 
   virtual void reset_keyframe_selector() = 0;
 
+  // Checkpoint support: serialize/restore persistent cross-frame tracking state (keyframe
+  // selector, last-keyframe tracks, per-camera mono SOF state). Per-frame scratch is skipped.
+  virtual void save_state(serial::Writer& w) const = 0;
+  virtual void load_state(serial::Reader& r) = 0;
+
+  // Rebuild the image/gradient pyramids of a restored previous-frame image context so the next
+  // trackNextFrame() call sees the same GPU/CPU pyramid state as before the checkpoint.
+  virtual void rebuild_prev_context(CameraId cam_id, const ImageSource& source, const ImageContextPtr& ctx) = 0;
+
   virtual ~IMultiSOF() = default;
 };
 

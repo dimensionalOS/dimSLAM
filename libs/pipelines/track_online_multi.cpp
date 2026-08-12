@@ -164,4 +164,20 @@ void SolverSfMMulti::exportTracks(const std::vector<camera::Observation>& observ
   }
 }
 
+void SolverSfMMulti::save_state(serial::Writer& w) const {
+  // Quiesce the SBA worker so no in-flight bundle adjustment mutates the map mid-serialization.
+  if (sba_service_) {
+    sba_service_->restart();
+  }
+  w.write_tag(0x53464D4D);  // "SFMM"
+  w.write_isometry(prev_rig_from_world_);
+  w.write_eigen(prev_static_info_exp_);
+}
+
+void SolverSfMMulti::load_state(serial::Reader& r) {
+  r.expect_tag(0x53464D4D, "SolverSfMMulti");
+  r.read_isometry(prev_rig_from_world_);
+  r.read_eigen(prev_static_info_exp_);
+}
+
 }  // namespace cuvslam::pipelines

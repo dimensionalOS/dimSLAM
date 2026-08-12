@@ -17,6 +17,7 @@
 
 #include "sof/sof.h"
 
+#include <atomic>
 #include <string>
 
 #include "sof/klt_tracker.h"
@@ -24,6 +25,19 @@
 #include "sof/st_tracker.h"
 
 namespace cuvslam::sof {
+
+namespace {
+// Global track id counter shared by all trackers in the process. Starts at 1 (0 is reserved).
+// Exposed through accessors so Odometry state serialization can checkpoint and restore it:
+// after a restore, newly allocated track ids must not collide with ids in the restored state.
+std::atomic<TrackId> g_next_raw_track_id{1};
+}  // namespace
+
+TrackId AllocateRawTrackId() { return g_next_raw_track_id++; }
+
+TrackId GetNextRawTrackId() { return g_next_raw_track_id.load(); }
+
+void SetNextRawTrackId(TrackId next_id) { g_next_raw_track_id.store(next_id); }
 
 TrackerType ParseTrackerType(const std::string& name) {
   if (name == "lk") return TrackerType::LK;

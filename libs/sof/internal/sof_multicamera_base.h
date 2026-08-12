@@ -45,6 +45,9 @@ public:
 
   void reset_keyframe_selector() override;
 
+  void save_state(serial::Writer& w) const override;
+  void load_state(serial::Reader& r) override;
+
 protected:
   virtual void LaunchTrackingPrimaryToSecondary(CameraId primary_id, CameraId secondary_id, const Sources& curr_sources,
                                                 Images& curr_images,
@@ -58,6 +61,8 @@ protected:
     std::reference_wrapper<const TracksVector> ref;
   };
   using MulticamTracksVector = std::vector<TracksVectorAndCam>;
+
+  bool is_primary_cam(CameraId cam_id) const;
 
   bool is_keyframe(const MulticamTracksVector& tracks, const int64_t current_timestamp_ns,
                    const odom::KeyFrameSettings& kf_settings);

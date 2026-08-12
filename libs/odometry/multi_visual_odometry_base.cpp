@@ -138,4 +138,69 @@ const std::unique_ptr<IVisualOdometry::VOFrameStat>& MultiVisualOdometryBase::ge
   return last_frame_stat_;
 }
 
+void MultiVisualOdometryBase::save_state(serial::Writer& w) {
+  w.write_tag(0x4D564F42);     // "MVOB"
+  get_solver().save_state(w);  // quiesces async SBA before the map is serialized
+  prediction_model_.save_state(w);
+  w.write_isometry(prev_world_from_rig_);
+  map_.save_state(w);
+  feature_tracker_->save_state(w);
+
+  const bool has_stat = last_frame_stat_ != nullptr;
+  w.write_bool(has_stat);
+  if (has_stat) {
+    w.write_bool(last_frame_stat_->keyframe);
+    w.write_bool(last_frame_stat_->heating);
+    w.write_size(last_frame_stat_->tracks2d.size());
+    for (const Track2D& t : last_frame_stat_->tracks2d) {
+      w.write_pod(t.cam_id);
+      w.write_pod(t.track_id);
+      w.write_eigen(t.uv);
+    }
+    w.write_size(last_frame_stat_->tracks3d.size());
+    for (const auto& [track_id, point] : last_frame_stat_->tracks3d) {
+      w.write_pod(track_id);
+      w.write_eigen(point);
+    }
+  }
+}
+
+void MultiVisualOdometryBase::load_state(serial::Reader& r) {
+  r.expect_tag(0x4D564F42, "MultiVisualOdometryBase");
+  get_solver().load_state(r);
+  prediction_model_.load_state(r);
+  r.read_isometry(prev_world_from_rig_);
+  map_.load_state(r);
+  feature_tracker_->load_state(r);
+
+  const bool has_stat = r.read_bool();
+  last_frame_stat_ = has_stat ? std::make_unique<VOFrameStat>() : nullptr;
+  if (has_stat) {
+    last_frame_stat_->keyframe = r.read_bool();
+    last_frame_stat_->heating = r.read_bool();
+    const size_t num_tracks2d = r.read_size();
+    last_frame_stat_->tracks2d.reserve(num_tracks2d);
+    for (size_t i = 0; i < num_tracks2d; ++i) {
+      Track2D t;
+      t.cam_id = r.read_pod<CameraId>();
+      t.track_id = r.read_pod<TrackId>();
+      r.read_eigen(t.uv);
+      last_frame_stat_->tracks2d.push_back(t);
+    }
+    const size_t num_tracks3d = r.read_size();
+    for (size_t i = 0; i < num_tracks3d; ++i) {
+      const TrackId track_id = r.read_pod<TrackId>();
+      Vector3T point;
+      r.read_eigen(point);
+      last_frame_stat_->tracks3d.emplace(track_id, point);
+    }
+  }
+}
+
+void MultiVisualOdometryBase::rebuild_prev_context(CameraId cam_id, const ImageSource& source,
+                                                   const ImageSource* /*depth_source*/,
+                                                   const sof::ImageContextPtr& ctx) {
+  feature_tracker_->rebuild_prev_context(cam_id, source, ctx);
+}
+
 }  // namespace cuvslam::odom

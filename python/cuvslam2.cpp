@@ -45,7 +45,7 @@ namespace cuvslam {
 namespace {
 
 template <typename T, typename ElementType, size_t N>
-auto bind_array_accessors(nb::class_<T>& cls, const char* name, std::array<ElementType, N> T::*member,
+auto bind_array_accessors(nb::class_<T>& cls, const char* name, std::array<ElementType, N> T::* member,
                           const char* doc = "") {
   return cls.def_prop_rw(
       name,
@@ -734,6 +734,33 @@ NB_MODULE(pycuvslam, m) {
           "Get all final landmarks from all frames.\n\n"
           "Landmarks are 3D points in the odometry start frame.\n"
           "Requires `enable_final_landmarks_export=True` in :class:`Odometry.Config`.")
+      .def(
+          "save_state",
+          [](const Odometry& self) -> nb::bytes {
+            const std::vector<uint8_t> data = self.SaveState();
+            return nb::bytes(reinterpret_cast<const char*>(data.data()), data.size());
+          },
+          "Serialize the complete mutable tracker state into bytes.\n\n"
+          "Together with the construction inputs (rig + config) the returned checkpoint makes\n"
+          "tracking a pure function: a fresh tracker created with the same rig/config and restored\n"
+          "with :meth:`load_state` continues exactly where this tracker left off.\n"
+          "Supported for Multicamera and RGBD odometry modes.")
+      .def(
+          "load_state",
+          [](Odometry& self, const nb::bytes& data) {
+            const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data.c_str());
+            self.LoadState(std::vector<uint8_t>(ptr, ptr + data.size()));
+          },
+          nb::arg("data"),
+          "Restore tracker state from :meth:`save_state` bytes.\n\n"
+          "The tracker must have been constructed with the same rig and config as the tracker that\n"
+          "produced the buffer; all accumulated state is replaced.")
+      .def(
+          "save_state_to_file", [](const Odometry& self, const char* path) { self.SaveStateToFile(path); },
+          nb::arg("path"), "Save the tracker state checkpoint to a file (see :meth:`save_state`).")
+      .def(
+          "load_state_from_file", [](Odometry& self, const char* path) { self.LoadStateFromFile(path); },
+          nb::arg("path"), "Load a tracker state checkpoint from a file (see :meth:`load_state`).")
       .def(
           "get_state",
           [](const Odometry& self) -> Odometry::State {

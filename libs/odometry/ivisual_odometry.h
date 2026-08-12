@@ -20,6 +20,7 @@
 #include <memory>
 
 #include "common/isometry.h"
+#include "common/state_serial.h"
 #include "common/types.h"
 #include "common/vector_2t.h"
 #include "common/vector_3t.h"
@@ -54,6 +55,22 @@ public:
 
   virtual void enable_stat(bool enable) = 0;
   virtual const std::unique_ptr<VOFrameStat>& get_last_stat() const = 0;
+
+  // Checkpoint support. save_state() quiesces asynchronous work (SBA) before serializing, hence
+  // non-const. Default implementations throw for odometry modes without checkpoint support yet.
+  virtual void save_state(serial::Writer& /*w*/) {
+    throw std::runtime_error("cuVSLAM: state serialization is not implemented for this odometry mode");
+  }
+  virtual void load_state(serial::Reader& /*r*/) {
+    throw std::runtime_error("cuVSLAM: state deserialization is not implemented for this odometry mode");
+  }
+
+  // Rebuild the pyramids of a restored previous-frame image context so the next track() call sees
+  // the same state as before the checkpoint. Optional depth source is used by RGBD odometry.
+  virtual void rebuild_prev_context(CameraId /*cam_id*/, const ImageSource& /*source*/,
+                                    const ImageSource* /*depth_source*/, const sof::ImageContextPtr& /*ctx*/) {
+    throw std::runtime_error("cuVSLAM: context rebuild is not implemented for this odometry mode");
+  }
 };
 
 }  // namespace cuvslam::odom

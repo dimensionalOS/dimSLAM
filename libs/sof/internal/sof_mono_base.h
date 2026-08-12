@@ -45,6 +45,20 @@ protected:
   void KillTracksWithinMask();
   bool SelectKeyframe(const MonoSOFFrameSettings& frame_settings);
 
+  void save_base_state(serial::Writer& w) const {
+    w.write_tag(0x4D4F4E4F);  // "MONO"
+    w.write_pod(cam_id_);
+    tracks_.save_state(w);
+  }
+  void load_base_state(serial::Reader& r) {
+    r.expect_tag(0x4D4F4E4F, "MonoSOFBase");
+    const CameraId saved_cam_id = r.read_pod<CameraId>();
+    if (saved_cam_id != cam_id_) {
+      throw std::runtime_error("cuVSLAM state deserialization: mono SOF camera id mismatch");
+    }
+    tracks_.load_state(r);
+  }
+
   // internal state
   TracksVector tracks_;  // current tracks
 

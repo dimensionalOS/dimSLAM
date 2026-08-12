@@ -19,6 +19,8 @@
 
 #include <cstdint>
 #include <deque>
+
+#include "common/state_serial.h"
 #include "odometry/ipredictor.h"
 
 namespace cuvslam::odom {
@@ -46,6 +48,34 @@ public:
   int64_t last_timestamp_ns() const;
 
   bool predict(int64_t prev_timestamp, int64_t current_timestamp, Isometry3T& delta) const override final;
+
+  void save_state(serial::Writer& w) const {
+    w.write_tag(0x50505244);  // "PPRD"
+    w.write_size(poses_.size());
+    for (const Isometry3T& pose : poses_) {
+      w.write_isometry(pose);
+    }
+    w.write_size(timestamps_ns_.size());
+    for (const int64_t t : timestamps_ns_) {
+      w.write_pod(t);
+    }
+  }
+
+  void load_state(serial::Reader& r) {
+    r.expect_tag(0x50505244, "PosePredictionModel");
+    poses_.clear();
+    const size_t num_poses = r.read_size();
+    for (size_t i = 0; i < num_poses; ++i) {
+      Isometry3T pose;
+      r.read_isometry(pose);
+      poses_.push_back(pose);
+    }
+    timestamps_ns_.clear();
+    const size_t num_ts = r.read_size();
+    for (size_t i = 0; i < num_ts; ++i) {
+      timestamps_ns_.push_back(r.read_pod<int64_t>());
+    }
+  }
 
 private:
   std::deque<Isometry3T> poses_;

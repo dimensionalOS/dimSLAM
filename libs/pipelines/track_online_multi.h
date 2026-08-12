@@ -51,6 +51,9 @@ public:
 
   void reset() final;
 
+  void save_state(serial::Writer& w) const final;
+  void load_state(serial::Reader& r) final;
+
 private:
   // rigIsometry * rigFromCamera_[0] = cam0World;
   // rigIsometry * rigFromCamera_[1] = cam1World;

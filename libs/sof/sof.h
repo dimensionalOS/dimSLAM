@@ -23,6 +23,7 @@
 
 #include "camera/camera.h"
 #include "camera/observation.h"
+#include "common/state_serial.h"
 #include "common/types.h"
 #include "common/unaligned_types.h"
 
@@ -34,6 +35,13 @@ TrackerType ParseTrackerType(const std::string& name);
 
 class IFeatureTracker;
 std::unique_ptr<IFeatureTracker> CreateTracker(TrackerType type);
+
+// Global track id counter accessors. The raw id does not include the camera bits that
+// TracksVector::newTrackId() ORs on top. Used by Odometry state serialization to checkpoint and
+// restore the counter so that ids allocated after a restore do not collide with restored state.
+TrackId AllocateRawTrackId();
+TrackId GetNextRawTrackId();
+void SetNextRawTrackId(TrackId next_id);
 
 // keep track position in uv space (in float pixels')
 class Track {
@@ -77,6 +85,25 @@ public:
     return true;
   }
   bool dead() const { return age_ == 0; }
+
+  void save_state(serial::Writer& w) const {
+    w.write_pod(cam_id_);
+    w.write_pod(id_);
+    w.write_eigen(position_);
+    w.write_eigen(info_);
+    w.write_pod<uint64_t>(age_);
+  }
+
+  static Track load_state(serial::Reader& r) {
+    const CameraId cam_id = r.read_pod<CameraId>();
+    const TrackId id = r.read_pod<TrackId>();
+    Vector2T position;
+    r.read_eigen(position);
+    Track t(cam_id, id, position);
+    r.read_eigen(t.info_);
+    t.age_ = static_cast<size_t>(r.read_pod<uint64_t>());
+    return t;
+  }
 
 private:
   Track() = delete;
@@ -150,11 +177,29 @@ public:
     num_alive_ = 0;
   }
 
+  void save_state(serial::Writer& w) const {
+    w.write_tag(0x54524B56);  // "TRKV"
+    w.write_size(tracks_.size());
+    for (const Track& t : tracks_) {
+      t.save_state(w);
+    }
+    w.write_pod<uint64_t>(num_alive_);
+  }
+
+  void load_state(serial::Reader& r) {
+    r.expect_tag(0x54524B56, "TracksVector");
+    const size_t size = r.read_size();
+    tracks_.clear();
+    tracks_.reserve(size);
+    for (size_t i = 0; i < size; ++i) {
+      tracks_.push_back(Track::load_state(r));
+    }
+    num_alive_ = static_cast<size_t>(r.read_pod<uint64_t>());
+  }
+
 private:
   TrackId newTrackId(CameraId cam_id) const {
-    const size_t start_track_id = 1;
-    static std::atomic<TrackId> id(start_track_id);
-    TrackId id_with_cam = id++;
+    TrackId id_with_cam = AllocateRawTrackId();
 
     // top 8 bits contain camera id, the rest is for track id.
     id_with_cam = id_with_cam | (TrackId)(cam_id) << 8 * (sizeof(TrackId) - sizeof(CameraId));

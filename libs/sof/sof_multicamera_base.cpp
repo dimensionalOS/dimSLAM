@@ -17,6 +17,10 @@
 
 #include "sof/internal/sof_multicamera_base.h"
 
+#include <algorithm>
+#include <stdexcept>
+#include <vector>
+
 namespace cuvslam::sof {
 
 MultiSOFBase::MultiSOFBase(const camera::Rig& rig, const camera::FrustumIntersectionGraph& fid,
@@ -153,6 +157,60 @@ bool MultiSOFBase::is_keyframe(const MulticamTracksVector& tracks, const int64_t
     return true;
   }
   return false;
+}
+
+bool MultiSOFBase::is_primary_cam(CameraId cam_id) const {
+  for (const auto& mono : mono_sof_) {
+    if (mono->camera_id() == cam_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void MultiSOFBase::save_state(serial::Writer& w) const {
+  w.write_tag(0x4D534F46);  // "MSOF"
+  kf_selector_.save_state(w);
+  w.write_pod<int64_t>(last_kf_timestamp_);
+
+  // Camera ids are written sorted so the byte stream is deterministic.
+  std::vector<CameraId> cam_ids;
+  cam_ids.reserve(last_kf_tracks_.size());
+  for (const auto& [cam_id, tracks] : last_kf_tracks_) {
+    cam_ids.push_back(cam_id);
+  }
+  std::sort(cam_ids.begin(), cam_ids.end());
+  w.write_size(cam_ids.size());
+  for (const CameraId cam_id : cam_ids) {
+    w.write_pod(cam_id);
+    last_kf_tracks_.at(cam_id).save_state(w);
+  }
+
+  w.write_size(mono_sof_.size());
+  for (const auto& mono : mono_sof_) {
+    mono->save_state(w);
+  }
+}
+
+void MultiSOFBase::load_state(serial::Reader& r) {
+  r.expect_tag(0x4D534F46, "MultiSOFBase");
+  kf_selector_.load_state(r);
+  last_kf_timestamp_ = r.read_pod<int64_t>();
+
+  last_kf_tracks_.clear();
+  const size_t num_cams = r.read_size();
+  for (size_t i = 0; i < num_cams; ++i) {
+    const CameraId cam_id = r.read_pod<CameraId>();
+    last_kf_tracks_[cam_id].load_state(r);
+  }
+
+  const size_t num_mono = r.read_size();
+  if (num_mono != mono_sof_.size()) {
+    throw std::runtime_error("cuVSLAM state deserialization: mono SOF count mismatch");
+  }
+  for (const auto& mono : mono_sof_) {
+    mono->load_state(r);
+  }
 }
 
 }  // namespace cuvslam::sof

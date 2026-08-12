@@ -60,6 +60,11 @@ public:
   virtual void reset() = 0;
 
   virtual CameraId camera_id() const = 0;
+
+  // Checkpoint support: serialize/restore the persistent cross-frame tracking state
+  // (alive tracks, last-keyframe tracks). Per-frame scratch is not serialized.
+  virtual void save_state(serial::Writer& w) const = 0;
+  virtual void load_state(serial::Reader& r) = 0;
 };
 
 }  // namespace cuvslam::sof

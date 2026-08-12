@@ -36,6 +36,9 @@ public:
               const TracksVector& last_kf_tracks, const int64_t last_kf_timestamp,
               const odom::KeyFrameSettings& kf_settings);
 
+  void save_state(serial::Writer& w) const { w.write_bool(first_kf_selected_); }
+  void load_state(serial::Reader& r) { first_kf_selected_ = r.read_bool(); }
+
 private:
   bool first_kf_selected_ = false;
 

@@ -49,6 +49,13 @@ public:
   virtual bool do_predict(PredictorRef predictor, int64_t timestamp, Isometry3T& sof_prediction) = 0;
   virtual pipelines::ISFMSolver& get_solver() = 0;
 
+  void save_state(serial::Writer& w) override;
+  void load_state(serial::Reader& r) override;
+
+  // Rebuild pyramids of a restored previous-frame image context (delegates to the feature tracker).
+  void rebuild_prev_context(CameraId cam_id, const ImageSource& source, const ImageSource* depth_source,
+                            const sof::ImageContextPtr& ctx) override;
+
 protected:
   void reset();
   camera::Rig rig_;

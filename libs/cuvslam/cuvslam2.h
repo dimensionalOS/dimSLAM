@@ -674,6 +674,45 @@ public:
   void GetState(State& state) const;
 
   /**
+   * @brief Serialize the complete mutable tracker state into a byte buffer.
+   *
+   * The returned checkpoint captures everything the tracker has accumulated since construction:
+   * feature tracks, keyframe/landmark map, pose prediction history, previous-frame images, pose and
+   * frame counters, and the global track id counter. Together with the construction inputs
+   * (Rig + Config) it makes tracking a pure function: a fresh tracker constructed with the same
+   * Rig/Config and restored with LoadState() continues exactly where this tracker left off.
+   *
+   * Asynchronous SBA work is drained before serialization, so the checkpoint is self-consistent.
+   * Not to be confused with GetState()/State, which export per-frame results.
+   *
+   * @note Supported for Multicamera and RGBD odometry modes. Inertial/Multisensor/Mono modes throw.
+   * @note Must not be called concurrently with Track()/RegisterImuMeasurement().
+   * @return serialized state bytes
+   * @throws std::runtime_error if the odometry mode does not support state serialization
+   */
+  std::vector<uint8_t> SaveState() const;
+
+  /**
+   * @brief Restore tracker state from a SaveState() buffer.
+   *
+   * The tracker must have been constructed with the same Rig and Config as the tracker that
+   * produced the buffer (verified; mismatch throws). All accumulated state in this tracker is
+   * replaced. After the call, Track() continues from the checkpointed frame: feed it the frames
+   * that followed the checkpoint and it produces the same poses as an uninterrupted run.
+   *
+   * @param[in] data buffer produced by SaveState()
+   * @throws std::invalid_argument if the buffer does not match this tracker's Rig/Config
+   * @throws std::runtime_error if the buffer is corrupt or from an unsupported version
+   */
+  void LoadState(const std::vector<uint8_t>& data);
+
+  /// @brief SaveState() convenience wrapper writing the checkpoint to a file.
+  void SaveStateToFile(const std::string_view& path) const;
+
+  /// @brief LoadState() convenience wrapper reading the checkpoint from a file.
+  void LoadStateFromFile(const std::string_view& path);
+
+  /**
    * @brief Get all final landmarks from all frames
    *
    * Landmarks are 3D points in the odometry start frame.

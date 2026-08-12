@@ -27,7 +27,7 @@ namespace cuvslam::sof {
 MultiSOFCPU::MultiSOFCPU(const camera::Rig& rig, const camera::FrustumIntersectionGraph& fid,
                          sof::FeaturePredictorPtr feature_predictor, const Settings& sof_settings,
                          const odom::KeyFrameSettings& keyframe_settings)
-    : MultiSOFBase(rig, fid, sof_settings, keyframe_settings) {
+    : MultiSOFBase(rig, fid, sof_settings, keyframe_settings), sof_settings_(sof_settings) {
   const auto& primary_cams = fid_.primary_cameras();
 
   for (CameraId primary_cam_id : primary_cams) {
@@ -112,6 +112,17 @@ void MultiSOFCPU::reset() {
   }
 
   reset_keyframe_selector();
+}
+
+void MultiSOFCPU::rebuild_prev_context(CameraId cam_id, const ImageSource& source, const ImageContextPtr& ctx) {
+  // See MultiSOFGPU::rebuild_prev_context. On CPU the stereo path derives the gradient direction
+  // from the configured left-right tracker type.
+  ctx->build_cpu_image_pyramid(source, sof_settings_.box3_prefilter);
+  bool horizontal = false;
+  if (!is_primary_cam(cam_id)) {
+    horizontal = CreateTracker(sof_settings_.lr_tracker)->isHorizontal();
+  }
+  ctx->build_cpu_gradient_pyramid(horizontal);
 }
 
 }  // namespace cuvslam::sof

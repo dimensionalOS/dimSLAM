@@ -21,8 +21,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -371,6 +374,184 @@ void SetVerbosity(int verbosity) {
 
 void WarmUpGPU() { WarmUpGpuImpl(); }
 
+namespace {
+
+constexpr uint32_t kStateMagic = 0x43564B50;  // "CVKP"
+constexpr uint32_t kStateVersion = 1;
+
+}  // namespace
+
+// Host copy of one raw input image, captured at Track() time for checkpointing. Internal to this
+// translation unit (referenced by Odometry::Impl).
+struct SavedInputImage {
+  uint32_t camera_index{0};
+  FrameId frame_id{0};
+  int64_t timestamp_ns{0};
+  int32_t width{0};
+  int32_t height{0};
+  uint8_t encoding{0};         // ImageData::Encoding
+  uint8_t data_type{0};        // ImageData::DataType
+  std::vector<uint8_t> bytes;  // tightly packed rows
+};
+
+namespace {
+
+size_t ImageBytesPerPixel(uint8_t encoding, uint8_t data_type) {
+  const size_t channels = (static_cast<ImageData::Encoding>(encoding) == ImageData::Encoding::RGB) ? 3 : 1;
+  switch (static_cast<ImageData::DataType>(data_type)) {
+    case ImageData::DataType::UINT8:
+      return channels;
+    case ImageData::DataType::UINT16:
+      return channels * 2;
+    case ImageData::DataType::FLOAT32:
+      return channels * 4;
+  }
+  throw std::invalid_argument{"Unsupported image data type"};
+}
+
+// Canonical byte encoding of the construction inputs. Written into every checkpoint; LoadState()
+// refuses buffers whose fingerprint differs from the tracker it is called on.
+std::vector<uint8_t> ComputeStateFingerprint(const Rig& rig, const Odometry::Config& cfg) {
+  serial::Writer w;
+  w.write_pod<uint8_t>(static_cast<uint8_t>(cfg.multicam_mode));
+  w.write_pod<uint8_t>(static_cast<uint8_t>(cfg.odometry_mode));
+  w.write_bool(cfg.use_gpu);
+  w.write_bool(cfg.async_sba);
+  w.write_bool(cfg.use_motion_model);
+  w.write_bool(cfg.use_denoising);
+  w.write_bool(cfg.rectified_stereo_camera);
+  w.write_bool(cfg.enable_observations_export);
+  w.write_bool(cfg.enable_landmarks_export);
+  w.write_bool(cfg.enable_final_landmarks_export);
+  w.write_pod<float>(cfg.max_frame_delta_s);
+  w.write_pod<float>(cfg.rgbd_settings.depth_scale_factor);
+  w.write_pod<int32_t>(cfg.rgbd_settings.depth_camera_id);
+  w.write_bool(cfg.rgbd_settings.enable_depth_stereo_tracking);
+  w.write_pod_vector(cfg.multisensor_settings.depth_camera_ids);
+  w.write_pod<float>(cfg.multisensor_settings.depth_scale_factor);
+  w.write_bool(cfg.multisensor_settings.enable_depth_stereo_tracking);
+
+  w.write_size(rig.cameras.size());
+  for (const Camera& cam : rig.cameras) {
+    w.write_pod<int32_t>(cam.size[0]);
+    w.write_pod<int32_t>(cam.size[1]);
+    w.write_pod<float>(cam.principal[0]);
+    w.write_pod<float>(cam.principal[1]);
+    w.write_pod<float>(cam.focal[0]);
+    w.write_pod<float>(cam.focal[1]);
+    for (const float v : cam.rig_from_camera.rotation) {
+      w.write_pod<float>(v);
+    }
+    for (const float v : cam.rig_from_camera.translation) {
+      w.write_pod<float>(v);
+    }
+    w.write_pod<uint8_t>(static_cast<uint8_t>(cam.distortion.model));
+    w.write_pod_vector(cam.distortion.parameters);
+    w.write_pod<int32_t>(cam.border_top);
+    w.write_pod<int32_t>(cam.border_bottom);
+    w.write_pod<int32_t>(cam.border_left);
+    w.write_pod<int32_t>(cam.border_right);
+  }
+  w.write_size(rig.imus.size());
+  for (const ImuCalibration& imu : rig.imus) {
+    for (const float v : imu.rig_from_imu.rotation) {
+      w.write_pod<float>(v);
+    }
+    for (const float v : imu.rig_from_imu.translation) {
+      w.write_pod<float>(v);
+    }
+    w.write_pod<float>(imu.gyroscope_noise_density);
+    w.write_pod<float>(imu.gyroscope_random_walk);
+    w.write_pod<float>(imu.accelerometer_noise_density);
+    w.write_pod<float>(imu.accelerometer_random_walk);
+    w.write_pod<float>(imu.frequency);
+  }
+  return w.take_buffer();
+}
+
+void SaveInputImage(const Image& image, FrameId frame_id, std::optional<SavedInputImage>& out) {
+  SavedInputImage saved;
+  saved.camera_index = image.camera_index;
+  saved.frame_id = frame_id;
+  saved.timestamp_ns = image.timestamp_ns;
+  saved.width = image.width;
+  saved.height = image.height;
+  saved.encoding = static_cast<uint8_t>(image.encoding);
+  saved.data_type = static_cast<uint8_t>(image.data_type);
+  const size_t row_bytes = static_cast<size_t>(image.width) * ImageBytesPerPixel(saved.encoding, saved.data_type);
+  saved.bytes.resize(row_bytes * static_cast<size_t>(image.height));
+  if (image.is_gpu_mem) {
+#ifdef USE_CUDA
+    const size_t src_pitch = image.pitch > 0 ? static_cast<size_t>(image.pitch) : row_bytes;
+    CUDA_CHECK(cudaMemcpy2D(saved.bytes.data(), row_bytes, image.pixels, src_pitch, row_bytes,
+                            static_cast<size_t>(image.height), cudaMemcpyDeviceToHost));
+#else
+    throw std::runtime_error{"cuVSLAM: cannot capture GPU input image for state serialization without CUDA"};
+#endif
+  } else {
+    std::memcpy(saved.bytes.data(), image.pixels, saved.bytes.size());
+  }
+  out = std::move(saved);
+}
+
+void WriteSavedImage(serial::Writer& w, const std::optional<SavedInputImage>& saved) {
+  w.write_bool(saved.has_value());
+  if (saved.has_value()) {
+    w.write_pod<uint32_t>(saved->camera_index);
+    w.write_pod<FrameId>(saved->frame_id);
+    w.write_pod<int64_t>(saved->timestamp_ns);
+    w.write_pod<int32_t>(saved->width);
+    w.write_pod<int32_t>(saved->height);
+    w.write_pod<uint8_t>(saved->encoding);
+    w.write_pod<uint8_t>(saved->data_type);
+    w.write_pod_vector(saved->bytes);
+  }
+}
+
+void ReadSavedImage(serial::Reader& r, std::optional<SavedInputImage>& out) {
+  out.reset();
+  if (r.read_bool()) {
+    SavedInputImage saved;
+    saved.camera_index = r.read_pod<uint32_t>();
+    saved.frame_id = r.read_pod<FrameId>();
+    saved.timestamp_ns = r.read_pod<int64_t>();
+    saved.width = r.read_pod<int32_t>();
+    saved.height = r.read_pod<int32_t>();
+    saved.encoding = r.read_pod<uint8_t>();
+    saved.data_type = r.read_pod<uint8_t>();
+    saved.bytes = r.read_pod_vector<uint8_t>();
+    const size_t expected =
+        static_cast<size_t>(saved.width) * ImageBytesPerPixel(saved.encoding, saved.data_type) * saved.height;
+    if (saved.bytes.size() != expected) {
+      throw std::runtime_error{"cuVSLAM state deserialization: image byte size mismatch"};
+    }
+    out = std::move(saved);
+  }
+}
+
+ImageSource MakeImageSourceFromSaved(const SavedInputImage& saved) {
+  ImageSource source;
+  switch (static_cast<ImageData::DataType>(saved.data_type)) {
+    case ImageData::DataType::UINT8:
+      source.type = ImageSource::U8;
+      break;
+    case ImageData::DataType::UINT16:
+      source.type = ImageSource::U16;
+      break;
+    case ImageData::DataType::FLOAT32:
+      source.type = ImageSource::F32;
+      break;
+  }
+  source.memory_type = ImageSource::Host;
+  source.data = const_cast<uint8_t*>(saved.bytes.data());
+  source.pitch =
+      static_cast<int>(static_cast<size_t>(saved.width) * ImageBytesPerPixel(saved.encoding, saved.data_type));
+  source.image_encoding = ToImageEncoding(static_cast<ImageData::Encoding>(saved.encoding));
+  return source;
+}
+
+}  // namespace
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Odometry class implementation
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -411,6 +592,12 @@ public:
   // stats
   bool enable_final_landmarks_export{false};
   std::unordered_map<uint64_t, Vector3f> final_landmarks;
+  // state serialization (SaveState/LoadState): host copies of the most recent input image (and
+  // depth) per camera, kept in lock-step with prev_image_ptrs so LoadState() can rebuild the
+  // previous-frame pyramids.
+  std::vector<std::optional<SavedInputImage>> prev_raw_images;
+  std::vector<std::optional<SavedInputImage>> prev_raw_depths;
+  std::vector<uint8_t> state_fingerprint;  // canonical Rig+Config bytes, computed at construction
 
   // data helpers
 
@@ -613,6 +800,8 @@ Odometry::Odometry(const Rig& rig, const Config& cfg) {
   ImageShape shape{rig.cameras[0].size[0], rig.cameras[0].size[1]};
   tracker->image_manager->init(shape, num_no_depth_cams * cache_size, cfg.use_gpu, num_depth_cams * cache_size);
 
+  tracker->state_fingerprint = ComputeStateFingerprint(rig, cfg);
+
   impl = std::move(tracker);
 
   DumpConfiguration(impl->debug_dump_directory, rig, cfg);
@@ -672,6 +861,10 @@ PoseEstimate Odometry::Track(const ImageSet& images, const ImageSet& masks, cons
   cuvslam_images_ptrs.assign(num_cameras, nullptr);
   if (impl->prev_image_ptrs.size() != num_cameras) {
     impl->prev_image_ptrs.assign(num_cameras, nullptr);
+  }
+  if (impl->prev_raw_images.size() != num_cameras) {
+    impl->prev_raw_images.assign(num_cameras, std::nullopt);
+    impl->prev_raw_depths.assign(num_cameras, std::nullopt);
   }
   impl->image_contexts.clear();
 
@@ -737,6 +930,24 @@ PoseEstimate Odometry::Track(const ImageSet& images, const ImageSet& masks, cons
     ptr->set_image_meta(meta);
     cuvslam_images_ptrs[cam_id] = ptr;
     impl->image_contexts.insert({cam_id, std::static_pointer_cast<Odometry::State::Context>(ptr)});
+
+    // Keep a host copy of this frame's raw inputs for state serialization; it becomes the
+    // "previous frame" that LoadState() rebuilds pyramids from.
+    SaveInputImage(image, frame_id, impl->prev_raw_images[cam_id]);
+    if (is_rgbd) {
+      const Image* depth_image = nullptr;
+      for (const auto& depth : depths) {
+        if (depth.camera_index == cam_id) {
+          depth_image = &depth;
+          break;
+        }
+      }
+      if (depth_image != nullptr) {
+        SaveInputImage(*depth_image, frame_id, impl->prev_raw_depths[cam_id]);
+      }
+    } else {
+      impl->prev_raw_depths[cam_id].reset();
+    }
   }
 
   Matrix6T static_info_exp = Matrix6T::Identity();
@@ -781,6 +992,151 @@ PoseEstimate Odometry::Track(const ImageSet& images, const ImageSet& masks, cons
   }
 
   return pose_estimate;
+}
+
+std::vector<uint8_t> Odometry::SaveState() const {
+  serial::Writer w;
+  w.write_pod<uint32_t>(kStateMagic);
+  w.write_pod<uint32_t>(kStateVersion);
+  w.write_pod_vector(impl->state_fingerprint);
+
+  w.write_pod<FrameId>(impl->frame_id);
+  w.write_isometry(impl->prev_abs_pose);
+  w.write_pod<int64_t>(impl->last_timestamp_ns);
+  w.write_pod<int64_t>(impl->last_frame_timestamp_ns);
+  w.write_isometry(impl->last_delta);
+
+  // final_landmarks, sorted by id for a deterministic byte stream
+  {
+    std::vector<uint64_t> ids;
+    ids.reserve(impl->final_landmarks.size());
+    for (const auto& [id, point] : impl->final_landmarks) {
+      ids.push_back(id);
+    }
+    std::sort(ids.begin(), ids.end());
+    w.write_size(ids.size());
+    for (const uint64_t id : ids) {
+      w.write_pod<uint64_t>(id);
+      const Vector3f& point = impl->final_landmarks.at(id);
+      w.write_pod<float>(point[0]);
+      w.write_pod<float>(point[1]);
+      w.write_pod<float>(point[2]);
+    }
+  }
+
+  w.write_pod<TrackId>(sof::GetNextRawTrackId());
+
+  // previous-frame raw inputs (per camera)
+  w.write_size(impl->prev_raw_images.size());
+  for (size_t cam = 0; cam < impl->prev_raw_images.size(); ++cam) {
+    WriteSavedImage(w, impl->prev_raw_images[cam]);
+    WriteSavedImage(w, impl->prev_raw_depths.size() > cam ? impl->prev_raw_depths[cam] : std::nullopt);
+  }
+
+  // visual odometry state (quiesces async SBA first)
+  impl->visual_odometry->save_state(w);
+
+  return w.take_buffer();
+}
+
+void Odometry::LoadState(const std::vector<uint8_t>& data) {
+  serial::Reader r(data);
+  THROW_INVALID_ARG_IF(r.read_pod<uint32_t>() != kStateMagic, "Not a cuVSLAM state buffer");
+  THROW_INVALID_ARG_IF(r.read_pod<uint32_t>() != kStateVersion, "Unsupported cuVSLAM state version");
+  const std::vector<uint8_t> fingerprint = r.read_pod_vector<uint8_t>();
+  THROW_INVALID_ARG_IF(fingerprint != impl->state_fingerprint,
+                       "State buffer was produced by a tracker with a different Rig or Config");
+
+  impl->frame_id = r.read_pod<FrameId>();
+  r.read_isometry(impl->prev_abs_pose);
+  impl->last_timestamp_ns = r.read_pod<int64_t>();
+  impl->last_frame_timestamp_ns = r.read_pod<int64_t>();
+  r.read_isometry(impl->last_delta);
+
+  impl->final_landmarks.clear();
+  const size_t num_final_landmarks = r.read_size();
+  impl->final_landmarks.reserve(num_final_landmarks);
+  for (size_t i = 0; i < num_final_landmarks; ++i) {
+    const uint64_t id = r.read_pod<uint64_t>();
+    Vector3f point;
+    point[0] = r.read_pod<float>();
+    point[1] = r.read_pod<float>();
+    point[2] = r.read_pod<float>();
+    impl->final_landmarks.emplace(id, point);
+  }
+
+  sof::SetNextRawTrackId(r.read_pod<TrackId>());
+
+  const size_t num_cameras = r.read_size();
+  THROW_INVALID_ARG_IF(num_cameras != 0 && num_cameras != static_cast<size_t>(impl->rig.num_cameras),
+                       "State buffer camera count does not match the rig");
+  impl->prev_raw_images.assign(impl->rig.num_cameras, std::nullopt);
+  impl->prev_raw_depths.assign(impl->rig.num_cameras, std::nullopt);
+  for (size_t cam = 0; cam < num_cameras; ++cam) {
+    ReadSavedImage(r, impl->prev_raw_images[cam]);
+    ReadSavedImage(r, impl->prev_raw_depths[cam]);
+  }
+
+  impl->visual_odometry->load_state(r);
+
+  // Rebuild the previous-frame image contexts (GPU/CPU pyramids) from the saved raw inputs so the
+  // next Track() call sees the same previous-frame state as before the checkpoint.
+  impl->prev_image_ptrs.assign(impl->rig.num_cameras, nullptr);
+  impl->image_contexts.clear();
+  for (size_t cam = 0; cam < num_cameras; ++cam) {
+    const auto& saved = impl->prev_raw_images[cam];
+    if (!saved.has_value()) {
+      continue;
+    }
+    const auto& saved_depth = impl->prev_raw_depths[cam];
+    const bool is_rgbd = saved_depth.has_value();
+
+    ImageMeta meta;
+    meta.frame_id = saved->frame_id;
+    meta.camera_index = static_cast<int>(saved->camera_index);
+    meta.timestamp = saved->timestamp_ns;
+    meta.shape.width = saved->width;
+    meta.shape.height = saved->height;
+    if (is_rgbd) {
+      meta.pixel_scale_factor = impl->odometry_mode == OdometryMode::Multisensor
+                                    ? impl->multisensor_settings.depth_scale_factor
+                                    : impl->rgbd_settings.depth_scale_factor;
+    }
+
+    sof::ImageContextPtr ctx = is_rgbd ? impl->image_manager->acquire_with_depth() : impl->image_manager->acquire();
+    THROW_RUNTIME_ERROR_IF(ctx == nullptr, "Failed to acquire image context from image_manager");
+    ctx->set_image_meta(meta);
+
+    const ImageSource source = MakeImageSourceFromSaved(*saved);
+    ImageSource depth_source;
+    if (is_rgbd) {
+      depth_source = MakeImageSourceFromSaved(*saved_depth);
+    }
+    impl->visual_odometry->rebuild_prev_context(static_cast<CameraId>(cam), source, is_rgbd ? &depth_source : nullptr,
+                                                ctx);
+    impl->prev_image_ptrs[cam] = ctx;
+  }
+
+  THROW_RUNTIME_ERROR_IF(!r.at_end(), "cuVSLAM state buffer has trailing data");
+}
+
+void Odometry::SaveStateToFile(const std::string_view& path) const {
+  const std::vector<uint8_t> data = SaveState();
+  std::ofstream file(std::string(path), std::ios::binary);
+  THROW_RUNTIME_ERROR_IF(!file.is_open(), "Failed to open state file for writing");
+  file.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+  THROW_RUNTIME_ERROR_IF(!file.good(), "Failed to write state file");
+}
+
+void Odometry::LoadStateFromFile(const std::string_view& path) {
+  std::ifstream file(std::string(path), std::ios::binary | std::ios::ate);
+  THROW_RUNTIME_ERROR_IF(!file.is_open(), "Failed to open state file for reading");
+  const std::streamsize size = file.tellg();
+  file.seekg(0, std::ios::beg);
+  std::vector<uint8_t> data(static_cast<size_t>(size));
+  file.read(reinterpret_cast<char*>(data.data()), size);
+  THROW_RUNTIME_ERROR_IF(!file.good(), "Failed to read state file");
+  LoadState(data);
 }
 
 std::vector<Observation> Odometry::GetLastObservations(uint32_t camera_index) const {

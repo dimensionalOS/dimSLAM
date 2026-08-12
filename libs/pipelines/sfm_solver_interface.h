@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "common/state_serial.h"
+
 #include <vector>
 
 #include "camera/rig.h"
@@ -66,6 +68,16 @@ public:
                               std::vector<Track2D>* tracks2d = nullptr, Tracks3DMap* tracks3d = nullptr) = 0;
 
   virtual void reset() = 0;
+
+  // Checkpoint support. save_state() must first quiesce any asynchronous work (SBA service) so
+  // the serialized map/pose state is consistent; load_state() assumes a freshly constructed solver.
+  // Defaults throw for solvers without checkpoint support yet.
+  virtual void save_state(serial::Writer& /*w*/) const {
+    throw std::runtime_error("cuVSLAM: state serialization is not implemented for this solver");
+  }
+  virtual void load_state(serial::Reader& /*r*/) {
+    throw std::runtime_error("cuVSLAM: state deserialization is not implemented for this solver");
+  }
 };
 
 }  // namespace cuvslam::pipelines

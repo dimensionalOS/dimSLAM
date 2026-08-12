@@ -49,6 +49,8 @@ public:
 
   void reset() final;
 
+  void rebuild_prev_context(CameraId cam_id, const ImageSource& source, const ImageContextPtr& ctx) final;
+
 private:
   struct PrimaryToSecondaryGPUTracker {
     std::unique_ptr<GPULKFeatureTracker> tracker;

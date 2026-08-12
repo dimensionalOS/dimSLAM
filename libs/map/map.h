@@ -28,6 +28,7 @@
 #include "camera/observation.h"
 #include "common/fixed_array.h"
 #include "common/isometry.h"
+#include "common/state_serial.h"
 #include "common/track_id.h"
 #include "common/vector_2t.h"
 #include "common/vector_3t.h"
@@ -116,6 +117,12 @@ public:
   bool empty() const;
 
   void clear();
+
+  // Checkpoint support: serialize/restore the full keyframe/landmark graph. Landmark object
+  // identity is keyed by track id (one shared Landmark instance per alive track id), keyframe
+  // identity by position in the consecutive-keyframes deque.
+  void save_state(serial::Writer& w) const;
+  void load_state(serial::Reader& r);
 
 private:
   void remove_tail_keyframe_thread_unsafe();

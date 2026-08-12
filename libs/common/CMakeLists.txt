@@ -42,6 +42,7 @@ set(HEADERS
     parse_utils.h
     rerun.h
     rotation_utils.h
+    state_serial.h
     statistic.h
     stopwatch.h
     stream.h
