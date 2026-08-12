@@ -21,6 +21,7 @@ set(SOURCES
     image_dropper_test.cpp
     parse_utils_test.cpp
     rotation_utils_test.cpp
+    state_serial_test.cpp
     stream_test.cpp
     )
 

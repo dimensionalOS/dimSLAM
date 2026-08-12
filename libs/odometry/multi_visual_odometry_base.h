@@ -54,7 +54,7 @@ public:
 
   // Rebuild pyramids of a restored previous-frame image context (delegates to the feature tracker).
   void rebuild_prev_context(CameraId cam_id, const ImageSource& source, const ImageSource* depth_source,
-                            const sof::ImageContextPtr& ctx) override;
+                            const ImageSource* mask_source, const sof::ImageContextPtr& ctx) override;
 
 protected:
   void reset();

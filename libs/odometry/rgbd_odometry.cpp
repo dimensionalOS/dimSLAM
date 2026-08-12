@@ -17,6 +17,8 @@
 
 #include "odometry/rgbd_odometry.h"
 
+#include "odometry/vo_state_io.h"
+
 #include <algorithm>
 
 #include "math/twist.h"
@@ -188,6 +190,28 @@ bool RGBDOdometry::do_predict(PredictorRef predictor, int64_t timestamp, Isometr
     return true;
   }
   return false;
+}
+
+void RGBDOdometry::save_state(serial::Writer& w) {
+  w.write_tag(0x52474244);  // "RGBD"
+  solver_.save_state(w);    // quiesces async SBA before the map is serialized
+  SaveVoCommonState(w, prediction_model_, prev_world_from_rig_, map_, *feature_tracker_, last_frame_stat_);
+}
+
+void RGBDOdometry::load_state(serial::Reader& r) {
+  r.expect_tag(0x52474244, "RGBDOdometry");
+  solver_.load_state(r);
+  LoadVoCommonState(r, prediction_model_, prev_world_from_rig_, map_, *feature_tracker_, last_frame_stat_);
+}
+
+void RGBDOdometry::rebuild_prev_context(CameraId cam_id, const ImageSource& source, const ImageSource* depth_source,
+                                        const ImageSource* mask_source, const sof::ImageContextPtr& ctx) {
+  feature_tracker_->rebuild_prev_context(cam_id, source, ctx);
+  if (depth_source != nullptr && ctx->support_depth()) {
+    // Same call track() makes for the depth-providing camera, including the optional mask.
+    ctx->build_gpu_depth_pyramid(*depth_source, stream.get_stream(), mask_source);
+    cudaStreamSynchronize(stream.get_stream());
+  }
 }
 
 }  // namespace cuvslam::odom

@@ -68,7 +68,8 @@ public:
   // Rebuild the pyramids of a restored previous-frame image context so the next track() call sees
   // the same state as before the checkpoint. Optional depth source is used by RGBD odometry.
   virtual void rebuild_prev_context(CameraId /*cam_id*/, const ImageSource& /*source*/,
-                                    const ImageSource* /*depth_source*/, const sof::ImageContextPtr& /*ctx*/) {
+                                    const ImageSource* /*depth_source*/, const ImageSource* /*mask_source*/,
+                                    const sof::ImageContextPtr& /*ctx*/) {
     throw std::runtime_error("cuVSLAM: context rebuild is not implemented for this odometry mode");
   }
 };

@@ -29,6 +29,10 @@ public:
   virtual void reset_selector() = 0;
   virtual bool select(const TracksVector& cur_frame_tracks) = 0;
   virtual void set_tracks(const TracksVector& cur_frame_tracks) = 0;
+
+  // Checkpoint support: serialize/restore the selector's persistent feature-initialization state.
+  virtual void save_state(serial::Writer& w) const = 0;
+  virtual void load_state(serial::Reader& r) = 0;
 };
 
 }  // namespace cuvslam::sof

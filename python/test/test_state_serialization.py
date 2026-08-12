@@ -33,8 +33,8 @@ os.environ.setdefault("RERUN", "0")
 import cuvslam as vslam
 import data_gen as data
 
-STEPS = 40
-SAVE_AT = 20
+STEPS = int(os.environ.get("CUVSLAM_TEST_STEPS", 40))
+SAVE_AT = int(os.environ.get("CUVSLAM_TEST_SAVE_AT", 20))
 WIDTH, HEIGHT = 640, 480
 FRAME_INTERVAL_NS = 33_000_000
 
@@ -92,6 +92,12 @@ def run_worker(mode: str, device: str, out_path: str, state_path: str) -> None:
 
 
 def quat_angle_deg(q1, q2):
+    q1 = np.array(q1, dtype=np.float64)
+    q2 = np.array(q2, dtype=np.float64)
+    if np.array_equal(q1, q2):
+        return 0.0
+    q1 /= np.linalg.norm(q1)
+    q2 /= np.linalg.norm(q2)
     dot = abs(float(np.clip(np.dot(q1, q2), -1.0, 1.0)))
     return float(np.degrees(2.0 * np.arccos(dot)))
 
@@ -163,6 +169,13 @@ class TestStateSerialization(unittest.TestCase):
         identical runs), so the bar is: checkpoint/restore must not add error beyond the measured
         identical-run noise floor (with margin), and must stay within absolute bounds.
         """
+        self._run_noise_floor_comparison("gpu")
+
+    def test_fresh_process_save_restore_matches_continuous_rgbd(self):
+        """RGBD mode: restored run must match the continuous run within the replay noise floor."""
+        self._run_noise_floor_comparison("rgbd")
+
+    def _run_noise_floor_comparison(self, device):
         with tempfile.TemporaryDirectory() as temp_dir:
             ref_path = os.path.join(temp_dir, "reference.json")
             ref2_path = os.path.join(temp_dir, "reference2.json")
@@ -170,10 +183,10 @@ class TestStateSerialization(unittest.TestCase):
             second_path = os.path.join(temp_dir, "second.json")
             state_path = os.path.join(temp_dir, "checkpoint.cvkp")
 
-            self._spawn("reference", "gpu", ref_path, state_path)
-            self._spawn("reference", "gpu", ref2_path, state_path)
-            self._spawn("first-half", "gpu", first_path, state_path)
-            self._spawn("second-half", "gpu", second_path, state_path)
+            self._spawn("reference", device, ref_path, state_path)
+            self._spawn("reference", device, ref2_path, state_path)
+            self._spawn("first-half", device, first_path, state_path)
+            self._spawn("second-half", device, second_path, state_path)
 
             reference = self._load(ref_path)
             reference2 = self._load(ref2_path)
@@ -183,7 +196,7 @@ class TestStateSerialization(unittest.TestCase):
             # Noise floor: two identical, unmodified continuous runs.
             floor_t, floor_r = max_trajectory_errors(
                 self, reference, reference2, 0, "identical-run noise floor")
-            print(f"\nGPU identical-run noise floor: {floor_t:.3e} m, {floor_r:.3e} deg")
+            print(f"\n{device} identical-run noise floor: {floor_t:.3e} m, {floor_r:.3e} deg")
 
             thr_t = max(TRANSLATION_ATOL_M, 3.0 * floor_t)
             thr_r = max(ROTATION_ATOL_DEG, 3.0 * floor_r)

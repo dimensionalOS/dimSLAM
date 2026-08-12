@@ -312,15 +312,14 @@ void UnifiedMap::save_state(serial::Writer& w) const {
       continue;
     }
     w.write_size(kf_index.at(kf_p.keyframe));
-    std::map<TrackId, const LandmarkAndObserv*> sorted_entries;
+    // Entries are written in the FastMap's own iteration order and re-inserted in that order on
+    // load: open-addressing probe chains (and therefore iteration order, which fixes the SBA
+    // floating-point summation order) depend on insertion order, not just content.
+    w.write_size(it->second.size());
     for (const auto& [track_id, lm_obs] : it->second) {
-      sorted_entries.emplace(track_id, &lm_obs);
-    }
-    w.write_size(sorted_entries.size());
-    for (const auto& [track_id, lm_obs] : sorted_entries) {
       w.write_pod(track_id);
-      w.write_size(lm_obs->observations.size());
-      for (const camera::Observation& obs : lm_obs->observations) {
+      w.write_size(lm_obs.observations.size());
+      for (const camera::Observation& obs : lm_obs.observations) {
         w.write_pod(obs.cam_id);
         w.write_pod(obs.id);
         w.write_eigen(obs.xy);

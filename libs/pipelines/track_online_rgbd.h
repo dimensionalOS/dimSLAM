@@ -57,6 +57,10 @@ public:
 
   void reset();
 
+  // Checkpoint support: see ISFMSolver::save_state/load_state (same contract).
+  void save_state(serial::Writer& w) const;
+  void load_state(serial::Reader& r);
+
 private:
   camera::Rig rig_;
   Isometry3T prev_rig_from_world_{Isometry3T::Identity()};

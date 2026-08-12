@@ -41,6 +41,18 @@ private:
   SelectorStereoSettings settings_;
   bool first_feature_initialization_selected_ = false;
   TracksVector last_feature_initialization_tracks_;
+
+public:
+  void save_state(serial::Writer& w) const final {
+    w.write_tag(0x53454C53);  // "SELS"
+    w.write_bool(first_feature_initialization_selected_);
+    last_feature_initialization_tracks_.save_state(w);
+  }
+  void load_state(serial::Reader& r) final {
+    r.expect_tag(0x53454C53, "SelectorStereo");
+    first_feature_initialization_selected_ = r.read_bool();
+    last_feature_initialization_tracks_.load_state(r);
+  }
 };
 
 }  // namespace cuvslam::sof

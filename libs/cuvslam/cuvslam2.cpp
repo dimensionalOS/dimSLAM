@@ -597,6 +597,7 @@ public:
   // previous-frame pyramids.
   std::vector<std::optional<SavedInputImage>> prev_raw_images;
   std::vector<std::optional<SavedInputImage>> prev_raw_depths;
+  std::vector<std::optional<SavedInputImage>> prev_raw_masks;
   std::vector<uint8_t> state_fingerprint;  // canonical Rig+Config bytes, computed at construction
 
   // data helpers
@@ -865,6 +866,7 @@ PoseEstimate Odometry::Track(const ImageSet& images, const ImageSet& masks, cons
   if (impl->prev_raw_images.size() != num_cameras) {
     impl->prev_raw_images.assign(num_cameras, std::nullopt);
     impl->prev_raw_depths.assign(num_cameras, std::nullopt);
+    impl->prev_raw_masks.assign(num_cameras, std::nullopt);
   }
   impl->image_contexts.clear();
 
@@ -934,6 +936,11 @@ PoseEstimate Odometry::Track(const ImageSet& images, const ImageSet& masks, cons
     // Keep a host copy of this frame's raw inputs for state serialization; it becomes the
     // "previous frame" that LoadState() rebuilds pyramids from.
     SaveInputImage(image, frame_id, impl->prev_raw_images[cam_id]);
+    if (mask_it != masks.end()) {
+      SaveInputImage(*mask_it, frame_id, impl->prev_raw_masks[cam_id]);
+    } else {
+      impl->prev_raw_masks[cam_id].reset();
+    }
     if (is_rgbd) {
       const Image* depth_image = nullptr;
       for (const auto& depth : depths) {
@@ -1031,6 +1038,7 @@ std::vector<uint8_t> Odometry::SaveState() const {
   for (size_t cam = 0; cam < impl->prev_raw_images.size(); ++cam) {
     WriteSavedImage(w, impl->prev_raw_images[cam]);
     WriteSavedImage(w, impl->prev_raw_depths.size() > cam ? impl->prev_raw_depths[cam] : std::nullopt);
+    WriteSavedImage(w, impl->prev_raw_masks.size() > cam ? impl->prev_raw_masks[cam] : std::nullopt);
   }
 
   // visual odometry state (quiesces async SBA first)
@@ -1072,9 +1080,11 @@ void Odometry::LoadState(const std::vector<uint8_t>& data) {
                        "State buffer camera count does not match the rig");
   impl->prev_raw_images.assign(impl->rig.num_cameras, std::nullopt);
   impl->prev_raw_depths.assign(impl->rig.num_cameras, std::nullopt);
+  impl->prev_raw_masks.assign(impl->rig.num_cameras, std::nullopt);
   for (size_t cam = 0; cam < num_cameras; ++cam) {
     ReadSavedImage(r, impl->prev_raw_images[cam]);
     ReadSavedImage(r, impl->prev_raw_depths[cam]);
+    ReadSavedImage(r, impl->prev_raw_masks[cam]);
   }
 
   impl->visual_odometry->load_state(r);
@@ -1112,8 +1122,13 @@ void Odometry::LoadState(const std::vector<uint8_t>& data) {
     if (is_rgbd) {
       depth_source = MakeImageSourceFromSaved(*saved_depth);
     }
+    const auto& saved_mask = impl->prev_raw_masks[cam];
+    ImageSource mask_source;
+    if (saved_mask.has_value()) {
+      mask_source = MakeImageSourceFromSaved(*saved_mask);
+    }
     impl->visual_odometry->rebuild_prev_context(static_cast<CameraId>(cam), source, is_rgbd ? &depth_source : nullptr,
-                                                ctx);
+                                                saved_mask.has_value() ? &mask_source : nullptr, ctx);
     impl->prev_image_ptrs[cam] = ctx;
   }
 

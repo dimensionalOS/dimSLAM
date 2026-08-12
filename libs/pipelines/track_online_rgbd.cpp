@@ -167,4 +167,20 @@ void SolverSfMRGBD::exportTracks(const std::vector<camera::Observation>& observa
   }
 }
 
+void SolverSfMRGBD::save_state(serial::Writer& w) const {
+  // Quiesce the SBA worker so no in-flight bundle adjustment mutates the map mid-serialization.
+  if (sba_service_) {
+    sba_service_->restart();
+  }
+  w.write_tag(0x53464D52);  // "SFMR"
+  w.write_isometry(prev_rig_from_world_);
+  w.write_eigen(prev_static_info_exp_);
+}
+
+void SolverSfMRGBD::load_state(serial::Reader& r) {
+  r.expect_tag(0x53464D52, "SolverSfMRGBD");
+  r.read_isometry(prev_rig_from_world_);
+  r.read_eigen(prev_static_info_exp_);
+}
+
 }  // namespace cuvslam::pipelines

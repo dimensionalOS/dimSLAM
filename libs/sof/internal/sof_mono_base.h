@@ -49,6 +49,7 @@ protected:
     w.write_tag(0x4D4F4E4F);  // "MONO"
     w.write_pod(cam_id_);
     tracks_.save_state(w);
+    feature_selector_->save_state(w);
   }
   void load_base_state(serial::Reader& r) {
     r.expect_tag(0x4D4F4E4F, "MonoSOFBase");
@@ -57,6 +58,7 @@ protected:
       throw std::runtime_error("cuVSLAM state deserialization: mono SOF camera id mismatch");
     }
     tracks_.load_state(r);
+    feature_selector_->load_state(r);
   }
 
   // internal state

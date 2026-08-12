@@ -41,6 +41,11 @@ public:
   void enable_stat(bool enable) override;
   const std::unique_ptr<IVisualOdometry::VOFrameStat>& get_last_stat() const override;
 
+  void save_state(serial::Writer& w) override;
+  void load_state(serial::Reader& r) override;
+  void rebuild_prev_context(CameraId cam_id, const ImageSource& source, const ImageSource* depth_source,
+                            const ImageSource* mask_source, const sof::ImageContextPtr& ctx) override;
+
 protected:
   bool do_predict(PredictorRef predictor, int64_t timestamp, Isometry3T& sof_prediction);
   void reset();

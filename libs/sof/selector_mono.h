@@ -55,6 +55,24 @@ private:
   bool first_feature_initialization_selected_ = false;
   TracksVector penultimate_feature_initialization_tracks_;  // expected to be ordered by TrackId
   TracksVector last_feature_initialization_tracks_;         // expected to be ordered by TrackId
+
+public:
+  void save_state(serial::Writer& w) const final {
+    w.write_tag(0x53454C4D);  // "SELM"
+    w.write_bool(mono_);
+    w.write_pod<uint32_t>(width_);
+    w.write_bool(first_feature_initialization_selected_);
+    penultimate_feature_initialization_tracks_.save_state(w);
+    last_feature_initialization_tracks_.save_state(w);
+  }
+  void load_state(serial::Reader& r) final {
+    r.expect_tag(0x53454C4D, "SelectorMono");
+    mono_ = r.read_bool();
+    width_ = r.read_pod<uint32_t>();
+    first_feature_initialization_selected_ = r.read_bool();
+    penultimate_feature_initialization_tracks_.load_state(r);
+    last_feature_initialization_tracks_.load_state(r);
+  }
 };
 
 }  // namespace cuvslam::sof
