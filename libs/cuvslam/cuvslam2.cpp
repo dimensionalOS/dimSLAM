@@ -661,7 +661,7 @@ Odometry::Odometry(const Rig& rig, const Config& cfg) {
   // otherwise the standard GPU bundler.
   svo_settings.sba_settings.mode = (cfg.odometry_mode == OdometryMode::Inertial || multisensor_with_imu)
                                        ? sba::Mode::InertialCPU
-                                       : sba::Mode::OriginalGPU;
+                                       : (cfg.use_gpu ? sba::Mode::OriginalGPU : sba::Mode::OriginalCPU);
 
   // Use only first camera border settings. Other camera border settings are ignored now.
   svo_settings.sof_settings.multicam_mode = ToMulticamMode(cfg.multicam_mode);
