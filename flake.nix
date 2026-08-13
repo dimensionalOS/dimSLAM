@@ -1,5 +1,5 @@
 {
-  description = "dim-slam: cuVSLAM (in cuvslam/) plus the dimos odometry module built on it";
+  description = "dimSLAM: cuVSLAM (in cuvslam/) plus the dimos odometry module built on it";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -244,7 +244,7 @@
             cp bin/libcuvslam.so $out/lib/
             cp $src/libs/cuvslam/cuvslam2.h $out/include/cuvslam/
             cp $src/LICENSE $out/share/cuvslam/
-            echo "Built from cuvslam/ in github.com/jeff-hykin/dim-slam with ENFORCE_GPU=OFF." \
+            echo "Built from cuvslam/ in github.com/dimensionalOS/dimSLAM with ENFORCE_GPU=OFF." \
               > $out/share/cuvslam/NOTICE
             runHook postInstall
           '';
