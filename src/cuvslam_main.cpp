@@ -65,6 +65,22 @@ struct RigCamera {
     bool have_image{false};
 };
 
+/// SE(3) adjoint on (xyz, rpy) coordinates: how a small motion expressed in the child
+/// frame reads in the parent frame. First order in the rotation block, where fixed-axis
+/// rpy rates and rotation-vector components coincide.
+Eigen::Matrix<double, 6, 6> se3_adjoint(const Transform& parent_from_child) {
+    const Eigen::Matrix3d rotation = parent_from_child.linear();
+    const Eigen::Vector3d translation = parent_from_child.translation();
+    Eigen::Matrix3d translation_skew;
+    translation_skew << 0.0, -translation.z(), translation.y(),
+                        translation.z(), 0.0, -translation.x(),
+                        -translation.y(), translation.x(), 0.0;
+    Eigen::Matrix<double, 6, 6> adjoint = Eigen::Matrix<double, 6, 6>::Zero();
+    adjoint.topLeftCorner<3, 3>() = rotation;
+    adjoint.topRightCorner<3, 3>() = translation_skew * rotation;
+    adjoint.bottomRightCorner<3, 3>() = rotation;
+    return adjoint;
+}
 
 }  // namespace
 
@@ -424,6 +440,7 @@ private:
         }
         base_from_rig_ = to_isometry(base_from_rig->rigid);
         rig_from_base_ = base_from_rig_.inverse();
+        covariance_adjoint_ = se3_adjoint(base_from_rig_);
         cuvslam::Rig rig;
         for (const RigCamera& rig_camera : cameras_) {
             const sensor_msgs::CameraInfo& info = rig_camera.info;
@@ -604,7 +621,16 @@ private:
         // collapse to the raw pose when the two frames are the same.
         const Transform raw_pose =
             base_from_rig_ * to_isometry(est.world_from_rig->pose) * rig_from_base_;
-        covariance_ = est.world_from_rig->covariance_xyz_rpy;
+        // cuVSLAM reports the 6x6 on the rig frame; the published pose is on base_frame,
+        // so the covariance moves through the same fixed transform. NaN (the tracker's
+        // unconstrained marker) survives the product and still trips the gate below.
+        const Eigen::Map<const Eigen::Matrix<float, 6, 6, Eigen::RowMajor>> rig_covariance(
+            est.world_from_rig->covariance_xyz_rpy.data());
+        const Eigen::Matrix<double, 6, 6> base_covariance =
+            covariance_adjoint_ * rig_covariance.cast<double>() *
+            covariance_adjoint_.transpose();
+        Eigen::Map<Eigen::Matrix<float, 6, 6, Eigen::RowMajor>>(covariance_.data()) =
+            base_covariance.cast<float>();
         const double translation_std = std::sqrt(static_cast<double>(
             std::max({covariance_[0], covariance_[7], covariance_[14]})));
         // NaN covariance is the tracker's own way of saying unconstrained; a NaN never
@@ -735,8 +761,8 @@ private:
     void publish(std::int64_t timestamp_ns) {
         nav_msgs::Odometry msg{};
         fill_pose(msg, world_from_rig_, timestamp_ns, cfg_.odom_frame, cfg_.base_frame);
-        // cuVSLAM's own 6x6, row-major xyz-rpy, the order ROS uses. Reported against the
-        // rig frame, which is base_frame unless rig_frame overrides it.
+        // cuVSLAM's own 6x6, row-major xyz-rpy, the order ROS uses, already moved onto
+        // base_frame with the pose.
         for (std::size_t i = 0; i < covariance_.size(); ++i) {
             msg.pose.covariance[i] = covariance_[i];
         }
@@ -778,6 +804,8 @@ private:
 
     /// covariance gate
     cuvslam::PoseCovariance covariance_{};
+    /// Adjoint of base_from_rig_, fixed with it at tracker creation.
+    Eigen::Matrix<double, 6, 6> covariance_adjoint_ = Eigen::Matrix<double, 6, 6>::Identity();
     Transform rebase_ = Transform::Identity();  ///< identity until the gate first fires
     bool frame_gated_{false};
     Transform corrected_rebase_ = Transform::Identity();
