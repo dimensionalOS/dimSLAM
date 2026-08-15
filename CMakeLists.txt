@@ -79,6 +79,21 @@ if(APPLE)
 endif()
 install(TARGETS cuvslam_odometry RUNTIME DESTINATION bin)
 
+# The fusion filter downstream of the visual odometry: IMU propagation corrected by
+# any number of odometry sources. No cuVSLAM dependency.
+add_executable(fused_odometry src/fused_odometry_main.cpp)
+target_include_directories(fused_odometry PRIVATE
+  ${dimos_lcm_SOURCE_DIR}/generated/cpp_lcm_msgs
+  ${LCM_INCLUDE_DIRS}
+)
+target_link_libraries(fused_odometry PRIVATE
+  dimos_native
+  Eigen3::Eigen
+  ${LCM_LIBRARIES}
+)
+target_link_directories(fused_odometry PRIVATE ${LCM_LIBRARY_DIRS})
+install(TARGETS fused_odometry RUNTIME DESTINATION bin)
+
 # The tf client's test suite (a mirror of the rust one's; tf.hpp is std-only, so the
 # tests need doctest alone). Off by default; flip on to run them locally.
 option(CUVSLAM_UTIL_TESTS "Build the cuvslam util tests" OFF)
@@ -89,12 +104,12 @@ if(CUVSLAM_UTIL_TESTS)
     GIT_TAG 1da23a3e8119ec5cce4f9388e91b065e20bf06f5  # v2.4.12
   )
   FetchContent_MakeAvailable(doctest)
-  add_executable(cuvslam_util_tests src/utils/test_tf.cpp)
+  add_executable(cuvslam_util_tests src/utils/test_tf.cpp src/utils/test_eskf.cpp)
   target_compile_features(cuvslam_util_tests PRIVATE cxx_std_20)
   target_compile_definitions(cuvslam_util_tests
     PRIVATE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN)
   target_compile_options(cuvslam_util_tests PRIVATE -Wall -Wextra -Werror)
-  target_link_libraries(cuvslam_util_tests PRIVATE doctest::doctest)
+  target_link_libraries(cuvslam_util_tests PRIVATE doctest::doctest Eigen3::Eigen)
   include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
   doctest_discover_tests(cuvslam_util_tests)
 endif()
