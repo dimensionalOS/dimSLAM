@@ -58,6 +58,8 @@ message(STATUS "cuVSLAM library: ${CUVSLAM_LIBRARY}")
 add_executable(cuvslam_odometry src/cuvslam_main.cpp)
 target_include_directories(cuvslam_odometry PRIVATE
   ${dimos_lcm_SOURCE_DIR}/generated/cpp_lcm_msgs
+  # Vendored lcm-gen output for types dimos-lcm does not ship yet (ImuInfo).
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/vendor
   ${LCM_INCLUDE_DIRS}
   ${CUVSLAM_INCLUDE_DIR}
 )

@@ -4,7 +4,7 @@
 // NVIDIA cuVSLAM visual odometry as a dimos native module.
 //
 // in:  image, camera_info (every camera on the one stream, told apart by frame_id),
-//      tf, depth_image, imu
+//      tf, depth_image, imu, imu_info (the IMU's noise model, published like camera_info)
 // out: odometry, corrected_odometry, tf
 //
 // Nothing is published while tracking is lost. cuVSLAM keeps one world frame for the
@@ -27,6 +27,7 @@
 #include "sensor_msgs/CameraInfo.hpp"
 #include "sensor_msgs/Image.hpp"
 #include "sensor_msgs/Imu.hpp"
+#include "sensor_msgs/ImuInfo.hpp"
 #include "tf2_msgs/TFMessage.hpp"
 #include "utils/depth_reproject.hpp"
 #include <Eigen/Geometry>
@@ -111,15 +112,9 @@ struct CuvslamConfig {
     /// 0 disables that limit.
     double speed_gate_max_linear;
     double speed_gate_max_angular;
-    /// cuVSLAM's Inertial mode is stereo plus one IMU.
+    /// cuVSLAM's Inertial mode is stereo plus one IMU. The noise model arrives on the
+    /// imu_info stream, the way camera intrinsics arrive on camera_info.
     bool enable_imu;
-    /// Flattened from the python ImuCalibration. All zero means enable_imu is off.
-    double imu_gyro_noise_density;
-    double imu_gyro_random_walk;
-    double imu_accel_noise_density;
-    double imu_accel_random_walk;
-    /// The rate actually fed. Declaring more than arrives never initialises alignment.
-    double imu_frequency;
     /// rgbd only: raw depth units per metre. 1000 for sixteen-bit millimetres.
     double depth_units_per_meter;
 };
@@ -145,6 +140,7 @@ public:
         }
         if (cfg_.enable_imu) {
             builder.input<sensor_msgs::Imu>("imu", &CuvslamOdometry::on_imu, this);
+            builder.input<sensor_msgs::ImuInfo>("imu_info", &CuvslamOdometry::on_imu_info, this);
         }
 
         odometry_ = builder.output<nav_msgs::Odometry>("odometry");
@@ -298,11 +294,19 @@ private:
         return -1;
     }
 
+    /// The IMU's noise model, published by the driver the way camera_info is.
+    void on_imu_info(const sensor_msgs::ImuInfo& info) {
+        if (tracker_) {
+            return;  // rig is fixed once the tracker exists
+        }
+        imu_info_ = info;
+        resolve_rig();
+    }
+
     /// Buffered. cuVSLAM requires Track() and RegisterImuMeasurement() in
     /// non-decreasing timestamp order; the round-robin dispatcher lets images
     /// overtake a 400 Hz IMU.
     void on_imu(const sensor_msgs::Imu& msg) {
-        imu_frame_ = msg.header.frame_id;
         if (!tracker_) {
             // No tracker yet; this is the window inertial init needs.
             ++imu_dropped_;
@@ -436,22 +440,27 @@ private:
             rig.cameras.push_back(camera);
         }
         if (cfg_.enable_imu) {
+            if (!imu_info_) {
+                DIMOS_LOG_THROTTLED(logging::Level::Warn, logging::from_secs(10),
+                                    "cuvslam: enable_imu is on but no imu_info has arrived");
+                return;
+            }
+            const std::string& imu_frame = imu_info_->header.frame_id;
             const std::optional<tf_client::Transform> rig_from_imu =
-                imu_frame_.empty() ? std::nullopt
-                                   : tf_client_.get_latest(rig_frame(), imu_frame_);
+                imu_frame.empty() ? std::nullopt : tf_client_.get_latest(rig_frame(), imu_frame);
             if (!rig_from_imu) {
                 DIMOS_LOG_THROTTLED(logging::Level::Warn, logging::from_secs(10),
                                     "cuvslam: enable_imu is on but tf does not place the IMU",
-                                    logging::Field("imu_frame", imu_frame_));
+                                    logging::Field("imu_frame", imu_frame));
                 return;
             }
             cuvslam::ImuCalibration imu{};
             imu.rig_from_imu = to_pose(to_isometry(rig_from_imu->rigid));
-            imu.gyroscope_noise_density = static_cast<float>(cfg_.imu_gyro_noise_density);
-            imu.gyroscope_random_walk = static_cast<float>(cfg_.imu_gyro_random_walk);
-            imu.accelerometer_noise_density = static_cast<float>(cfg_.imu_accel_noise_density);
-            imu.accelerometer_random_walk = static_cast<float>(cfg_.imu_accel_random_walk);
-            imu.frequency = static_cast<float>(cfg_.imu_frequency);
+            imu.gyroscope_noise_density = static_cast<float>(imu_info_->gyro_noise_density);
+            imu.gyroscope_random_walk = static_cast<float>(imu_info_->gyro_random_walk);
+            imu.accelerometer_noise_density = static_cast<float>(imu_info_->accel_noise_density);
+            imu.accelerometer_random_walk = static_cast<float>(imu_info_->accel_random_walk);
+            imu.frequency = static_cast<float>(imu_info_->frequency);
             rig.imus = {imu};
         }
 
@@ -771,7 +780,7 @@ private:
     std::vector<RigCamera> cameras_;
     std::unordered_map<std::string, sensor_msgs::CameraInfo> camera_info_;
     std::uint64_t unplaced_images_{0};
-    std::string imu_frame_;
+    std::optional<sensor_msgs::ImuInfo> imu_info_;
 
     /// child frame -> (its parent, parent_from_child). The bound is a cycle guard.
     Tf tf_client_;
