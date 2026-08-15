@@ -6,7 +6,7 @@
 // three calls used (construct, Track, RegisterImuMeasurement) behind extern "C".
 //
 // in:  image, camera_info (every camera on the one stream, told apart by frame_id),
-//      tf, depth_image, depth_camera_info, imu
+//      tf, depth_image, depth_camera_info, imu, imu_info
 // out: odometry, tf
 //
 // Nothing is published while tracking is lost. cuVSLAM keeps one world frame for the
@@ -14,6 +14,7 @@
 
 mod depth_reproject;
 mod ffi;
+mod imu_info;
 mod msg_convert;
 mod tracker;
 
@@ -29,6 +30,7 @@ use lcm_msgs::sensor_msgs::{CameraInfo, Image, Imu};
 use tracing::{error, info, warn};
 
 use depth_reproject::reproject_depth;
+use imu_info::ImuInfo;
 use msg_convert::{cuv_pose_to_isometry, stamp_to_ns, to_cuv_pose, to_distortion, to_stamp, transform_to_isometry};
 use tracker::{CameraParams, ImageRef, Tracker};
 
@@ -134,15 +136,9 @@ struct CuvslamOdometryConfig {
     /// 0 disables that limit.
     speed_gate_max_linear: f64,
     speed_gate_max_angular: f64,
-    /// cuVSLAM's Inertial mode is stereo plus one IMU.
+    /// cuVSLAM's Inertial mode is stereo plus one IMU. The noise model and frame come
+    /// from the imu_info stream, published by the driver the way camera_info is.
     enable_imu: bool,
-    /// Flattened from the python ImuCalibration. All zero means enable_imu is off.
-    imu_gyro_noise_density: f64,
-    imu_gyro_random_walk: f64,
-    imu_accel_noise_density: f64,
-    imu_accel_random_walk: f64,
-    /// The rate actually fed. Declaring more than arrives never initialises alignment.
-    imu_frequency: f64,
     /// rgbd only: raw depth units per metre. 1000 for sixteen-bit millimetres.
     depth_units_per_meter: f64,
 }
@@ -178,6 +174,9 @@ struct CuvslamOdometry {
     /// enable_imu only; unconnected otherwise.
     #[input(decode = Imu::decode)]
     imu: Input<Imu>,
+    /// enable_imu only: the IMU's noise model and frame.
+    #[input(decode = ImuInfo::decode)]
+    imu_info: Input<ImuInfo>,
     #[output(encode = Odometry::encode)]
     odometry: Output<Odometry>,
     #[tf]
@@ -188,7 +187,7 @@ struct CuvslamOdometry {
     /// The rig, in cuVSLAM's camera order.
     cameras: Vec<RigCamera>,
     camera_info_by_frame: HashMap<String, CameraInfo>,
-    imu_frame: String,
+    imu_model: Option<ImuInfo>,
     /// Buffered. cuVSLAM requires Track() and RegisterImuMeasurement() in
     /// non-decreasing timestamp order; the round-robin dispatcher lets images
     /// overtake a 400 Hz IMU.
@@ -311,8 +310,15 @@ impl CuvslamOdometry {
         self.cameras.iter().position(|camera| camera.frame == frame_id)
     }
 
+    async fn handle_imu_info(&mut self, info: ImuInfo) {
+        if self.vslam.is_some() {
+            return; // rig is fixed once the tracker exists
+        }
+        self.imu_model = Some(info);
+        self.resolve_rig();
+    }
+
     async fn handle_imu(&mut self, msg: Imu) {
-        self.imu_frame = msg.header.frame_id.clone();
         if self.vslam.is_none() {
             // No tracker yet; this is the window inertial init needs.
             self.imu_dropped += 1;
@@ -457,26 +463,29 @@ impl CuvslamOdometry {
 
         let mut imu_calibration = None;
         if self.config.enable_imu {
-            let rig_from_imu = if self.imu_frame.is_empty() {
-                None
-            } else {
-                self.tf.get_latest(self.rig_frame(), &self.imu_frame)
-            };
-            let Some(rig_from_imu) = rig_from_imu else {
+            let Some(imu_model) = &self.imu_model else {
                 warn_throttled!(
                     Duration::from_secs(10),
-                    imu_frame = %self.imu_frame,
+                    "cuvslam: enable_imu is on but no imu_info has arrived",
+                );
+                return;
+            };
+            let imu_frame = &imu_model.header.frame_id;
+            let Some(rig_from_imu) = self.tf.get_latest(self.rig_frame(), imu_frame) else {
+                warn_throttled!(
+                    Duration::from_secs(10),
+                    imu_frame = %imu_frame,
                     "cuvslam: enable_imu is on but tf does not place the IMU",
                 );
                 return;
             };
             imu_calibration = Some(ffi::CuvImuCalibration {
                 rig_from_imu: to_cuv_pose(&transform_to_isometry(&rig_from_imu)),
-                gyroscope_noise_density: self.config.imu_gyro_noise_density as f32,
-                gyroscope_random_walk: self.config.imu_gyro_random_walk as f32,
-                accelerometer_noise_density: self.config.imu_accel_noise_density as f32,
-                accelerometer_random_walk: self.config.imu_accel_random_walk as f32,
-                frequency: self.config.imu_frequency as f32,
+                gyroscope_noise_density: imu_model.gyro_noise_density as f32,
+                gyroscope_random_walk: imu_model.gyro_random_walk as f32,
+                accelerometer_noise_density: imu_model.accel_noise_density as f32,
+                accelerometer_random_walk: imu_model.accel_random_walk as f32,
+                frequency: imu_model.frequency as f32,
             });
         }
 
