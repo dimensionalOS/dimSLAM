@@ -720,18 +720,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fused_odometry"
-version = "0.1.0"
-dependencies = [
- "dimos-module",
- "lcm-msgs",
- "serde",
- "tokio",
- "tracing",
- "validator",
-]
-
-[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1664,6 +1652,18 @@ checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
 dependencies = [
  "hermit-abi",
  "libc",
+]
+
+[[package]]
+name = "odometry_fusion"
+version = "0.1.0"
+dependencies = [
+ "dimos-module",
+ "lcm-msgs",
+ "serde",
+ "tokio",
+ "tracing",
+ "validator",
 ]
 
 [[package]]

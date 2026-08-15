@@ -81,18 +81,18 @@ install(TARGETS cuvslam_odometry RUNTIME DESTINATION bin)
 
 # The fusion filter downstream of the visual odometry: IMU propagation corrected by
 # any number of odometry sources. No cuVSLAM dependency.
-add_executable(fused_odometry src/fused_odometry_main.cpp)
-target_include_directories(fused_odometry PRIVATE
+add_executable(odometry_fusion src/odometry_fusion_main.cpp)
+target_include_directories(odometry_fusion PRIVATE
   ${dimos_lcm_SOURCE_DIR}/generated/cpp_lcm_msgs
   ${LCM_INCLUDE_DIRS}
 )
-target_link_libraries(fused_odometry PRIVATE
+target_link_libraries(odometry_fusion PRIVATE
   dimos_native
   Eigen3::Eigen
   ${LCM_LIBRARIES}
 )
-target_link_directories(fused_odometry PRIVATE ${LCM_LIBRARY_DIRS})
-install(TARGETS fused_odometry RUNTIME DESTINATION bin)
+target_link_directories(odometry_fusion PRIVATE ${LCM_LIBRARY_DIRS})
+install(TARGETS odometry_fusion RUNTIME DESTINATION bin)
 
 # The tf client's test suite (a mirror of the rust one's; tf.hpp is std-only, so the
 # tests need doctest alone). Off by default; flip on to run them locally.

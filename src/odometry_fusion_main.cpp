@@ -63,7 +63,7 @@ std_msgs::Time to_stamp(std::int64_t timestamp_ns) {
 
 }  // namespace
 
-struct FusedOdometryConfig {
+struct OdometryFusionConfig {
     std::string odom_frame;
     std::string base_frame;
     /// Output cadence; the filter itself runs at the IMU rate.
@@ -97,10 +97,10 @@ struct FusedOdometryConfig {
     std::vector<double> constraint_twist_variances;
 };
 
-class FusedOdometry : public Module {
+class OdometryFusion : public Module {
 public:
     void build(Builder& builder, Config& config) override {
-        cfg_ = config.parse<FusedOdometryConfig>();
+        cfg_ = config.parse<OdometryFusionConfig>();
         const std::size_t sources = cfg_.source_frames.size();
         if (cfg_.source_pose_variances.size() != 6 * sources ||
             cfg_.source_twist_variances.size() != 6 * sources) {
@@ -117,14 +117,14 @@ public:
         anchors_.assign(sources, Transform::Identity());
         anchored_.assign(sources, false);
 
-        builder.input<sensor_msgs::Imu>("imu", &FusedOdometry::on_imu, this);
-        builder.input<nav_msgs::Odometry>("odometry", &FusedOdometry::on_odometry, this);
+        builder.input<sensor_msgs::Imu>("imu", &OdometryFusion::on_imu, this);
+        builder.input<nav_msgs::Odometry>("odometry", &OdometryFusion::on_odometry, this);
         odometry_ = builder.output<nav_msgs::Odometry>("odometry");
         tf_ = builder.output<tf2_msgs::TFMessage>("tf");
     }
 
     void teardown() override {
-        logging::info("fused_odometry shutting down",
+        logging::info("odometry_fusion shutting down",
                       {logging::Field("imu_samples", static_cast<std::int64_t>(imu_samples_)),
                        logging::Field("measurements", static_cast<std::int64_t>(measurements_)),
                        logging::Field("gated", static_cast<std::int64_t>(gated_)),
@@ -272,7 +272,7 @@ private:
         seed.is_imu = true;
         snapshot(seed);
         events_.push_back(std::move(seed));
-        logging::info("fused_odometry initialized",
+        logging::info("odometry_fusion initialized",
                       {logging::Field("gyro_bias", mean_gyro.norm()),
                        logging::Field("accel_norm", mean_accel.norm())});
     }
@@ -520,7 +520,7 @@ private:
         tf_.publish(tf_message);
     }
 
-    FusedOdometryConfig cfg_{};
+    OdometryFusionConfig cfg_{};
     eskf::Filter filter_{};
 
     bool initialized_{false};
@@ -549,6 +549,6 @@ private:
 };
 
 int main() {
-    dimos::native::run_with_transport<FusedOdometry>();
+    dimos::native::run_with_transport<OdometryFusion>();
     return 0;
 }

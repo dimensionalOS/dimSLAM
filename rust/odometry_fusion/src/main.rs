@@ -55,7 +55,7 @@ fn resolve_variance(configured: f64, from_message: f64) -> f64 {
 }
 
 #[native_config]
-struct FusedOdometryConfig {
+struct OdometryFusionConfig {
     odom_frame: String,
     base_frame: String,
     /// Output cadence; the filter itself runs at the IMU rate.
@@ -128,7 +128,7 @@ struct Event {
 
 #[derive(Module)]
 #[module(teardown = report)]
-struct FusedOdometry {
+struct OdometryFusion {
     #[input(decode = Imu::decode)]
     imu: Input<Imu>,
     #[input(decode = Odometry::decode)]
@@ -138,7 +138,7 @@ struct FusedOdometry {
     #[tf]
     tf: Tf,
     #[config]
-    config: FusedOdometryConfig,
+    config: OdometryFusionConfig,
 
     filter: Filter,
     initialized: bool,
@@ -160,7 +160,7 @@ struct FusedOdometry {
     too_late: u64,
 }
 
-impl FusedOdometry {
+impl OdometryFusion {
     async fn handle_imu(&mut self, imu: Imu) {
         let gyro = vector3(&imu.angular_velocity);
         let accel = vector3(&imu.linear_acceleration);
@@ -330,7 +330,7 @@ impl FusedOdometry {
         info!(
             gyro_bias = mean_gyro.norm(),
             accel_norm = mean_accel.norm(),
-            "fused_odometry initialized"
+            "odometry_fusion initialized"
         );
     }
 
@@ -613,12 +613,12 @@ impl FusedOdometry {
             gated = self.gated,
             replayed = self.replayed,
             too_late = self.too_late,
-            "fused_odometry shutting down"
+            "odometry_fusion shutting down"
         );
     }
 }
 
 #[tokio::main]
 async fn main() {
-    run_with_transport::<FusedOdometry>().await;
+    run_with_transport::<OdometryFusion>().await;
 }
