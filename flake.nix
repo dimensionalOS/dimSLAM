@@ -1,33 +1,12 @@
 {
-  description = "dimSLAM: cuVSLAM (in cuvslam/) plus the dimos odometry module built on it";
+  description = "dimSLAM: cuVSLAM (in cuvslam/) plus the Rust odometry modules built on it";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    lcm-extended = {
-      url = "github:jeff-hykin/lcm_extended";
-      inputs.nixpkgs.follows = "nixpkgs";
-      inputs.flake-utils.follows = "flake-utils";
-    };
-    # Generated LCM message headers, via a FetchContent source override.
-    dimos-lcm = {
-      url = "github:dimensionalOS/dimos-lcm/main";
-      flake = false;
-    };
-    # Standalone Boost.PFR, the same way.
-    pfr = {
-      url = "github:apolukhin/pfr_non_boost/2.3.2";
-      flake = false;
-    };
-    # The dimos header-only native C++ SDK (module/transport/config headers).
-    # Pinned to a dimos main revision; bump when native/cpp changes.
-    dimos-src = {
-      url = "github:dimensionalOS/dimos/bc5605aa5de303b557d40215e4e608a204713fa5";
-      flake = false;
-    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, lcm-extended, dimos-lcm, pfr, dimos-src, ... }:
+  outputs = { self, nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         isDarwin = nixpkgs.lib.hasSuffix "-darwin" system;
@@ -35,7 +14,6 @@
           inherit system;
           config = { allowUnfree = true; cudaSupport = !isDarwin; };
         };
-        lcm = lcm-extended.packages.${system}.lcm;
 
         # Every C++ build NVIDIA ships for this release. The ubuntu flavor does not
         # matter under autoPatchelf. `cuda` is the matching nixpkgs set: a runtime
@@ -264,41 +242,55 @@
         # the module's runtime libs.
         sdkPackageFor = name: sdk:
           if forkBuilds ? ${name} then forkSdkFor name forkBuilds.${name} else sdkFor name sdk;
-        runtimeCudaFor = name: sdk:
-          if forkBuilds ? ${name} then { cuda = forkBuilds.${name}.cuda; } else sdk;
 
-        moduleFor = name: sdk: let sdkPackage = sdkPackageFor name sdk; in pkgs.stdenv.mkDerivation {
-          pname = "dimos-cuvslam-native";
+        # The crates' git dependencies, pre-fetched so the sandboxed cargo build
+        # needs no network. Both dimos-module crates come from the same dimos
+        # checkout, so they share a hash. Bump alongside Cargo.lock.
+        rustGitDepHashes = {
+          "dimos-module-0.1.0" = "sha256-nMnCk9RbDKhOUZRCQUCjZVVPeQY8HrwFLItaZ64Q1KY=";
+          "dimos-module-macros-0.1.0" = "sha256-nMnCk9RbDKhOUZRCQUCjZVVPeQY8HrwFLItaZ64Q1KY=";
+          "lcm-msgs-0.1.0" = "sha256-GGkx4Mn6NYP6KZecmoRLKGWIih/+y8OgNn12DeXX6n8=";
+        };
+
+        # The fusion filter downstream of the visual odometry: IMU propagation
+        # corrected by any number of odometry sources. No cuVSLAM dependency.
+        odometryFusion = pkgs.rustPlatform.buildRustPackage {
+          pname = "odometry_fusion";
           version = "0.1.0";
-          # cmake inputs only. Editing cuvslam.py must not rebuild the C++.
-          src = pkgs.lib.fileset.toSource {
-            root = ./.;
-            fileset = pkgs.lib.fileset.unions [ ./CMakeLists.txt ./src ];
+          src = ./rust/odometry_fusion;
+          cargoLock = {
+            lockFile = ./rust/odometry_fusion/Cargo.lock;
+            outputHashes = rustGitDepHashes;
+          };
+        };
+
+        cuvslamModuleFor = name: sdk: let sdkPackage = sdkPackageFor name sdk; in
+          pkgs.rustPlatform.buildRustPackage {
+            pname = "cuvslam_odometry";
+            version = "0.1.0";
+            src = ./rust/cuvslam_odometry;
+            cargoLock = {
+              lockFile = ./rust/cuvslam_odometry/Cargo.lock;
+              outputHashes = rustGitDepHashes;
+            };
+            # build.rs compiles the shim against this SDK and embeds lib/ as an rpath.
+            env.CUVSLAM_SDK_DIR = sdkPackage;
+            nativeBuildInputs = pkgs.lib.optionals isDarwin [ pkgs.makeWrapper ];
+            # The test binary links libcuvslam, whose CUDA runtime wants a GPU
+            # driver the build sandbox lacks; unit tests run via plain cargo test.
+            doCheck = false;
+            # The archive ships every kernel already compiled, but its store path is
+            # read-only so CuMetal cannot use it as the normal cache; this is the
+            # read-only lookup it consults first.
+            postInstall = pkgs.lib.optionalString isDarwin ''
+              wrapProgram $out/bin/cuvslam_odometry \
+                --set-default CUMETAL_PREBUILT_CACHE_DIR ${sdkPackage}/share/cumetal-cache
+            '';
           };
 
-          nativeBuildInputs = [ pkgs.cmake pkgs.pkg-config ]
-            ++ pkgs.lib.optionals isDarwin [ pkgs.makeWrapper ]
-            ++ pkgs.lib.optionals (!isDarwin) [ pkgs.autoPatchelfHook ];
-          buildInputs = [ lcm pkgs.glib pkgs.nlohmann_json pkgs.eigen sdkPackage ]
-            ++ cudaLibs (runtimeCudaFor name sdk);
-
-          cmakeFlags = [
-            # cmake otherwise defaults to no optimisation at all.
-            "-DCMAKE_BUILD_TYPE=Release"
-            "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
-            "-DFETCHCONTENT_SOURCE_DIR_DIMOS_LCM=${dimos-lcm}"
-            "-DFETCHCONTENT_SOURCE_DIR_PFR=${pfr}"
-            "-DDIMOS_NATIVE_CPP_DIR=${dimos-src}/native/cpp"
-            "-DCUVSLAM_SDK_DIR=${sdkPackage}"
-          ];
-
-          # The archive ships every kernel already compiled, but its store path is
-          # read-only so CuMetal cannot use it as the normal cache; this is the read-only
-          # lookup it consults first.
-          postInstall = pkgs.lib.optionalString isDarwin ''
-            wrapProgram $out/bin/cuvslam_odometry \
-              --set-default CUMETAL_PREBUILT_CACHE_DIR ${sdkPackage}/share/cumetal-cache
-          '';
+        moduleFor = name: sdk: pkgs.symlinkJoin {
+          name = "dimslam-${name}";
+          paths = [ (cuvslamModuleFor name sdk) odometryFusion ];
         };
       in {
         # One package per build NVIDIA ships for this arch.
@@ -310,7 +302,8 @@
           // { default = moduleFor defaultVariant forThisSystem.${defaultVariant}; };
 
         devShells.default = pkgs.mkShell {
-          inputsFrom = [ self.packages.${system}.default ];
+          packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt ];
+          CUVSLAM_SDK_DIR = sdkPackageFor defaultVariant forThisSystem.${defaultVariant};
         };
       });
 }
