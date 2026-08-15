@@ -5,7 +5,7 @@
 //
 // in:  image, camera_info (every camera on the one stream, told apart by frame_id),
 //      tf, depth_image, imu
-// out: odometry, corrected_odometry, tf
+// out: odometry, tf
 //
 // Nothing is published while tracking is lost. cuVSLAM keeps one world frame for the
 // life of the tracker, so it resumes in the same frame. The rig comes from the tf tree.
@@ -102,17 +102,8 @@ struct CuvslamConfig {
     /// odometry stays on base_frame either way, since the two differ by a fixed transform.
     std::string rig_frame;
     std::string map_frame;
-    /// Only read when Slam is off, where map->odom can only be identity.
+    /// map->odom can only be identity: this module carries no map correction.
     bool publish_map_to_odom;
-    /// Pose graph + loop closure.
-    bool enable_slam;
-    /// GetPose() carries no timestamp, so a Slam thread running behind cannot be
-    /// matched to the odometry pose it corrects.
-    bool slam_async;
-    /// Poses kept in the graph; 0 is unlimited.
-    int slam_max_poses;
-    /// Floor on the interval between loop closures, milliseconds.
-    int slam_throttling_ms;
     /// Rebase guard. A frame whose translation standard deviation (root of the largest
     /// translation term of cuVSLAM's covariance) exceeds this is unconstrained: its motion
     /// is dropped, the pose holds, and later frames are rebased onto the held pose so the
@@ -164,7 +155,6 @@ public:
         }
 
         odometry_ = builder.output<nav_msgs::Odometry>("odometry");
-        corrected_odometry_ = builder.output<nav_msgs::Odometry>("corrected_odometry");
         tf_ = builder.output<tf2_msgs::TFMessage>("tf");
         tf_client_.set_publish_sink([this](const std::vector<tf_client::Transform>& transforms) {
             tf2_msgs::TFMessage message{};
@@ -196,7 +186,6 @@ public:
                       {logging::Field("frames", static_cast<std::int64_t>(frames_)),
                        logging::Field("tracked", static_cast<std::int64_t>(tracked_)),
                        logging::Field("resets", static_cast<std::int64_t>(segment_id_)),
-                       logging::Field("loop_closures", static_cast<std::int64_t>(loop_closures_)),
                        logging::Field("imu_samples", static_cast<std::int64_t>(imu_samples_)),
                        logging::Field("imu_dropped_before_start",
                                       static_cast<std::int64_t>(imu_dropped_)),
@@ -478,10 +467,6 @@ private:
         // cuVSLAM rejects this outright unless the rig has a stereo pair: "Rectified
         // stereo camera mode only works with 1+ stereo cameras".
         odometry_cfg.rectified_stereo_camera = cfg_.rectified && mode_ == Mode::Stereo;
-        odometry_cfg.enable_landmarks_export = cfg_.enable_slam;
-        // Slam reads the tracker's State, which GetState() only fills when the
-        // export flags are on; without them it throws instead of returning empty.
-        odometry_cfg.enable_observations_export = cfg_.enable_slam;
         // On, cuVSLAM's bundle adjustment throws from its own thread, where no
         // caller-side handler can catch it, and the process aborts.
         odometry_cfg.async_sba = false;
@@ -495,14 +480,6 @@ private:
         }
 
         tracker_.emplace(rig, odometry_cfg);
-        if (cfg_.enable_slam) {
-            cuvslam::Slam::Config slam_cfg = cuvslam::Slam::GetDefaultConfig();
-            slam_cfg.sync_mode = !cfg_.slam_async;
-            slam_cfg.use_gpu = cfg_.use_gpu;
-            slam_cfg.max_map_size = static_cast<std::uint32_t>(cfg_.slam_max_poses);
-            slam_cfg.throttling_time_ms = static_cast<std::uint32_t>(cfg_.slam_throttling_ms);
-            slam_.emplace(rig, tracker_->GetPrimaryCameras(), slam_cfg);
-        }
         logging::info("cuvslam tracker created",
                       {logging::Field("cameras", static_cast<std::int64_t>(rig.cameras.size())),
                        logging::Field("width", static_cast<std::int64_t>(rig.cameras[0].size[0])),
@@ -681,65 +658,12 @@ private:
             // and keep rebasing onto the held pose, so recovery continues from here with
             // only the delta measured after tracking became sane again.
             rebase_ = world_from_rig_ * raw_pose.inverse();
-            frame_gated_ = true;
         } else {
             world_from_rig_ = rebase_ * raw_pose;
-            frame_gated_ = false;
         }
         was_tracking_ = true;
         ++tracked_;
         publish(est.timestamp_ns);
-        if (slam_) {
-            run_slam(est.timestamp_ns);
-        }
-    }
-
-    void run_slam(std::int64_t timestamp_ns) {
-        cuvslam::Odometry::State state;
-        tracker_->GetState(state);
-        slam_->Track(state);
-
-        // Identity until Slam has a keyframe, which would read as a huge correction.
-        slam_started_ = slam_started_ || state.keyframe;
-        if (!slam_started_) {
-            return;
-        }
-        // Slam tracks the same rig, so its pose needs the same move onto base_frame as the
-        // odometry one before it can be compared with world_from_rig_ or published.
-        const Transform slam_pose = to_isometry(slam_->GetPose()) * rig_from_base_;
-        // The gate's decision carries over: an unconstrained frame poisons the slam pose
-        // through the same estimate, so the loop-closed stream holds and rebases with the
-        // VO stream. A real loop-closure snap has ordinary covariance and passes through.
-        if (frame_gated_) {
-            corrected_rebase_ = map_from_base_ * slam_pose.inverse();
-        } else {
-            map_from_base_ = corrected_rebase_ * slam_pose;
-        }
-        const Transform& map_from_base = map_from_base_;
-
-        const Transform map_from_odom_raw = map_from_base * world_from_rig_.inverse();
-
-        nav_msgs::Odometry corrected{};
-        fill_pose(corrected, map_from_base, timestamp_ns, cfg_.map_frame, cfg_.base_frame);
-        corrected_odometry_.publish(corrected);
-
-        tf_client_.publish({tf_client::Transform{cfg_.map_frame, cfg_.odom_frame,
-                                                 static_cast<double>(timestamp_ns) / 1.0e9,
-                                                 to_rigid(map_from_odom_raw)}});
-
-        cuvslam::Slam::Metrics metrics{};
-        slam_->GetSlamMetrics(metrics);
-        // The metrics are retained between Slam steps, which happen per keyframe, so a
-        // closure reads back on every frame until the next one. Key on the step's own stamp.
-        if (metrics.lc_status && metrics.timestamp_ns != last_closure_ns_) {
-            ++loop_closures_;
-            last_closure_ns_ = metrics.timestamp_ns;
-            logging::info("cuvslam loop closure",
-                          {logging::Field("count", static_cast<std::int64_t>(loop_closures_)),
-                           logging::Field("timestamp_ns", metrics.timestamp_ns),
-                           logging::Field("tracked_landmarks",
-                                          static_cast<std::int64_t>(metrics.lc_tracked_landmarks_count))});
-        }
     }
 
     static void fill_pose(nav_msgs::Odometry& msg, const Transform& pose, std::int64_t timestamp_ns,
@@ -770,8 +694,7 @@ private:
         tf_client_.publish({tf_client::Transform{cfg_.odom_frame, cfg_.base_frame,
                                                  static_cast<double>(timestamp_ns) / 1.0e9,
                                                  to_rigid(world_from_rig_)}});
-        // With Slam running, map->odom is its correction; only one publisher per edge.
-        if (!cfg_.enable_slam && cfg_.publish_map_to_odom) {
+        if (cfg_.publish_map_to_odom) {
             tf_client_.publish({tf_client::Transform{cfg_.map_frame, cfg_.odom_frame,
                                                      static_cast<double>(timestamp_ns) / 1.0e9,
                                                      to_rigid(Transform::Identity())}});
@@ -782,14 +705,9 @@ private:
     /// camera_mode, parsed once.
     Mode mode_{Mode::Stereo};
 
-    // slam
-    std::optional<cuvslam::Slam> slam_;
     std::vector<cuvslam::ImuMeasurement> pending_imu_;
     std::uint64_t imu_samples_{0};
     std::uint64_t imu_dropped_{0};
-    bool slam_started_{false};
-    std::uint64_t loop_closures_{0};
-    std::int64_t last_closure_ns_{-1};
 
     std::uint64_t skew_rejects_{0};
 
@@ -807,9 +725,6 @@ private:
     /// Adjoint of base_from_rig_, fixed with it at tracker creation.
     Eigen::Matrix<double, 6, 6> covariance_adjoint_ = Eigen::Matrix<double, 6, 6>::Identity();
     Transform rebase_ = Transform::Identity();  ///< identity until the gate first fires
-    bool frame_gated_{false};
-    Transform corrected_rebase_ = Transform::Identity();
-    Transform map_from_base_ = Transform::Identity();  ///< last published loop-closed pose
     std::uint64_t covariance_gated_{0};
     std::optional<Transform> previous_raw_;  ///< raw pose of the last tracked frame
     std::int64_t previous_raw_ns_{0};
@@ -835,7 +750,6 @@ private:
     std::uint64_t tracked_{0};
 
     Output<nav_msgs::Odometry> odometry_;
-    Output<nav_msgs::Odometry> corrected_odometry_;
     Output<tf2_msgs::TFMessage> tf_;
 };
 
