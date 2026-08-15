@@ -1,0 +1,20 @@
+# Copyright 2026 Dimensional Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "fused_odometry"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+dimos-module = { git = "https://github.com/dimensionalOS/dimos.git", branch = "main" }
+lcm-msgs = { git = "https://github.com/dimensionalOS/dimos-lcm.git", branch = "rust-codegen" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+# native_config expands to ::serde and ::validator derives, so both must be direct deps.
+serde = { version = "1", features = ["derive"] }
+validator = { version = "0.20", features = ["derive"] }
+
+[profile.release]
+lto = true
