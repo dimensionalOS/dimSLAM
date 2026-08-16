@@ -70,11 +70,19 @@ struct RigCamera {
 }  // namespace
 
 struct CuvslamConfig {
-    /// "stereo", "mono" or "rgbd". Mono is accurate only up to scale.
+    /// "stereo", "mono", "rgbd" or "multicam". Mono is accurate only up to scale.
     std::string camera_mode;
     /// One tf frame per camera, in cuVSLAM's index order. Empty discovers them off
-    /// camera_info.
+    /// camera_info; multicam has no discoverable count and requires the list.
     std::vector<std::string> camera_frames;
+    /// multicam only: cameras whose registered depth anchors metric scale. Non-empty runs
+    /// cuVSLAM's Multisensor mode; empty falls back to Multicamera, which cannot recover
+    /// scale from mono cameras. Every camera must share one resolution either way.
+    std::vector<std::string> depth_camera_frames;
+    /// multicam only: stamp spread one frame set (and its depth) may span, milliseconds.
+    /// Spot's images land within ~15 ms of each other but depth trails its camera by up
+    /// to ~90 ms; stereo keeps cuVSLAM's 1 ms contract regardless.
+    double max_skew_ms;
     /// Images arrive rectified: no distortion, rows aligned.
     bool rectified;
     /// Off runs the tracker on the CPU. Needs a libcuvslam built with ENFORCE_GPU=OFF
@@ -121,19 +129,20 @@ struct CuvslamConfig {
 
 class CuvslamOdometry : public Module {
 public:
-    enum class Mode { Stereo, Mono, Rgbd };
+    enum class Mode { Stereo, Mono, Rgbd, Multicam };
 
     void build(Builder& builder, Config& config) override {
         cfg_ = config.parse<CuvslamConfig>();
-        mode_ = cfg_.camera_mode == "stereo" ? Mode::Stereo
-                : cfg_.camera_mode == "rgbd"  ? Mode::Rgbd
-                                              : Mode::Mono;
+        mode_ = cfg_.camera_mode == "stereo"     ? Mode::Stereo
+                : cfg_.camera_mode == "rgbd"     ? Mode::Rgbd
+                : cfg_.camera_mode == "multicam" ? Mode::Multicam
+                                                 : Mode::Mono;
 
         builder.input<tf2_msgs::TFMessage>("tf", &CuvslamOdometry::on_tf, this);
         builder.input<sensor_msgs::CameraInfo>("camera_info", &CuvslamOdometry::on_camera_info,
                                                this);
         builder.input<sensor_msgs::Image>("image", &CuvslamOdometry::on_image, this);
-        if (mode_ == Mode::Rgbd) {
+        if (mode_ == Mode::Rgbd || (mode_ == Mode::Multicam && !cfg_.depth_camera_frames.empty())) {
             builder.input<sensor_msgs::Image>("depth_image", &CuvslamOdometry::on_depth, this);
             builder.input<sensor_msgs::CameraInfo>("depth_camera_info",
                                                    &CuvslamOdometry::on_depth_camera_info, this);
@@ -233,6 +242,12 @@ private:
             return;
         }
         const bool discovered = cfg_.camera_frames.empty();
+        if (discovered && mode_ == Mode::Multicam) {
+            DIMOS_LOG_THROTTLED(logging::Level::Error, logging::from_secs(10),
+                                "cuvslam multicam has no discoverable camera count; "
+                                "set camera_frames");
+            return;
+        }
         std::vector<std::string> frames = cfg_.camera_frames;
         if (discovered) {
             for (const auto& [frame, info] : camera_info_) {
@@ -344,14 +359,22 @@ private:
     }
 
     void on_depth(const sensor_msgs::Image& img) {
-        depth_ = img;
-        have_depth_ = true;
+        if (mode_ == Mode::Multicam) {
+            multicam_depth_[img.header.frame_id] = img;
+        } else {
+            depth_ = img;
+            have_depth_ = true;
+        }
         try_track();
     }
 
     /// Intrinsics of the depth sensor itself, only needed when depth has to be reprojected
     /// onto the rig camera. Kept off `camera_info` so it cannot join the rig discovery.
     void on_depth_camera_info(const sensor_msgs::CameraInfo& info) {
+        if (mode_ == Mode::Multicam) {
+            depth_info_by_frame_.emplace(info.header.frame_id, info);
+            return;
+        }
         if (!have_depth_info_) {
             depth_info_ = info;
             have_depth_info_ = true;
@@ -399,6 +422,39 @@ private:
         return &aligned_depth_;
     }
 
+    /// Depth for one multicam camera, pixel-aligned with it. Spot registers depth in the
+    /// camera's own frame but through the depth sensor's narrower intrinsics, so alignment
+    /// is a reprojection even though the extrinsic is identity. Null while that camera's
+    /// depth is missing, stale, or (unsupported) recorded against another frame.
+    const sensor_msgs::Image* align_multicam_depth(const std::string& frame,
+                                                   std::int64_t frame_set_ns, std::size_t slot) {
+        const auto depth = multicam_depth_.find(frame);
+        if (depth == multicam_depth_.end() ||
+            std::llabs(stamp_to_ns(depth->second.header) - frame_set_ns) > skew_limit_ns()) {
+            return nullptr;
+        }
+        if (depth->second.header.frame_id != frame) {
+            DIMOS_LOG_THROTTLED(logging::Level::Warn, logging::from_secs(10),
+                                "cuvslam multicam only takes depth registered in its own "
+                                "camera's frame",
+                                logging::Field("depth_frame", depth->second.header.frame_id),
+                                logging::Field("camera_frame", frame));
+            return nullptr;
+        }
+        const auto info = depth_info_by_frame_.find(frame);
+        if (info == depth_info_by_frame_.end()) {
+            DIMOS_LOG_THROTTLED(logging::Level::Warn, logging::from_secs(10),
+                                "cuvslam multicam depth needs its depth_camera_info",
+                                logging::Field("frame", frame));
+            return nullptr;
+        }
+        const int index = camera_index(frame);
+        reproject_depth(depth->second, info->second, cameras_[index].info, Transform::Identity(),
+                        cfg_.depth_units_per_meter, aligned_multicam_[slot]);
+        ++depth_reprojected_;
+        return &aligned_multicam_[slot];
+    }
+
     cuvslam::Odometry::OdometryMode odometry_mode() const {
         using OdometryMode = cuvslam::Odometry::OdometryMode;
         if (mode_ == Mode::Rgbd) {
@@ -407,8 +463,19 @@ private:
         if (mode_ == Mode::Mono) {
             return OdometryMode::Mono;
         }
+        if (mode_ == Mode::Multicam) {
+            // Mono cameras give Multicamera mode no scale; depth anchors it.
+            return cfg_.depth_camera_frames.empty() ? OdometryMode::Multicamera
+                                                    : OdometryMode::Multisensor;
+        }
         // Inertial is the stereo pair plus an IMU; there is no inertial mono or rgbd.
         return cfg_.enable_imu ? OdometryMode::Inertial : OdometryMode::Multicamera;
+    }
+
+    std::int64_t skew_limit_ns() const {
+        return mode_ == Mode::Multicam
+                   ? static_cast<std::int64_t>(std::llround(cfg_.max_skew_ms * 1.0e6))
+                   : MAX_PAIR_SKEW_NS;
     }
 
     /// Builds the tracker against rig_frame(). Poses are converted back onto base_frame on
@@ -485,6 +552,21 @@ private:
             odometry_cfg.rgbd_settings.depth_camera_id =
                 std::max(camera_index(depth_.header.frame_id), 0);
         }
+        if (mode_ == Mode::Multicam && !cfg_.depth_camera_frames.empty()) {
+            odometry_cfg.multisensor_settings.depth_scale_factor =
+                static_cast<float>(cfg_.depth_units_per_meter);
+            for (const std::string& frame : cfg_.depth_camera_frames) {
+                const int index = camera_index(frame);
+                if (index < 0) {
+                    DIMOS_LOG_THROTTLED(logging::Level::Error, logging::from_secs(10),
+                                        "cuvslam: depth_camera_frames names a frame that is "
+                                        "not on the rig",
+                                        logging::Field("frame", frame));
+                    return;
+                }
+                odometry_cfg.multisensor_settings.depth_camera_ids.push_back(index);
+            }
+        }
 
         tracker_.emplace(rig, odometry_cfg);
         if (cfg_.enable_slam) {
@@ -560,12 +642,13 @@ private:
             oldest = std::min(oldest, ts);
             newest = std::max(newest, ts);
         }
-        if (newest - oldest > MAX_PAIR_SKEW_NS) {
+        if (newest - oldest > skew_limit_ns()) {
             ++skew_rejects_;
             DIMOS_LOG_THROTTLED(logging::Level::Warn, logging::from_secs(10),
-                                "cuvslam frame sets exceed the 1 ms skew limit",
+                                "cuvslam frame sets exceed the skew limit",
                                 logging::Field("rejected", static_cast<std::int64_t>(skew_rejects_)),
-                                logging::Field("skew_ms", (newest - oldest) / 1.0e6));
+                                logging::Field("skew_ms", (newest - oldest) / 1.0e6),
+                                logging::Field("limit_ms", skew_limit_ns() / 1.0e6));
             return;
         }
         // cuVSLAM rejects a frame that is not strictly newer than the last one.
@@ -589,6 +672,21 @@ private:
             depth.encoding = cuvslam::ImageData::Encoding::MONO;
             depth.data_type = cuvslam::ImageData::DataType::UINT16;
             depths.push_back(depth);
+        }
+        if (mode_ == Mode::Multicam && !cfg_.depth_camera_frames.empty()) {
+            aligned_multicam_.resize(cfg_.depth_camera_frames.size());
+            for (std::size_t slot = 0; slot < cfg_.depth_camera_frames.size(); ++slot) {
+                const std::string& frame = cfg_.depth_camera_frames[slot];
+                const sensor_msgs::Image* aligned = align_multicam_depth(frame, newest, slot);
+                if (aligned == nullptr) {
+                    return;  // that camera's depth has not caught up; retry on its arrival
+                }
+                cuvslam::Image depth = to_cuvslam_image(
+                    *aligned, newest, static_cast<std::uint32_t>(camera_index(frame)));
+                depth.encoding = cuvslam::ImageData::Encoding::MONO;
+                depth.data_type = cuvslam::ImageData::DataType::UINT16;
+                depths.push_back(depth);
+            }
         }
 
         register_imu_through(newest);
@@ -619,7 +717,13 @@ private:
         // NaN covariance is the tracker's own way of saying unconstrained; a NaN never
         // exceeds a threshold, so it has to be gated explicitly.
         bool gate_frame = false;
-        if (cfg_.covariance_gate_translation_std > 0.0 && was_tracking_ &&
+        // Multisensor covariance is not on the stereo scale: frames tracking well within
+        // 2 m of ground truth still self-report ~10 m translation std (measured on
+        // spot_small_loop, 3288 of 3304 frames gated), so the self-report gate would hold
+        // the pose forever. The kinematic speed gate below still applies.
+        const bool covariance_gate_applies = mode_ != Mode::Multicam;
+        if (covariance_gate_applies && cfg_.covariance_gate_translation_std > 0.0 &&
+            was_tracking_ &&
             (!std::isfinite(translation_std) ||
              translation_std > cfg_.covariance_gate_translation_std)) {
             gate_frame = true;
@@ -801,6 +905,10 @@ private:
     sensor_msgs::CameraInfo depth_info_{};
     bool have_depth_info_{false};
     sensor_msgs::Image aligned_depth_{};
+    /// multicam: latest depth and depth intrinsics per camera frame.
+    std::unordered_map<std::string, sensor_msgs::Image> multicam_depth_;
+    std::unordered_map<std::string, sensor_msgs::CameraInfo> depth_info_by_frame_;
+    std::vector<sensor_msgs::Image> aligned_multicam_;
     std::optional<Transform> camera_from_depth_;
     std::uint64_t depth_reprojected_{0};
     std::optional<std::int64_t> last_ts_ns_;
