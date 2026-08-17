@@ -1,4 +1,4 @@
-# dim-slam
+# dimSLAM
 
 SLAM stack for dimos.
 
@@ -12,4 +12,4 @@ SLAM stack for dimos.
   C++ SDK comes in as the pinned `dimos-src` flake input.
 
 dimos consumes this repo by git tag:
-`nix build github:jeff-hykin/dim-slam/<tag>#<variant>`
+`nix build github:dimensionalOS/dimSLAM/<tag>#<variant>`
