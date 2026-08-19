@@ -124,6 +124,9 @@ struct CuvslamOdometryConfig {
     map_frame: String,
     /// map->odom can only be identity: this module carries no map correction.
     publish_map_to_odom: bool,
+    /// Off publishes odometry only. Downstream of a fusion filter this has to be off: the
+    /// filter owns odom->base_frame, and a second publisher on that edge races it.
+    publish_tf: bool,
     /// Rebase guard. A frame whose translation standard deviation (root of the largest
     /// translation term of cuVSLAM's covariance) exceeds this is unconstrained: its motion
     /// is dropped, the pose holds, and later frames are rebased onto the held pose so the
@@ -798,6 +801,10 @@ impl CuvslamOdometry {
             }
         }
         self.odometry.publish(&msg).await.ok();
+
+        if !self.config.publish_tf {
+            return;
+        }
 
         let ts_secs = timestamp_ns as f64 / 1.0e9;
         let mut transforms = vec![Transform::new(
