@@ -164,7 +164,6 @@ struct OdometryFusion {
     /// are computed once at arrival and survive replay untouched.
     previous_source_pose: HashMap<usize, Isometry3<f64>>,
     last_publish_ns: i64,
-    imu_tf_warned: bool,
     imu_samples: u64,
     measurements: u64,
     gated: u64,
@@ -177,24 +176,8 @@ impl OdometryFusion {
         if !self.config.use_imu {
             return;
         }
-        // The filter's whole state lives in base_frame, so a camera-mounted IMU has to be
-        // rotated in or its yaw lands on the wrong axis. The lever arm is left out: it
-        // needs angular acceleration and is worth millimetres at driving speeds.
-        let base_from_imu = self
-            .tf
-            .get_latest(&self.config.base_frame, &imu.header.frame_id)
-            .map(|transform| transform.rotation());
-        if base_from_imu.is_none() && !self.imu_tf_warned {
-            self.imu_tf_warned = true;
-            warn!(
-                imu_frame = %imu.header.frame_id,
-                base_frame = %self.config.base_frame,
-                "no transform to the base frame; fusing the IMU in its own frame"
-            );
-        }
-        let rotation = base_from_imu.unwrap_or_default();
-        let gyro = rotation * vector3(&imu.angular_velocity);
-        let accel = rotation * vector3(&imu.linear_acceleration);
+        let gyro = vector3(&imu.angular_velocity);
+        let accel = vector3(&imu.linear_acceleration);
         if !self.initialized {
             self.check_config();
             self.init_gyro_sum += gyro;
