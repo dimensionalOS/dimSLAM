@@ -46,7 +46,11 @@ fn vector3(v: &lcm_msgs::geometry_msgs::Vector3) -> Vector3<f64> {
 /// Fixed and message policies share a guard: a non-finite or non-positive
 /// variance can only drop the dimension, never divide by it.
 fn resolve_variance(configured: f64, from_message: f64) -> f64 {
-    let variance = if configured < 0.0 { from_message } else { configured };
+    let variance = if configured < 0.0 {
+        from_message
+    } else {
+        configured
+    };
     if variance.is_finite() && variance > 0.0 {
         variance
     } else {
@@ -64,6 +68,10 @@ struct OdometryFusionConfig {
     replay_buffer_seconds: f64,
     /// Outlier gate in standard deviations per measurement dimension; 0 disables.
     mahalanobis_gate: f64,
+    /// With no IMU the filter is seeded level from the first source message and dead
+    /// reckons between measurements at constant world velocity, turning at the last
+    /// reported angular velocity.
+    use_imu: bool,
     imu_gyro_noise_density: f64,
     imu_gyro_random_walk: f64,
     imu_accel_noise_density: f64,
@@ -108,7 +116,10 @@ struct Measurement {
 #[derive(Clone, Debug)]
 enum EventKind {
     Seed,
-    Imu { gyro: Vector3<f64>, accel: Vector3<f64> },
+    Imu {
+        gyro: Vector3<f64>,
+        accel: Vector3<f64>,
+    },
     Measurement(Measurement),
 }
 
@@ -153,6 +164,7 @@ struct OdometryFusion {
     /// are computed once at arrival and survive replay untouched.
     previous_source_pose: HashMap<usize, Isometry3<f64>>,
     last_publish_ns: i64,
+    imu_tf_warned: bool,
     imu_samples: u64,
     measurements: u64,
     gated: u64,
@@ -162,15 +174,39 @@ struct OdometryFusion {
 
 impl OdometryFusion {
     async fn handle_imu(&mut self, imu: Imu) {
-        let gyro = vector3(&imu.angular_velocity);
-        let accel = vector3(&imu.linear_acceleration);
+        if !self.config.use_imu {
+            return;
+        }
+        // The filter's whole state lives in base_frame, so a camera-mounted IMU has to be
+        // rotated in or its yaw lands on the wrong axis. The lever arm is left out: it
+        // needs angular acceleration and is worth millimetres at driving speeds.
+        let base_from_imu = self
+            .tf
+            .get_latest(&self.config.base_frame, &imu.header.frame_id)
+            .map(|transform| transform.rotation());
+        if base_from_imu.is_none() && !self.imu_tf_warned {
+            self.imu_tf_warned = true;
+            warn!(
+                imu_frame = %imu.header.frame_id,
+                base_frame = %self.config.base_frame,
+                "no transform to the base frame; fusing the IMU in its own frame"
+            );
+        }
+        let rotation = base_from_imu.unwrap_or_default();
+        let gyro = rotation * vector3(&imu.angular_velocity);
+        let accel = rotation * vector3(&imu.linear_acceleration);
         if !self.initialized {
             self.check_config();
             self.init_gyro_sum += gyro;
             self.init_accel_sum += accel;
             self.init_samples += 1;
             if self.init_samples >= self.config.imu_init_samples.max(1) as u64 {
-                self.initialize(stamp_to_ns(&imu.header));
+                let mean_accel = self.init_accel_sum / self.init_samples as f64;
+                let mean_gyro = self.init_gyro_sum / self.init_samples as f64;
+                // Stationary accel reads the specific force R^T (0,0,g): level so it maps to +z.
+                let world_from_body = UnitQuaternion::rotation_between(&mean_accel, &Vector3::z())
+                    .unwrap_or_default();
+                self.initialize(stamp_to_ns(&imu.header), world_from_body, mean_gyro);
             }
             return;
         }
@@ -189,7 +225,15 @@ impl OdometryFusion {
 
     async fn handle_sources(&mut self, msg: Odometry) {
         if !self.initialized {
-            return;
+            if self.config.use_imu {
+                return;
+            }
+            self.check_config();
+            self.initialize(
+                stamp_to_ns(&msg.header),
+                UnitQuaternion::identity(),
+                Vector3::zeros(),
+            );
         }
         let Some(source) = self
             .config
@@ -292,12 +336,12 @@ impl OdometryFusion {
         );
     }
 
-    fn initialize(&mut self, timestamp_ns: i64) {
-        let mean_accel = self.init_accel_sum / self.init_samples as f64;
-        let mean_gyro = self.init_gyro_sum / self.init_samples as f64;
-        // Stationary accel reads the specific force R^T (0,0,g): level so it maps to +z.
-        let world_from_body =
-            UnitQuaternion::rotation_between(&mean_accel, &Vector3::z()).unwrap_or_default();
+    fn initialize(
+        &mut self,
+        timestamp_ns: i64,
+        world_from_body: UnitQuaternion<f64>,
+        gyro_bias: Vector3<f64>,
+    ) {
         self.filter.noise = eskf::Noise {
             gyro_noise_density: self.config.imu_gyro_noise_density,
             gyro_random_walk: self.config.imu_gyro_random_walk,
@@ -307,7 +351,7 @@ impl OdometryFusion {
         self.filter.gravity = self.config.gravity;
         self.filter.init(
             world_from_body,
-            mean_gyro,
+            gyro_bias,
             self.config.initial_position_std,
             self.config.initial_velocity_std,
             self.config.initial_rotation_std,
@@ -328,8 +372,8 @@ impl OdometryFusion {
         self.snapshot(&mut seed);
         self.events.push_back(seed);
         info!(
-            gyro_bias = mean_gyro.norm(),
-            accel_norm = mean_accel.norm(),
+            gyro_bias = gyro_bias.norm(),
+            use_imu = self.config.use_imu,
             "odometry_fusion initialized"
         );
     }
@@ -383,7 +427,15 @@ impl OdometryFusion {
                 self.last_imu_ns = ts_ns;
                 self.last_gyro = gyro;
             }
-            EventKind::Measurement(measurement) => self.apply(&measurement),
+            EventKind::Measurement(measurement) => {
+                if !self.config.use_imu {
+                    self.dead_reckon(ts_ns);
+                    self.apply(&measurement);
+                    self.last_gyro = measurement.angular;
+                } else {
+                    self.apply(&measurement);
+                }
+            }
         }
         let mut event = std::mem::replace(
             &mut self.events[index],
@@ -399,6 +451,19 @@ impl OdometryFusion {
         );
         self.snapshot(&mut event);
         self.events[index] = event;
+    }
+
+    /// Stand-in propagation for a run with no IMU: the last reported body rotation rate
+    /// turns the state, and the specific force is whatever cancels gravity, so the world
+    /// velocity coasts while the covariance grows at the configured noise densities.
+    fn dead_reckon(&mut self, ts_ns: i64) {
+        let dt = (ts_ns - self.last_imu_ns) as f64 / 1.0e9;
+        if self.last_imu_ns != 0 && dt > 0.0 && dt < 1.0 {
+            let gyro = self.last_gyro;
+            let accel = self.filter.x.q.inverse() * Vector3::new(0.0, 0.0, self.filter.gravity);
+            self.filter.propagate(dt, &gyro, &accel);
+        }
+        self.last_imu_ns = ts_ns;
     }
 
     fn apply(&mut self, measurement: &Measurement) {
@@ -422,8 +487,7 @@ impl OdometryFusion {
         };
         if let Some(target) = target {
             let position_residual = target.translation.vector - self.filter.x.p;
-            let rotation_residual =
-                (self.filter.x.q.inverse() * target.rotation).scaled_axis();
+            let rotation_residual = (self.filter.x.q.inverse() * target.rotation).scaled_axis();
             for dim in 0..3 {
                 if measurement.pose_variance[dim] > 0.0 {
                     let mut row = Vec15::zeros();
@@ -453,8 +517,14 @@ impl OdometryFusion {
             &mut variances,
         );
         let accepted = self.update(&rows, &residuals, &variances);
-        if accepted && target.is_some() && !measurement.absolute {
-            self.anchor(measurement.source);
+        if accepted && !measurement.absolute {
+            if let Some(target) = target {
+                // The anchor advances along the source's own chain rather than snapping to
+                // the corrected filter pose: a partial update would otherwise fold the
+                // unapplied fraction of every delta into the next anchor, so the track
+                // loses a slice of each step's translation and rotation for good.
+                self.anchors[measurement.source] = Some(target);
+            }
         }
 
         // The configured constraints ride along with every source message.
@@ -471,7 +541,11 @@ impl OdometryFusion {
             &mut constraint_residuals,
             &mut constraint_variances,
         );
-        self.update(&constraint_rows, &constraint_residuals, &constraint_variances);
+        self.update(
+            &constraint_rows,
+            &constraint_residuals,
+            &constraint_variances,
+        );
     }
 
     /// Body-frame twist rows. Linear velocity observes v and theta; angular velocity
@@ -522,9 +596,12 @@ impl OdometryFusion {
         for (index, row) in rows.iter().enumerate() {
             jacobian.row_mut(index).copy_from(&row.transpose());
         }
-        let accepted = self
-            .filter
-            .update(&residual, &jacobian, &variance, self.config.mahalanobis_gate);
+        let accepted = self.filter.update(
+            &residual,
+            &jacobian,
+            &variance,
+            self.config.mahalanobis_gate,
+        );
         if !accepted {
             self.gated += 1;
         }
