@@ -7,11 +7,12 @@
 //
 // in:  image, camera_info (every camera on the one stream, told apart by frame_id),
 //      tf, depth_image, depth_camera_info, imu, imu_info
-// out: odometry, tf
+// out: odometry, tf, depth_cloud
 //
 // Nothing is published while tracking is lost. cuVSLAM keeps one world frame for the
 // life of the tracker, so it resumes in the same frame. The rig comes from the tf tree.
 
+mod depth_cloud;
 mod depth_reproject;
 mod ffi;
 mod imu_info;
@@ -26,9 +27,10 @@ use dimos_module::{
     error_throttled, native_config, run_with_transport, warn_throttled, Input, Module, Output, Tf, Transform,
 };
 use lcm_msgs::nav_msgs::Odometry;
-use lcm_msgs::sensor_msgs::{CameraInfo, Image, Imu};
+use lcm_msgs::sensor_msgs::{CameraInfo, Image, Imu, PointCloud2};
 use tracing::{error, info, warn};
 
+use depth_cloud::depth_cloud;
 use depth_reproject::reproject_depth;
 use imu_info::ImuInfo;
 use msg_convert::{cuv_pose_to_isometry, stamp_to_ns, to_cuv_pose, to_distortion, to_stamp, transform_to_isometry};
@@ -141,6 +143,11 @@ struct CuvslamOdometryConfig {
     enable_imu: bool,
     /// rgbd only: raw depth units per metre. 1000 for sixteen-bit millimetres.
     depth_units_per_meter: f64,
+    /// Range gate on the published depth_cloud, metres. Stereo depth error grows as range
+    /// squared, so the far gate is what decides whether the cloud is worth mapping with;
+    /// 0 leaves it open.
+    depth_cloud_min_range: f64,
+    depth_cloud_max_range: f64,
 }
 
 struct RigCamera {
@@ -179,6 +186,9 @@ struct CuvslamOdometry {
     imu_info: Input<ImuInfo>,
     #[output(encode = Odometry::encode)]
     odometry: Output<Odometry>,
+    /// rgbd only: the depth sensor's own points, range-gated, in the depth frame.
+    #[output(encode = PointCloud2::encode)]
+    depth_cloud: Output<PointCloud2>,
     #[tf]
     tf: Tf,
     #[config]
@@ -361,8 +371,34 @@ impl CuvslamOdometry {
     }
 
     async fn handle_depth_image(&mut self, img: Image) {
+        self.publish_depth_cloud(&img).await;
         self.depth = Some(img);
         self.try_track().await;
+    }
+
+    /// The depth sensor's own points, gated by range, in the sensor's frame. A driver's
+    /// cloud carries every far, noisy pixel, and the tracker already holds the intrinsics and
+    /// the depth scale a clean one needs.
+    async fn publish_depth_cloud(&mut self, depth: &Image) {
+        let info = self.depth_info.as_ref().or_else(|| {
+            self.cameras
+                .iter()
+                .find(|camera| camera.frame == depth.header.frame_id)
+                .map(|camera| &camera.info)
+        });
+        let Some(info) = info else {
+            return;
+        };
+        let mut cloud = PointCloud2::default();
+        depth_cloud(
+            depth,
+            info,
+            self.config.depth_units_per_meter,
+            self.config.depth_cloud_min_range,
+            self.config.depth_cloud_max_range,
+            &mut cloud,
+        );
+        self.depth_cloud.publish(&cloud).await.ok();
     }
 
     async fn handle_depth_camera_info(&mut self, info: CameraInfo) {
