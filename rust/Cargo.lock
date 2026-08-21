@@ -424,19 +424,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cuvslam_odometry"
-version = "0.1.0"
-dependencies = [
- "cc",
- "dimos-module",
- "lcm-msgs",
- "serde",
- "tokio",
- "tracing",
- "validator",
-]
-
-[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -551,6 +538,19 @@ dependencies = [
  "const-oid",
  "crypto-common",
  "subtle",
+]
+
+[[package]]
+name = "dim_slam"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "dimos-module",
+ "lcm-msgs",
+ "serde",
+ "tokio",
+ "tracing",
+ "validator",
 ]
 
 [[package]]

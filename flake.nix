@@ -1,5 +1,5 @@
 {
-  description = "dimSLAM: cuVSLAM (in cuvslam/) plus the Rust odometry modules built on it";
+  description = "dimSLAM: cuVSLAM (in cuvslam/) plus the Rust dim_slam module built on it";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -252,25 +252,13 @@
           "lcm-msgs-0.1.0" = "sha256-GGkx4Mn6NYP6KZecmoRLKGWIih/+y8OgNn12DeXX6n8=";
         };
 
-        # The fusion filter downstream of the visual odometry: IMU propagation
-        # corrected by any number of odometry sources. No cuVSLAM dependency.
-        odometryFusion = pkgs.rustPlatform.buildRustPackage {
-          pname = "odometry_fusion";
-          version = "0.1.0";
-          src = ./rust/odometry_fusion;
-          cargoLock = {
-            lockFile = ./rust/odometry_fusion/Cargo.lock;
-            outputHashes = rustGitDepHashes;
-          };
-        };
-
-        cuvslamModuleFor = name: sdk: let sdkPackage = sdkPackageFor name sdk; in
+        moduleFor = name: sdk: let sdkPackage = sdkPackageFor name sdk; in
           pkgs.rustPlatform.buildRustPackage {
-            pname = "cuvslam_odometry";
+            pname = "dim_slam";
             version = "0.1.0";
-            src = ./rust/cuvslam_odometry;
+            src = ./rust;
             cargoLock = {
-              lockFile = ./rust/cuvslam_odometry/Cargo.lock;
+              lockFile = ./rust/Cargo.lock;
               outputHashes = rustGitDepHashes;
             };
             # build.rs compiles the shim against this SDK and embeds lib/ as an rpath.
@@ -283,15 +271,10 @@
             # read-only so CuMetal cannot use it as the normal cache; this is the
             # read-only lookup it consults first.
             postInstall = pkgs.lib.optionalString isDarwin ''
-              wrapProgram $out/bin/cuvslam_odometry \
+              wrapProgram $out/bin/dim_slam \
                 --set-default CUMETAL_PREBUILT_CACHE_DIR ${sdkPackage}/share/cumetal-cache
             '';
           };
-
-        moduleFor = name: sdk: pkgs.symlinkJoin {
-          name = "dimslam-${name}";
-          paths = [ (cuvslamModuleFor name sdk) odometryFusion ];
-        };
       in {
         # One package per build NVIDIA ships for this arch.
         packages = pkgs.lib.mapAttrs moduleFor forThisSystem

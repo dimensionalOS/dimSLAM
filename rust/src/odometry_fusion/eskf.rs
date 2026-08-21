@@ -69,10 +69,12 @@ impl Default for Filter {
 }
 
 impl Filter {
+    #[allow(clippy::too_many_arguments)]
     pub fn init(
         &mut self,
         world_from_body: UnitQuaternion<f64>,
         gyro_bias: Vector3<f64>,
+        accel_bias: Vector3<f64>,
         position_std: f64,
         velocity_std: f64,
         rotation_std: f64,
@@ -81,6 +83,7 @@ impl Filter {
         self.x = State::default();
         self.x.q = world_from_body;
         self.x.bg = gyro_bias;
+        self.x.ba = accel_bias;
         self.p_cov = Mat15::zeros();
         for (block, std) in [
             (0, position_std),
@@ -191,6 +194,7 @@ mod tests {
         };
         filter.init(
             UnitQuaternion::identity(),
+            Vector3::zeros(),
             Vector3::zeros(),
             0.1,
             0.1,
@@ -346,6 +350,7 @@ mod tests {
         filter.init(
             UnitQuaternion::identity(),
             Vector3::new(0.1, 0.0, 0.0),
+            Vector3::zeros(),
             2.0,
             3.0,
             0.5,

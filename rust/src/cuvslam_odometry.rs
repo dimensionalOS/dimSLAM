@@ -1,21 +1,17 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// NVIDIA cuVSLAM visual odometry as a dimos native module, Rust port of
-// src/cuvslam_main.cpp. cuVSLAM itself stays C++; shim/cuvslam_shim.cpp wraps the
-// three calls used (construct, Track, RegisterImuMeasurement) behind extern "C".
+// NVIDIA cuVSLAM visual odometry, Rust port of src/cuvslam_main.cpp. cuVSLAM itself
+// stays C++; shim/cuvslam_shim.cpp wraps the three calls used (construct, Track,
+// RegisterImuMeasurement) behind extern "C".
 //
-// in:  image, camera_info (every camera on the one stream, told apart by frame_id),
-//      tf, depth_image, depth_camera_info, imu, imu_info
-// out: odometry, tf, depth_cloud
-//
-// Nothing is published while tracking is lost. cuVSLAM keeps one world frame for the
+// Nothing is emitted while tracking is lost. cuVSLAM keeps one world frame for the
 // life of the tracker, so it resumes in the same frame. The rig comes from the tf tree.
 
 mod depth_cloud;
 mod depth_reproject;
 mod ffi;
-mod imu_info;
+pub mod imu_info;
 mod msg_convert;
 mod tracker;
 
@@ -23,18 +19,18 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use dimos_module::nalgebra::{Isometry3, Matrix3, Matrix6, Vector3};
-use dimos_module::{
-    error_throttled, native_config, run_with_transport, warn_throttled, Input, Module, Output, Tf, Transform,
-};
+use dimos_module::{error_throttled, native_config, warn_throttled, Tf};
 use lcm_msgs::nav_msgs::Odometry;
 use lcm_msgs::sensor_msgs::{CameraInfo, Image, Imu, PointCloud2};
 use tracing::{error, info, warn};
 
-use depth_cloud::depth_cloud;
-use depth_reproject::reproject_depth;
-use imu_info::ImuInfo;
-use msg_convert::{cuv_pose_to_isometry, stamp_to_ns, to_cuv_pose, to_distortion, to_stamp, transform_to_isometry};
-use tracker::{CameraParams, ImageRef, Tracker};
+use self::depth_cloud::depth_cloud;
+use self::depth_reproject::reproject_depth;
+use self::imu_info::ImuInfo;
+use self::msg_convert::{
+    cuv_pose_to_isometry, stamp_to_ns, to_cuv_pose, to_distortion, to_stamp, transform_to_isometry,
+};
+use self::tracker::{CameraParams, ImageRef, Tracker};
 
 /// cuVSLAM's Track() contract asks for stereo stamps within 1 ms.
 const MAX_PAIR_SKEW_NS: i64 = 1_000_000;
@@ -104,53 +100,49 @@ fn image_encoding(encoding: &str) -> u8 {
 }
 
 #[native_config]
-struct CuvslamOdometryConfig {
+#[derive(Clone)]
+pub struct CuvslamOdometryConfig {
     /// "stereo", "mono" or "rgbd". Mono is accurate only up to scale.
-    camera_mode: String,
+    pub camera_mode: String,
     /// One tf frame per camera, in cuVSLAM's index order. Empty discovers them off
     /// camera_info.
-    camera_frames: Vec<String>,
+    pub camera_frames: Vec<String>,
     /// Images arrive rectified: no distortion, rows aligned.
-    rectified: bool,
+    pub rectified: bool,
     /// Off runs the tracker on the CPU. Needs a libcuvslam built with ENFORCE_GPU=OFF
     /// (the jeff-hykin/cuVSLAM fork build); NVIDIA's stock SDK binaries are GPU-only.
-    use_gpu: bool,
-    odom_frame: String,
-    base_frame: String,
+    pub use_gpu: bool,
+    /// Frame stamped on the emitted odometry; the tracker's world, drifting freely.
+    pub odom_frame: String,
+    pub base_frame: String,
     /// Frame the cuVSLAM rig is expressed in. Empty means base_frame. Setting it to a camera's
-    /// optical frame reproduces NVIDIA's examples, whose rig IS the left camera; the published
+    /// optical frame reproduces NVIDIA's examples, whose rig IS the left camera; the emitted
     /// odometry stays on base_frame either way, since the two differ by a fixed transform.
-    rig_frame: String,
-    map_frame: String,
-    /// map->odom can only be identity: this module carries no map correction.
-    publish_map_to_odom: bool,
-    /// Off publishes odometry only. Downstream of a fusion filter this has to be off: the
-    /// filter owns odom->base_frame, and a second publisher on that edge races it.
-    publish_tf: bool,
+    pub rig_frame: String,
     /// Rebase guard. A frame whose translation standard deviation (root of the largest
     /// translation term of cuVSLAM's covariance) exceeds this is unconstrained: its motion
     /// is dropped, the pose holds, and later frames are rebased onto the held pose so the
     /// published path never carries the teleport. Meters; 0 disables the guard and the raw
     /// integrator is published untouched.
-    covariance_gate_translation_std: f64,
+    pub covariance_gate_translation_std: f64,
     /// Rebase guard on physically implausible frame-to-frame motion, sharing the
     /// covariance gate's hold-and-rebase machinery but trusting kinematics instead of the
     /// tracker's self-report: a teleport with confident covariance still cannot claim the
     /// rig moved faster than the platform can. Linear is metres/second, angular is
     /// radians/second, both measured on the raw pose against the previous tracked frame;
     /// 0 disables that limit.
-    speed_gate_max_linear: f64,
-    speed_gate_max_angular: f64,
+    pub speed_gate_max_linear: f64,
+    pub speed_gate_max_angular: f64,
     /// cuVSLAM's Inertial mode is stereo plus one IMU. The noise model and frame come
     /// from the imu_info stream, published by the driver the way camera_info is.
-    enable_imu: bool,
+    pub enable_imu: bool,
     /// rgbd only: raw depth units per metre. 1000 for sixteen-bit millimetres.
-    depth_units_per_meter: f64,
+    pub depth_units_per_meter: f64,
     /// Range gate on the published depth_cloud, metres. Stereo depth error grows as range
     /// squared, so the far gate is what decides whether the cloud is worth mapping with;
     /// 0 leaves it open.
-    depth_cloud_min_range: f64,
-    depth_cloud_max_range: f64,
+    pub depth_cloud_min_range: f64,
+    pub depth_cloud_max_range: f64,
 }
 
 struct RigCamera {
@@ -167,36 +159,9 @@ enum DepthChoice {
     Aligned,
 }
 
-#[derive(Module)]
-#[module(teardown = report)]
-struct CuvslamOdometry {
-    #[input(decode = CameraInfo::decode)]
-    camera_info: Input<CameraInfo>,
-    #[input(decode = Image::decode)]
-    image: Input<Image>,
-    /// rgbd only; unconnected otherwise.
-    #[input(decode = Image::decode)]
-    depth_image: Input<Image>,
-    /// Intrinsics of the depth sensor itself, only needed when depth has to be reprojected
-    /// onto the rig camera. Kept off `camera_info` so it cannot join the rig discovery.
-    #[input(decode = CameraInfo::decode)]
-    depth_camera_info: Input<CameraInfo>,
-    /// enable_imu only; unconnected otherwise.
-    #[input(decode = Imu::decode)]
-    imu: Input<Imu>,
-    /// enable_imu only: the IMU's noise model and frame.
-    #[input(decode = ImuInfo::decode)]
-    imu_info: Input<ImuInfo>,
-    #[output(encode = Odometry::encode)]
-    odometry: Output<Odometry>,
-    /// rgbd only: the depth sensor's own points, range-gated, in the depth frame.
-    #[output(encode = PointCloud2::encode)]
-    depth_cloud: Output<PointCloud2>,
-    #[tf]
-    tf: Tf,
-    #[config]
+/// The tracker pipeline, free of any transport; the module in main.rs drives it.
+pub struct VoCore {
     config: CuvslamOdometryConfig,
-
     /// The rig, in cuVSLAM's camera order.
     cameras: Vec<RigCamera>,
     camera_info_by_frame: HashMap<String, CameraInfo>,
@@ -239,7 +204,42 @@ struct CuvslamOdometry {
     unplaced_images: u64,
 }
 
-impl CuvslamOdometry {
+impl VoCore {
+    pub fn new(config: CuvslamOdometryConfig) -> Self {
+        Self {
+            config,
+            cameras: Vec::new(),
+            camera_info_by_frame: HashMap::new(),
+            imu_model: None,
+            pending_imu: Vec::new(),
+            vslam: None,
+            depth: None,
+            depth_info: None,
+            aligned_depth: Image::default(),
+            camera_from_depth: None,
+            last_ts_ns: None,
+            world_from_base: None,
+            base_from_rig: None,
+            rig_from_base: None,
+            covariance_adjoint: Matrix6::zeros(),
+            rebase: None,
+            covariance: Matrix6::zeros(),
+            previous_raw: None,
+            previous_raw_ns: 0,
+            was_tracking: false,
+            frames: 0,
+            tracked: 0,
+            segment_id: 0,
+            imu_samples: 0,
+            imu_dropped: 0,
+            skew_rejects: 0,
+            depth_reprojected: 0,
+            covariance_gated: 0,
+            speed_gated: 0,
+            unplaced_images: 0,
+        }
+    }
+
     fn mode(&self) -> Mode {
         match self.config.camera_mode.as_str() {
             "stereo" => Mode::Stereo,
@@ -257,19 +257,19 @@ impl CuvslamOdometry {
         }
     }
 
-    async fn handle_camera_info(&mut self, info: CameraInfo) {
+    pub fn handle_camera_info(&mut self, info: CameraInfo, tf: &Tf) {
         if self.vslam.is_some() {
             return; // rig is fixed once the tracker exists
         }
         self.camera_info_by_frame.insert(info.header.frame_id.clone(), info);
-        self.resolve_rig();
+        self.resolve_rig(tf);
     }
 
     /// Place every camera against the rig frame, or nothing until they all resolve.
     ///
     /// The C++ module retried this on every tf message; here tf intake belongs to the
     /// SDK, so the retry rides on camera_info and image arrivals instead.
-    fn resolve_rig(&mut self) {
+    fn resolve_rig(&mut self, tf: &Tf) {
         if !self.cameras.is_empty() {
             return;
         }
@@ -296,7 +296,7 @@ impl CuvslamOdometry {
 
         let mut cameras = Vec::new();
         for frame in &frames {
-            let Some(rig_from_camera) = self.tf.get_latest(self.rig_frame(), frame) else {
+            let Some(rig_from_camera) = tf.get_latest(self.rig_frame(), frame) else {
                 return;
             };
             let Some(info) = self.camera_info_by_frame.get(frame) else {
@@ -323,15 +323,15 @@ impl CuvslamOdometry {
         self.cameras.iter().position(|camera| camera.frame == frame_id)
     }
 
-    async fn handle_imu_info(&mut self, info: ImuInfo) {
+    pub fn handle_imu_info(&mut self, info: ImuInfo, tf: &Tf) {
         if self.vslam.is_some() {
             return; // rig is fixed once the tracker exists
         }
         self.imu_model = Some(info);
-        self.resolve_rig();
+        self.resolve_rig(tf);
     }
 
-    async fn handle_imu(&mut self, msg: Imu) {
+    pub fn handle_imu(&mut self, msg: &Imu) {
         if self.vslam.is_none() {
             // No tracker yet; this is the window inertial init needs.
             self.imu_dropped += 1;
@@ -354,9 +354,9 @@ impl CuvslamOdometry {
         self.imu_samples += 1;
     }
 
-    async fn handle_image(&mut self, img: Image) {
+    pub fn handle_image(&mut self, img: Image, tf: &Tf) -> Option<Odometry> {
         if self.cameras.is_empty() {
-            self.resolve_rig();
+            self.resolve_rig(tf);
         }
         let Some(index) = self.camera_index(&img.header.frame_id) else {
             self.unplaced_images += 1;
@@ -367,31 +367,32 @@ impl CuvslamOdometry {
                 rig_cameras = self.cameras.len(),
                 "cuvslam dropping image with a frame_id not on the rig",
             );
-            return;
+            return None;
         };
         self.cameras[index].image = Some(img);
-        self.try_track().await;
+        self.try_track(tf)
     }
 
-    async fn handle_depth_image(&mut self, img: Image) {
-        self.publish_depth_cloud(&img).await;
+    pub fn handle_depth_image(
+        &mut self,
+        img: Image,
+        tf: &Tf,
+    ) -> (Option<PointCloud2>, Option<Odometry>) {
+        let cloud = self.depth_cloud_msg(&img);
         self.depth = Some(img);
-        self.try_track().await;
+        (cloud, self.try_track(tf))
     }
 
     /// The depth sensor's own points, gated by range, in the sensor's frame. A driver's
     /// cloud carries every far, noisy pixel, and the tracker already holds the intrinsics and
     /// the depth scale a clean one needs.
-    async fn publish_depth_cloud(&mut self, depth: &Image) {
+    fn depth_cloud_msg(&self, depth: &Image) -> Option<PointCloud2> {
         let info = self.depth_info.as_ref().or_else(|| {
             self.cameras
                 .iter()
                 .find(|camera| camera.frame == depth.header.frame_id)
                 .map(|camera| &camera.info)
-        });
-        let Some(info) = info else {
-            return;
-        };
+        })?;
         let mut cloud = PointCloud2::default();
         depth_cloud(
             depth,
@@ -401,10 +402,10 @@ impl CuvslamOdometry {
             self.config.depth_cloud_max_range,
             &mut cloud,
         );
-        self.depth_cloud.publish(&cloud).await.ok();
+        Some(cloud)
     }
 
-    async fn handle_depth_camera_info(&mut self, info: CameraInfo) {
+    pub fn handle_depth_camera_info(&mut self, info: CameraInfo) {
         if self.depth_info.is_none() {
             self.depth_info = Some(info);
         }
@@ -415,7 +416,7 @@ impl CuvslamOdometry {
     /// intrinsics and the tf between the two sensors when it was not (a D455 records depth
     /// against the left IR camera, not the color camera). None while the pieces to
     /// reproject are still missing.
-    fn align_depth(&mut self) -> Option<DepthChoice> {
+    fn align_depth(&mut self, tf: &Tf) -> Option<DepthChoice> {
         let depth = self.depth.as_ref().expect("checked by try_track");
         let camera = &self.cameras[0];
         if depth.header.frame_id == camera.frame {
@@ -432,7 +433,7 @@ impl CuvslamOdometry {
             return None;
         };
         if self.camera_from_depth.is_none() {
-            let Some(camera_from_depth) = self.tf.get_latest(&camera.frame, &depth.header.frame_id) else {
+            let Some(camera_from_depth) = tf.get_latest(&camera.frame, &depth.header.frame_id) else {
                 warn_throttled!(
                     Duration::from_secs(10),
                     depth_frame = %depth.header.frame_id,
@@ -464,11 +465,11 @@ impl CuvslamOdometry {
 
     /// Builds the tracker against rig_frame(). Poses are converted back onto base_frame on
     /// publish, so rig_frame is an internal choice with no effect on the output contract.
-    fn ensure_tracker(&mut self) {
+    fn ensure_tracker(&mut self, tf: &Tf) {
         if self.vslam.is_some() {
             return;
         }
-        let Some(base_from_rig) = self.tf.get_latest(&self.config.base_frame, self.rig_frame()) else {
+        let Some(base_from_rig) = tf.get_latest(&self.config.base_frame, self.rig_frame()) else {
             warn_throttled!(
                 Duration::from_secs(10),
                 rig_frame = self.rig_frame(),
@@ -510,7 +511,7 @@ impl CuvslamOdometry {
                 return;
             };
             let imu_frame = &imu_model.header.frame_id;
-            let Some(rig_from_imu) = self.tf.get_latest(self.rig_frame(), imu_frame) else {
+            let Some(rig_from_imu) = tf.get_latest(self.rig_frame(), imu_frame) else {
                 warn_throttled!(
                     Duration::from_secs(10),
                     imu_frame = %imu_frame,
@@ -579,18 +580,16 @@ impl CuvslamOdometry {
         self.depth = None;
     }
 
-    async fn try_track(&mut self) {
+    fn try_track(&mut self, tf: &Tf) -> Option<Odometry> {
         let mode = self.mode();
         if self.cameras.is_empty() || (mode == Mode::Rgbd && self.depth.is_none()) {
-            return;
+            return None;
         }
         if self.cameras.iter().any(|camera| camera.image.is_none()) {
-            return;
+            return None;
         }
-        self.ensure_tracker();
-        if self.vslam.is_none() {
-            return; // no tf placement yet
-        }
+        self.ensure_tracker(tf);
+        self.vslam.as_ref()?; // no tf placement yet
 
         let stamps: Vec<i64> = self
             .cameras
@@ -607,19 +606,17 @@ impl CuvslamOdometry {
                 skew_ms = (newest - oldest) as f64 / 1.0e6,
                 "cuvslam frame sets exceed the 1 ms skew limit",
             );
-            return;
+            return None;
         }
         // cuVSLAM rejects a frame that is not strictly newer than the last one.
         if self.last_ts_ns.is_some_and(|last| newest <= last) {
             self.clear_frame_set();
-            return;
+            return None;
         }
 
         let depth_choice = if mode == Mode::Rgbd {
-            match self.align_depth() {
-                Some(choice) => Some(choice),
-                None => return, // reprojection inputs still missing; retry on the next message
-            }
+            // Reprojection inputs still missing means retry on the next message.
+            Some(self.align_depth(tf)?)
         } else {
             None
         };
@@ -683,7 +680,7 @@ impl CuvslamOdometry {
                 // Track() throwing aborted the C++ module; the shim catches it instead
                 // and the frame is skipped.
                 error!(error = %message, "cuvslam Track failed");
-                return;
+                return None;
             }
         };
 
@@ -696,7 +693,7 @@ impl CuvslamOdometry {
                 self.previous_raw = None;
                 warn!(segment = self.segment_id, "cuvslam tracking lost");
             }
-            return;
+            return None;
         };
         // cuVSLAM tracks rig_frame(); the contract is base_frame starting at identity. Both
         // collapse to the raw pose when the two frames are the same.
@@ -775,10 +772,10 @@ impl CuvslamOdometry {
         }
         self.was_tracking = true;
         self.tracked += 1;
-        self.publish(estimate.timestamp_ns).await;
+        Some(self.output(estimate.timestamp_ns))
     }
 
-    async fn publish(&mut self, timestamp_ns: i64) {
+    fn output(&self, timestamp_ns: i64) -> Odometry {
         let world_from_base = self.world_from_base.unwrap_or_else(Isometry3::identity);
         let mut msg = Odometry::default();
         msg.header.stamp = to_stamp(timestamp_ns);
@@ -800,31 +797,10 @@ impl CuvslamOdometry {
                 msg.pose.covariance[row * 6 + column] = self.covariance[(row, column)];
             }
         }
-        self.odometry.publish(&msg).await.ok();
-
-        if !self.config.publish_tf {
-            return;
-        }
-
-        let ts_secs = timestamp_ns as f64 / 1.0e9;
-        let mut transforms = vec![Transform::new(
-            self.config.odom_frame.clone(),
-            self.config.base_frame.clone(),
-            ts_secs,
-            world_from_base,
-        )];
-        if self.config.publish_map_to_odom {
-            transforms.push(Transform::new(
-                self.config.map_frame.clone(),
-                self.config.odom_frame.clone(),
-                ts_secs,
-                Isometry3::identity(),
-            ));
-        }
-        self.tf.publish(&transforms).await.ok();
+        msg
     }
 
-    async fn report(&mut self) {
+    pub fn report(&self) {
         info!(
             frames = self.frames,
             tracked = self.tracked,
@@ -839,11 +815,6 @@ impl CuvslamOdometry {
             "cuvslam shutting down"
         );
     }
-}
-
-#[tokio::main]
-async fn main() {
-    run_with_transport::<CuvslamOdometry>().await;
 }
 
 #[cfg(test)]

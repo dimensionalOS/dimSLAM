@@ -9,7 +9,7 @@ use dimos_module::Transform;
 use lcm_msgs::sensor_msgs::CameraInfo;
 use lcm_msgs::std_msgs::{Header, Time};
 
-use crate::ffi::{CuvPose, CUV_DISTORTION_BROWN, CUV_DISTORTION_PINHOLE};
+use super::ffi::{CuvPose, CUV_DISTORTION_BROWN, CUV_DISTORTION_PINHOLE};
 
 pub const NS_PER_SEC: i64 = 1_000_000_000;
 

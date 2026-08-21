@@ -7,7 +7,7 @@
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
 
-use crate::ffi;
+use super::ffi;
 
 const ERROR_CAPACITY: usize = 512;
 
