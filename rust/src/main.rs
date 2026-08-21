@@ -42,6 +42,7 @@ struct DimSlamConfig {
     depth_units_per_meter: f64,
     depth_cloud_min_range: f64,
     depth_cloud_max_range: f64,
+    depth_cloud_decimation: i64,
 
     // --- fusion (see OdometryFusionConfig for the full field docs) ---
     odom_frame: String,
@@ -121,6 +122,7 @@ impl DimSlam {
             depth_units_per_meter: self.config.depth_units_per_meter,
             depth_cloud_min_range: self.config.depth_cloud_min_range,
             depth_cloud_max_range: self.config.depth_cloud_max_range,
+            depth_cloud_decimation: self.config.depth_cloud_decimation,
         }));
         self.fusion = Some(FusionCore::new(OdometryFusionConfig {
             odom_frame: self.config.odom_frame.clone(),

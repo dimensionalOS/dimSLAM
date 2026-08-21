@@ -143,6 +143,10 @@ pub struct CuvslamOdometryConfig {
     /// 0 leaves it open.
     pub depth_cloud_min_range: f64,
     pub depth_cloud_max_range: f64,
+    /// Emit one median point per k x k depth block instead of every pixel; <= 1 is off.
+    /// The median (not mean) suppresses flying pixels at depth discontinuities, and a
+    /// block with under half its pixels valid is dropped as edge noise.
+    pub depth_cloud_decimation: i64,
 }
 
 struct RigCamera {
@@ -400,6 +404,7 @@ impl VoCore {
             self.config.depth_units_per_meter,
             self.config.depth_cloud_min_range,
             self.config.depth_cloud_max_range,
+            self.config.depth_cloud_decimation.max(0) as u32,
             &mut cloud,
         );
         Some(cloud)
