@@ -160,6 +160,11 @@ pub struct CuvslamOdometryConfig {
     /// Scales the model input resolution, the quality/speed knob: 1.0 is the crate
     /// default (280x504), 0.5 is ~4x faster and coarser.
     pub depth2depth_quality: f64,
+    /// Frame whose images on the ``image`` stream feed the model. Empty uses the rig
+    /// camera on the depth frame; set it when depth is aligned to a sensor that has no
+    /// color (a D455 aligns depth to the left IR camera, so the color camera's frame
+    /// goes here — the few cm of parallax is small against the model's own error).
+    pub depth2depth_color_frame: String,
 }
 
 struct RigCamera {
@@ -192,6 +197,7 @@ pub struct VoCore {
     depth: Option<Image>,
     depth_info: Option<CameraInfo>,
     depth_fuser: Option<fused_depth::Fuser>,
+    fusion_color: Option<Image>,
     aligned_depth: Image,
     camera_from_depth: Option<Isometry3<f64>>,
     last_ts_ns: Option<i64>,
@@ -239,6 +245,7 @@ impl VoCore {
             depth: None,
             depth_info: None,
             depth_fuser,
+            fusion_color: None,
             aligned_depth: Image::default(),
             camera_from_depth: None,
             last_ts_ns: None,
@@ -388,7 +395,13 @@ impl VoCore {
         if self.cameras.is_empty() {
             self.resolve_rig(tf);
         }
+        let for_fusion = self.depth_fuser.is_some()
+            && img.header.frame_id == self.config.depth2depth_color_frame;
         let Some(index) = self.camera_index(&img.header.frame_id) else {
+            if for_fusion {
+                self.fusion_color = Some(img);
+                return None;
+            }
             self.unplaced_images += 1;
             warn_throttled!(
                 Duration::from_secs(10),
@@ -399,6 +412,9 @@ impl VoCore {
             );
             return None;
         };
+        if for_fusion {
+            self.fusion_color = Some(img.clone());
+        }
         self.cameras[index].image = Some(img);
         self.try_track(tf)
     }
@@ -418,13 +434,15 @@ impl VoCore {
     /// the depth scale a clean one needs. With a depth fuser configured the cloud is cut
     /// from the densified image instead, using the color image recorded on the same frame.
     fn depth_cloud_msg(&mut self, depth: &Image) -> Option<PointCloud2> {
-        let fused = match (
-            self.depth_fuser.as_mut(),
+        let color = if self.config.depth2depth_color_frame.is_empty() {
             self.cameras
                 .iter()
                 .find(|camera| camera.frame == depth.header.frame_id)
-                .and_then(|camera| camera.image.as_ref()),
-        ) {
+                .and_then(|camera| camera.image.as_ref())
+        } else {
+            self.fusion_color.as_ref()
+        };
+        let fused = match (self.depth_fuser.as_mut(), color) {
             (Some(fuser), Some(color)) => {
                 fuser.fuse(color, depth, self.config.depth_units_per_meter)
             }
