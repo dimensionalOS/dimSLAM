@@ -28,6 +28,12 @@ fn xyz_field(name: &str, offset: i32) -> PointField {
 /// which is why the RealSense D400 post-processing decimation filter uses it. Blocks where
 /// fewer than half the pixels have valid in-gate depth are dropped outright — those sit on
 /// object edges or specular holes where stereo depth is least trustworthy.
+///
+/// The median only outvotes flying pixels that are a minority of their block; a fringe wide
+/// enough to fill blocks becomes the median itself. Those survivors are caught by where they
+/// sit: a block whose median lies well between two opposing neighbour blocks hangs mid-air
+/// across a discontinuity, which no real surface does — a thin object stands in front of
+/// both its neighbours and a sloped surface stays within the mid-gap margin of them.
 pub fn depth_cloud(
     depth: &Image,
     depth_info: &CameraInfo,
@@ -68,12 +74,15 @@ pub fn depth_cloud(
             }
         }
     } else {
+        let blocks_w = (depth.width + kernel - 1) / kernel;
+        let blocks_h = (depth.height + kernel - 1) / kernel;
+        let mut medians: Vec<Option<u16>> = vec![None; (blocks_w * blocks_h) as usize];
         let mut block = Vec::with_capacity((kernel * kernel) as usize);
-        for block_v in (0..depth.height).step_by(kernel as usize) {
-            for block_u in (0..depth.width).step_by(kernel as usize) {
+        for block_v in 0..blocks_h {
+            for block_u in 0..blocks_w {
                 block.clear();
-                for v in block_v..(block_v + kernel).min(depth.height) {
-                    for u in block_u..(block_u + kernel).min(depth.width) {
+                for v in block_v * kernel..((block_v + 1) * kernel).min(depth.height) {
+                    for u in block_u * kernel..((block_u + 1) * kernel).min(depth.width) {
                         let raw = raw_at(u, v);
                         if raw >= near_raw && raw <= far_raw {
                             block.push(raw);
@@ -85,10 +94,42 @@ pub fn depth_cloud(
                 }
                 let mid = block.len() / 2;
                 let (_, median, _) = block.select_nth_unstable(mid);
-                let median = *median;
+                medians[(block_v * blocks_w + block_u) as usize] = Some(*median);
+            }
+        }
+        let median_at = |block_u: i32, block_v: i32| -> Option<u16> {
+            if block_u < 0 || block_v < 0 || block_u >= blocks_w || block_v >= blocks_h {
+                return None;
+            }
+            medians[(block_v * blocks_w + block_u) as usize]
+        };
+        for block_v in 0..blocks_h {
+            for block_u in 0..blocks_w {
+                let Some(median) = median_at(block_u, block_v) else {
+                    continue;
+                };
+                // A sloped surface seen at grazing incidence also lies between its
+                // neighbours, so the margin has to clear the per-block depth change of
+                // the steepest legitimate surface: relative in z (a ground plane's
+                // per-block change grows as z^2) with an absolute floor for close range.
+                let margin = (0.3 * units_per_meter).max(0.1 * median as f64) as i32;
+                let mid = median as i32;
+                let mid_gap = [(1, 0), (0, 1), (1, 1), (1, -1)].iter().any(|&(du, dv)| {
+                    let (Some(a), Some(b)) = (
+                        median_at(block_u - du, block_v - dv),
+                        median_at(block_u + du, block_v + dv),
+                    ) else {
+                        return false;
+                    };
+                    let (near, far) = (a.min(b) as i32, a.max(b) as i32);
+                    near + margin < mid && mid < far - margin
+                });
+                if mid_gap {
+                    continue;
+                }
                 emit(
-                    block_u as f64 + (kernel - 1) as f64 / 2.0,
-                    block_v as f64 + (kernel - 1) as f64 / 2.0,
+                    (block_u * kernel) as f64 + (kernel - 1) as f64 / 2.0,
+                    (block_v * kernel) as f64 + (kernel - 1) as f64 / 2.0,
                     median,
                     out,
                 );
@@ -178,6 +219,43 @@ mod tests {
         let mut cloud = PointCloud2::default();
         depth_cloud(&depth, &make_info(4, 4), 1000.0, 0.0, 0.0, 1, &mut cloud);
         assert_eq!(cloud.width, 16);
+    }
+
+    /// 6x2 image at k=2 = three blocks in a row, each uniform at the given depth.
+    fn three_block_strip(left: u16, middle: u16, right: u16) -> PointCloud2 {
+        let mut depth = make_depth(6, 2, left);
+        for v in 0..2 {
+            for u in 2..4 {
+                set_pixel(&mut depth, u, v, middle);
+            }
+            for u in 4..6 {
+                set_pixel(&mut depth, u, v, right);
+            }
+        }
+        let mut cloud = PointCloud2::default();
+        depth_cloud(&depth, &make_info(6, 2), 1000.0, 0.0, 0.0, 2, &mut cloud);
+        cloud
+    }
+
+    #[test]
+    fn a_block_hanging_mid_gap_between_its_neighbours_is_dropped() {
+        // A fringe strip interpolating a wall-to-wall discontinuity: mid-air, no surface.
+        let cloud = three_block_strip(1000, 3000, 5000);
+        assert_eq!(cloud_z_values(&cloud), vec![1.0, 5.0]);
+    }
+
+    #[test]
+    fn a_thin_object_in_front_of_the_background_is_kept() {
+        // A chair leg: nearer than both neighbours, not between them.
+        let cloud = three_block_strip(5000, 1000, 5000);
+        assert_eq!(cloud_z_values(&cloud), vec![5.0, 1.0, 5.0]);
+    }
+
+    #[test]
+    fn a_sloped_surface_within_the_margin_is_kept() {
+        // A grazing floor or corridor wall: between its neighbours but inside the margin.
+        let cloud = three_block_strip(2000, 2240, 2480);
+        assert_eq!(cloud_z_values(&cloud), vec![2.0, 2.24, 2.48]);
     }
 
     #[test]
