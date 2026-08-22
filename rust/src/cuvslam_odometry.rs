@@ -554,28 +554,53 @@ impl VoCore {
                 .map_or(0, |index| index as i32);
         }
 
-        // The C++ module let a construction failure abort the process; here it is logged
-        // and retried on the next frame set instead.
-        match Tracker::new(&cameras, imu_calibration.as_ref(), &tracker_config) {
-            Ok(vslam) => {
-                self.vslam = Some(vslam);
-                info!(
-                    cameras = cameras.len(),
-                    width = cameras[0].width,
-                    height = cameras[0].height,
-                    rig_frames = self
-                        .cameras
-                        .iter()
-                        .map(|camera| camera.frame.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    "cuvslam tracker created"
-                );
-            }
+        // A construction failure with a well-formed rig means this build has no such
+        // backend (each libcuvslam build carries one: GPU or CPU), so retrying the
+        // same config every frame set would run vision-less forever while the fusion
+        // filter keeps publishing. Try the other backend instead; if neither
+        // constructs, exit like the C++ module did rather than degrade silently.
+        let vslam = match Tracker::new(&cameras, imu_calibration.as_ref(), &tracker_config) {
+            Ok(vslam) => vslam,
             Err(message) => {
-                error_throttled!(Duration::from_secs(10), error = %message, "cuvslam tracker construction failed");
+                let fallback_config = ffi::CuvConfig {
+                    use_gpu: !tracker_config.use_gpu,
+                    ..tracker_config
+                };
+                match Tracker::new(&cameras, imu_calibration.as_ref(), &fallback_config) {
+                    Ok(vslam) => {
+                        warn!(
+                            configured_use_gpu = tracker_config.use_gpu,
+                            error = %message,
+                            "cuvslam tracker construction failed with the configured \
+                             backend; this build only carries the other one, using it"
+                        );
+                        vslam
+                    }
+                    Err(fallback_message) => {
+                        error!(
+                            configured_use_gpu = tracker_config.use_gpu,
+                            configured_error = %message,
+                            fallback_error = %fallback_message,
+                            "cuvslam tracker construction failed on both backends"
+                        );
+                        std::process::exit(1);
+                    }
+                }
             }
-        }
+        };
+        self.vslam = Some(vslam);
+        info!(
+            cameras = cameras.len(),
+            width = cameras[0].width,
+            height = cameras[0].height,
+            rig_frames = self
+                .cameras
+                .iter()
+                .map(|camera| camera.frame.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            "cuvslam tracker created"
+        );
     }
 
     fn clear_frame_set(&mut self) {
