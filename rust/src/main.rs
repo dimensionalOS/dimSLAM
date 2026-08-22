@@ -42,6 +42,9 @@ struct DimSlamConfig {
     depth_cloud_min_range: f64,
     depth_cloud_max_range: f64,
     depth_cloud_decimation: i64,
+    depth2depth_dinov2_weights: String,
+    depth2depth_head_weights: String,
+    depth2depth_quality: f64,
 
     // --- fusion (see OdometryFusionConfig for the full field docs) ---
     odom_frame: String,
@@ -120,6 +123,9 @@ impl DimSlam {
             depth_cloud_min_range: self.config.depth_cloud_min_range,
             depth_cloud_max_range: self.config.depth_cloud_max_range,
             depth_cloud_decimation: self.config.depth_cloud_decimation,
+            depth2depth_dinov2_weights: self.config.depth2depth_dinov2_weights.clone(),
+            depth2depth_head_weights: self.config.depth2depth_head_weights.clone(),
+            depth2depth_quality: self.config.depth2depth_quality,
         }));
         self.fusion = Some(FusionCore::new(OdometryFusionConfig {
             odom_frame: self.config.odom_frame.clone(),

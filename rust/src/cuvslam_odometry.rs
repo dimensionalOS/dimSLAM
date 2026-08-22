@@ -10,6 +10,7 @@
 
 mod depth_cloud;
 mod depth_reproject;
+mod fused_depth;
 pub mod imu_info;
 mod msg_convert;
 
@@ -149,6 +150,16 @@ pub struct CuvslamOdometryConfig {
     /// The median (not mean) suppresses flying pixels at depth discontinuities, and a
     /// block with under half its pixels valid is dropped as edge noise.
     pub depth_cloud_decimation: i64,
+    /// rgbd only: densify the depth image with the depth2depth crate before the cloud
+    /// is cut from it — Depth Anything V2 predicts dense depth from the color image,
+    /// the prediction is affine-anchored to the trusted raw pixels, and holes and
+    /// outliers get filled from it. Both safetensors paths set turns it on; needs the
+    /// `depth2depth` cargo feature (`depth2depth-cuda`/`-cudnn`/`-metal` for a GPU).
+    pub depth2depth_dinov2_weights: String,
+    pub depth2depth_head_weights: String,
+    /// Scales the model input resolution, the quality/speed knob: 1.0 is the crate
+    /// default (280x504), 0.5 is ~4x faster and coarser.
+    pub depth2depth_quality: f64,
 }
 
 struct RigCamera {
@@ -180,6 +191,7 @@ pub struct VoCore {
 
     depth: Option<Image>,
     depth_info: Option<CameraInfo>,
+    depth_fuser: Option<fused_depth::Fuser>,
     aligned_depth: Image,
     camera_from_depth: Option<Isometry3<f64>>,
     last_ts_ns: Option<i64>,
@@ -212,6 +224,11 @@ pub struct VoCore {
 
 impl VoCore {
     pub fn new(config: CuvslamOdometryConfig) -> Self {
+        let depth_fuser = fused_depth::Fuser::new(
+            &config.depth2depth_dinov2_weights,
+            &config.depth2depth_head_weights,
+            config.depth2depth_quality,
+        );
         Self {
             config,
             cameras: Vec::new(),
@@ -221,6 +238,7 @@ impl VoCore {
             vslam: None,
             depth: None,
             depth_info: None,
+            depth_fuser,
             aligned_depth: Image::default(),
             camera_from_depth: None,
             last_ts_ns: None,
@@ -397,8 +415,30 @@ impl VoCore {
 
     /// The depth sensor's own points, gated by range, in the sensor's frame. A driver's
     /// cloud carries every far, noisy pixel, and the tracker already holds the intrinsics and
-    /// the depth scale a clean one needs.
-    fn depth_cloud_msg(&self, depth: &Image) -> Option<PointCloud2> {
+    /// the depth scale a clean one needs. With a depth fuser configured the cloud is cut
+    /// from the densified image instead, using the color image recorded on the same frame.
+    fn depth_cloud_msg(&mut self, depth: &Image) -> Option<PointCloud2> {
+        let fused = match (
+            self.depth_fuser.as_mut(),
+            self.cameras
+                .iter()
+                .find(|camera| camera.frame == depth.header.frame_id)
+                .and_then(|camera| camera.image.as_ref()),
+        ) {
+            (Some(fuser), Some(color)) => {
+                fuser.fuse(color, depth, self.config.depth_units_per_meter)
+            }
+            (Some(_), None) => {
+                warn_throttled!(
+                    Duration::from_secs(10),
+                    depth_frame = %depth.header.frame_id,
+                    "depth2depth has no color image on the depth frame; publishing raw depth clouds",
+                );
+                None
+            }
+            (None, _) => None,
+        };
+        let depth = fused.as_ref().unwrap_or(depth);
         let info = self.depth_info.as_ref().or_else(|| {
             self.cameras
                 .iter()

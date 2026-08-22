@@ -16,6 +16,15 @@ tracing = "0.1"
 # native_config expands to ::serde and ::validator derives, so both must be direct deps.
 serde = { version = "1", features = ["derive"] }
 validator = { version = "0.20", features = ["derive"] }
+depth2depth = { version = "0.2.2", optional = true }
+
+[features]
+# RGB-guided densification of the depth cloud; see CuvslamOdometryConfig. The plain
+# feature runs the model on CPU (too slow for live use — pick a GPU variant).
+depth2depth = ["dep:depth2depth"]
+depth2depth-cuda = ["depth2depth", "depth2depth/cuda"]
+depth2depth-cudnn = ["depth2depth", "depth2depth/cudnn"]
+depth2depth-metal = ["depth2depth", "depth2depth/metal"]
 
 [profile.release]
 lto = true
