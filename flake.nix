@@ -55,6 +55,10 @@
             # The crate's build.rs cannot set the rpath: cargo drops rustc-link-arg
             # from dependency build scripts, so the final binary must embed it here.
             env.RUSTFLAGS = "-C link-arg=-Wl,-rpath,${sdkPackage}/lib";
+            # depth2depth needs a GPU backend to be useful; metal builds in the
+            # sandbox as-is, the CUDA backend would need nvcc so linux variants
+            # keep the stub for now.
+            buildFeatures = pkgs.lib.optionals isDarwin [ "depth2depth-metal" ];
             nativeBuildInputs = pkgs.lib.optionals isDarwin [ pkgs.makeWrapper ];
             # The test binary links libcuvslam, whose CUDA runtime wants a GPU
             # driver the build sandbox lacks; unit tests run via plain cargo test.
