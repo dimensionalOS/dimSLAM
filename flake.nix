@@ -50,9 +50,11 @@
               lockFile = ./rust/Cargo.lock;
               outputHashes = rustGitDepHashes;
             };
-            # cu_vslam_rs's build.rs compiles its shim against this SDK and embeds
-            # lib/ as an rpath.
+            # cu_vslam_rs's build.rs compiles its shim against this SDK.
             env.CUVSLAM_SDK_DIR = sdkPackage;
+            # The crate's build.rs cannot set the rpath: cargo drops rustc-link-arg
+            # from dependency build scripts, so the final binary must embed it here.
+            env.RUSTFLAGS = "-C link-arg=-Wl,-rpath,${sdkPackage}/lib";
             nativeBuildInputs = pkgs.lib.optionals isDarwin [ pkgs.makeWrapper ];
             # The test binary links libcuvslam, whose CUDA runtime wants a GPU
             # driver the build sandbox lacks; unit tests run via plain cargo test.
