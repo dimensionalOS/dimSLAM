@@ -46,6 +46,7 @@ struct DimSlamConfig {
     depth2depth_head_weights: String,
     depth2depth_quality: f64,
     depth2depth_color_frame: String,
+    depth2depth_max_color_skew_seconds: f64,
 
     // --- fusion (see OdometryFusionConfig for the full field docs) ---
     odom_frame: String,
@@ -128,6 +129,7 @@ impl DimSlam {
             depth2depth_head_weights: self.config.depth2depth_head_weights.clone(),
             depth2depth_quality: self.config.depth2depth_quality,
             depth2depth_color_frame: self.config.depth2depth_color_frame.clone(),
+            depth2depth_max_color_skew_seconds: self.config.depth2depth_max_color_skew_seconds,
         }));
         self.fusion = Some(FusionCore::new(OdometryFusionConfig {
             odom_frame: self.config.odom_frame.clone(),
