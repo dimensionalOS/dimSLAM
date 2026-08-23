@@ -1,19 +1,17 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// NVIDIA cuVSLAM visual odometry, Rust port of src/cuvslam_main.cpp. cuVSLAM itself
-// stays C++; shim/cuvslam_shim.cpp wraps the three calls used (construct, Track,
-// RegisterImuMeasurement) behind extern "C".
+// NVIDIA cuVSLAM visual odometry. cuVSLAM itself stays C++, behind the cu_vslam_rs
+// crate: an extern-C shim over the three calls used (construct, Track,
+// RegisterImuMeasurement) plus a safe Tracker wrapper.
 //
 // Nothing is emitted while tracking is lost. cuVSLAM keeps one world frame for the
 // life of the tracker, so it resumes in the same frame. The rig comes from the tf tree.
 
 mod depth_cloud;
 mod depth_reproject;
-mod ffi;
 pub mod imu_info;
 mod msg_convert;
-mod tracker;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -30,7 +28,7 @@ use self::imu_info::ImuInfo;
 use self::msg_convert::{
     cuv_pose_to_isometry, stamp_to_ns, to_cuv_pose, to_distortion, to_stamp, transform_to_isometry,
 };
-use self::tracker::{CameraParams, ImageRef, Tracker};
+use cu_vslam_rs::{ffi, CameraParams, ImageRef, Tracker};
 
 /// cuVSLAM's Track() contract asks for stereo stamps within 1 ms.
 const MAX_PAIR_SKEW_NS: i64 = 1_000_000;

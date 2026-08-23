@@ -424,6 +424,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cu_vslam_rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83eb1463aa249ad1da64055d34be9c6443d95b25d530acc0c0aa5cd0e3f56f00"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -544,7 +553,7 @@ dependencies = [
 name = "dim_slam"
 version = "0.1.0"
 dependencies = [
- "cc",
+ "cu_vslam_rs",
  "dimos-module",
  "lcm-msgs",
  "serde",

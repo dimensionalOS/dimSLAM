@@ -1,5 +1,0 @@
-reviews:
-  profile: assertive
-  commit_status: false
-  auto_review:
-    enabled: true

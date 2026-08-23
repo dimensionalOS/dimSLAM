@@ -1,5 +1,28 @@
 {
   "nodes": {
+    "cu-vslam-rs": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1787522773,
+        "narHash": "sha256-TOST6x1JjK6/CPt7nZeAa6qNwL7jf9y214pq2qh+hJ4=",
+        "owner": "jeff-hykin",
+        "repo": "cu_vslam_rs",
+        "rev": "b23c721454242218472811a8a05c9a256095e9a9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jeff-hykin",
+        "repo": "cu_vslam_rs",
+        "type": "github"
+      }
+    },
     "flake-utils": {
       "inputs": {
         "systems": "systems"
@@ -36,6 +59,7 @@
     },
     "root": {
       "inputs": {
+        "cu-vslam-rs": "cu-vslam-rs",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs"
       }
