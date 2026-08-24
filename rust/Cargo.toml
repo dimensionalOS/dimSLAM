@@ -6,16 +6,13 @@ name = "dim_slam"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+description = "Visual-inertial odometry: a cuVSLAM front end and an error-state Kalman fuser"
+repository = "https://github.com/dimensionalOS/dimSLAM"
+
 
 [dependencies]
 cu_vslam_rs = "0.1.1"
-dimos-module = { git = "https://github.com/dimensionalOS/dimos.git", branch = "main" }
-lcm-msgs = { git = "https://github.com/dimensionalOS/dimos-lcm.git", branch = "rust-codegen" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+nalgebra = "0.35"
 tracing = "0.1"
-# native_config expands to ::serde and ::validator derives, so both must be direct deps.
 serde = { version = "1", features = ["derive"] }
-validator = { version = "0.20", features = ["derive"] }
 
-[profile.release]
-lto = true

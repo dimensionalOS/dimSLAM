@@ -1,25 +1,10 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use dimos_module::nalgebra::{Isometry3, Translation3, UnitQuaternion};
-use dimos_module::Transform;
-use lcm_msgs::sensor_msgs::CameraInfo;
-use lcm_msgs::std_msgs::{Header, Time};
+use nalgebra::{Isometry3, Translation3, UnitQuaternion};
 
+use crate::types::CameraModel;
 use cu_vslam_rs::ffi::{CuvPose, CUV_DISTORTION_BROWN, CUV_DISTORTION_PINHOLE};
-
-pub const NS_PER_SEC: i64 = 1_000_000_000;
-
-pub fn stamp_to_ns(header: &Header) -> i64 {
-    header.stamp.sec as i64 * NS_PER_SEC + header.stamp.nsec as i64
-}
-
-pub fn to_stamp(timestamp_ns: i64) -> Time {
-    Time {
-        sec: (timestamp_ns / NS_PER_SEC) as i32,
-        nsec: (timestamp_ns % NS_PER_SEC) as i32,
-    }
-}
 
 pub fn to_cuv_pose(iso: &Isometry3<f64>) -> CuvPose {
     let rotation = iso.rotation.quaternion();
@@ -46,19 +31,15 @@ pub fn cuv_pose_to_isometry(pose: &CuvPose) -> Isometry3<f64> {
             pose.translation[1] as f64,
             pose.translation[2] as f64,
         ),
-        UnitQuaternion::from_quaternion(dimos_module::nalgebra::Quaternion::new(
+        UnitQuaternion::from_quaternion(nalgebra::Quaternion::new(
             w as f64, x as f64, y as f64, z as f64,
         )),
     )
 }
 
-pub fn transform_to_isometry(transform: &Transform) -> Isometry3<f64> {
-    Isometry3::from_parts(Translation3::from(transform.translation()), transform.rotation())
-}
-
 /// ROS orders plumb_bob (k1, k2, p1, p2, k3); cuVSLAM's Brown wants (k1, k2, k3, p1, p2).
-pub fn to_distortion(info: &CameraInfo) -> (u8, Vec<f32>) {
-    let d = &info.D;
+pub fn to_distortion(info: &CameraModel) -> (u8, Vec<f32>) {
+    let d = &info.distortion;
     let distorted = d.len() >= 5 && d.iter().any(|coefficient| *coefficient != 0.0);
     if !distorted {
         return (CUV_DISTORTION_PINHOLE, Vec::new());
@@ -74,21 +55,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stamp_round_trip() {
-        let stamp = to_stamp(1_234_567_890_123_456_789);
-        assert_eq!(stamp.sec, 1_234_567_890);
-        assert_eq!(stamp.nsec, 123_456_789);
-        let header = Header {
-            stamp,
-            ..Default::default()
-        };
-        assert_eq!(stamp_to_ns(&header), 1_234_567_890_123_456_789);
-    }
-
-    #[test]
     fn distortion_all_zero_is_pinhole() {
-        let info = CameraInfo {
-            D: vec![0.0; 5],
+        let info = CameraModel {
+            distortion: vec![0.0; 5],
             ..Default::default()
         };
         assert_eq!(to_distortion(&info), (CUV_DISTORTION_PINHOLE, Vec::new()));
@@ -96,14 +65,14 @@ mod tests {
 
     #[test]
     fn distortion_empty_is_pinhole() {
-        let info = CameraInfo::default();
+        let info = CameraModel::default();
         assert_eq!(to_distortion(&info), (CUV_DISTORTION_PINHOLE, Vec::new()));
     }
 
     #[test]
     fn distortion_plumb_bob_reorders_to_brown() {
-        let info = CameraInfo {
-            D: vec![0.1, 0.2, 0.3, 0.4, 0.5], // ROS: k1 k2 p1 p2 k3
+        let info = CameraModel {
+            distortion: vec![0.1, 0.2, 0.3, 0.4, 0.5],
             ..Default::default()
         };
         let (model, parameters) = to_distortion(&info);

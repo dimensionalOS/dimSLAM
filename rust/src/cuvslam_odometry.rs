@@ -5,24 +5,22 @@
 
 mod depth_cloud;
 mod depth_reproject;
-pub mod imu_info;
 mod msg_convert;
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
-use dimos_module::nalgebra::{Isometry3, Matrix3, Matrix6, Vector3};
-use dimos_module::{error_throttled, native_config, warn_throttled, Tf};
-use lcm_msgs::nav_msgs::Odometry;
-use lcm_msgs::sensor_msgs::{CameraInfo, Image, Imu, PointCloud2};
+use nalgebra::{Isometry3, Matrix3, Matrix6};
+use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use self::depth_cloud::depth_cloud;
 use self::depth_reproject::reproject_depth;
-use self::imu_info::ImuInfo;
-use self::msg_convert::{
-    cuv_pose_to_isometry, stamp_to_ns, to_cuv_pose, to_distortion, to_stamp, transform_to_isometry,
+use self::msg_convert::{cuv_pose_to_isometry, to_cuv_pose, to_distortion};
+use crate::types::{
+    CameraModel, ImageFrame, ImuNoiseModel, ImuSample, OdometryEstimate, PointCloud, TfLookup,
 };
+use crate::{error_throttled, warn_throttled};
 use cu_vslam_rs::{ffi, CameraParams, ImageRef, Tracker};
 
 /// cuVSLAM's Track() contract asks for stereo stamps within 1 ms.
@@ -91,8 +89,8 @@ fn image_encoding(encoding: &str) -> u8 {
     }
 }
 
-#[native_config]
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CuvslamOdometryConfig {
     /// "stereo", "mono" or "rgbd". Mono is accurate only up to scale.
     pub camera_mode: String,
@@ -111,22 +109,45 @@ pub struct CuvslamOdometryConfig {
     /// A teleport the covariance gate believes: m/s and rad/s against the previous raw pose.
     pub speed_gate_max_linear: f64,
     pub speed_gate_max_angular: f64,
-    /// cuVSLAM's Inertial mode: stereo plus one IMU, with its noise model from imu_info.
+    /// cuVSLAM's Inertial mode: stereo plus one IMU, whose noise model `handle_imu_info` supplies.
     pub enable_imu: bool,
     /// Raw depth units per metre. 1000 for sixteen-bit millimetres.
     pub depth_units_per_meter: f64,
-    /// Range gate on the published depth_cloud, metres; 0 leaves it open.
+    /// Range gate on the returned depth cloud, metres; 0 leaves it open.
     pub depth_cloud_min_range: f64,
     pub depth_cloud_max_range: f64,
     /// One median point per k x k depth block; <= 1 is off.
     pub depth_cloud_decimation: i64,
 }
 
+/// A zeroed default would divide depth by nothing and silently pick mono.
+impl Default for CuvslamOdometryConfig {
+    fn default() -> Self {
+        Self {
+            camera_mode: "stereo".to_string(),
+            camera_frames: Vec::new(),
+            rectified: true,
+            use_gpu: true,
+            odom_frame: "odom".to_string(),
+            base_frame: "base_link".to_string(),
+            rig_frame: String::new(),
+            covariance_gate_translation_std: 0.0,
+            speed_gate_max_linear: 0.0,
+            speed_gate_max_angular: 0.0,
+            enable_imu: false,
+            depth_units_per_meter: 1000.0,
+            depth_cloud_min_range: 0.0,
+            depth_cloud_max_range: 0.0,
+            depth_cloud_decimation: 0,
+        }
+    }
+}
+
 struct RigCamera {
     frame: String,
     rig_from_camera: Isometry3<f64>,
-    info: CameraInfo,
-    image: Option<Image>,
+    info: CameraModel,
+    image: Option<ImageFrame>,
 }
 
 enum DepthChoice {
@@ -138,16 +159,16 @@ pub struct VoCore {
     config: CuvslamOdometryConfig,
     /// The rig, in cuVSLAM's camera order.
     cameras: Vec<RigCamera>,
-    camera_info_by_frame: HashMap<String, CameraInfo>,
-    imu_model: Option<ImuInfo>,
-    /// cuVSLAM needs non-decreasing stamps, but the dispatcher lets images overtake the IMU.
+    camera_info_by_frame: HashMap<String, CameraModel>,
+    imu_model: Option<ImuNoiseModel>,
+    /// cuVSLAM needs non-decreasing stamps, but a caller's images can overtake its IMU.
     pending_imu: VecDeque<ffi::CuvImuMeasurement>,
     vslam: Option<Tracker>,
     tracker_unbuildable: bool,
 
-    depth: Option<Image>,
-    depth_info: Option<CameraInfo>,
-    aligned_depth: Image,
+    depth: Option<ImageFrame>,
+    depth_info: Option<CameraModel>,
+    aligned_depth: ImageFrame,
     camera_from_depth: Option<Isometry3<f64>>,
     last_ts_ns: Option<i64>,
 
@@ -186,7 +207,7 @@ impl VoCore {
             tracker_unbuildable: false,
             depth: None,
             depth_info: None,
-            aligned_depth: Image::default(),
+            aligned_depth: ImageFrame::default(),
             camera_from_depth: None,
             last_ts_ns: None,
             world_from_base: None,
@@ -227,16 +248,16 @@ impl VoCore {
         }
     }
 
-    pub fn handle_camera_info(&mut self, info: CameraInfo, tf: &Tf) {
+    pub fn handle_camera_info(&mut self, info: CameraModel, tf: &dyn TfLookup) {
         if self.vslam.is_some() {
             return; // rig is fixed once the tracker exists
         }
-        self.camera_info_by_frame.insert(info.header.frame_id.clone(), info);
+        self.camera_info_by_frame.insert(info.frame_id.clone(), info);
         self.resolve_rig(tf);
     }
 
     /// All-or-nothing: no camera is placed until every camera resolves.
-    fn resolve_rig(&mut self, tf: &Tf) {
+    fn resolve_rig(&mut self, tf: &dyn TfLookup) {
         if !self.cameras.is_empty() {
             return;
         }
@@ -263,7 +284,7 @@ impl VoCore {
 
         let mut cameras = Vec::new();
         for frame in &frames {
-            let Some(rig_from_camera) = tf.get_latest(self.rig_frame(), frame) else {
+            let Some(rig_from_camera) = tf.latest(self.rig_frame(), frame) else {
                 return;
             };
             let Some(info) = self.camera_info_by_frame.get(frame) else {
@@ -271,7 +292,7 @@ impl VoCore {
             };
             cameras.push(RigCamera {
                 frame: frame.clone(),
-                rig_from_camera: transform_to_isometry(&rig_from_camera),
+                rig_from_camera,
                 info: info.clone(),
                 image: None,
             });
@@ -289,7 +310,7 @@ impl VoCore {
         self.cameras.iter().position(|camera| camera.frame == frame_id)
     }
 
-    pub fn handle_imu_info(&mut self, info: ImuInfo, tf: &Tf) {
+    pub fn handle_imu_info(&mut self, info: ImuNoiseModel, tf: &dyn TfLookup) {
         if self.vslam.is_some() {
             return; // rig is fixed once the tracker exists
         }
@@ -297,13 +318,13 @@ impl VoCore {
         self.resolve_rig(tf);
     }
 
-    pub fn handle_imu(&mut self, msg: &Imu) {
+    pub fn handle_imu(&mut self, msg: &ImuSample) {
         if self.vslam.is_none() {
             self.imu_dropped += 1;
             return;
         }
         self.pending_imu.push_back(ffi::CuvImuMeasurement {
-            timestamp_ns: stamp_to_ns(&msg.header),
+            timestamp_ns: msg.timestamp_ns,
             linear_accelerations: [
                 msg.linear_acceleration.x as f32,
                 msg.linear_acceleration.y as f32,
@@ -321,15 +342,15 @@ impl VoCore {
         self.imu_samples += 1;
     }
 
-    pub fn handle_image(&mut self, img: Image, tf: &Tf) -> Option<Odometry> {
+    pub fn handle_image(&mut self, img: ImageFrame, tf: &dyn TfLookup) -> Option<OdometryEstimate> {
         if self.cameras.is_empty() {
             self.resolve_rig(tf);
         }
-        let Some(index) = self.camera_index(&img.header.frame_id) else {
+        let Some(index) = self.camera_index(&img.frame_id) else {
             self.unplaced_images += 1;
             warn_throttled!(
                 Duration::from_secs(10),
-                frame_id = %img.header.frame_id,
+                frame_id = %img.frame_id,
                 dropped = self.unplaced_images,
                 rig_cameras = self.cameras.len(),
                 "cuvslam dropping image with a frame_id not on the rig",
@@ -342,9 +363,9 @@ impl VoCore {
 
     pub fn handle_depth_image(
         &mut self,
-        img: Image,
-        tf: &Tf,
-    ) -> (Option<PointCloud2>, Option<Odometry>) {
+        img: ImageFrame,
+        tf: &dyn TfLookup,
+    ) -> (Option<PointCloud>, Option<OdometryEstimate>) {
         // Downstream indexes by step and height, so an undersized buffer would panic.
         let expected_bytes = img.step as usize * img.height as usize;
         if img.step < img.width * 2 || img.data.len() < expected_bytes {
@@ -364,14 +385,14 @@ impl VoCore {
     }
 
     /// A driver's own cloud carries every far, noisy pixel; this one is range-gated.
-    fn depth_cloud_msg(&self, depth: &Image) -> Option<PointCloud2> {
+    fn depth_cloud_msg(&self, depth: &ImageFrame) -> Option<PointCloud> {
         let info = self.depth_info.as_ref().or_else(|| {
             self.cameras
                 .iter()
-                .find(|camera| camera.frame == depth.header.frame_id)
+                .find(|camera| camera.frame == depth.frame_id)
                 .map(|camera| &camera.info)
         })?;
-        let mut cloud = PointCloud2::default();
+        let mut cloud = PointCloud::default();
         depth_cloud(
             depth,
             info,
@@ -384,23 +405,23 @@ impl VoCore {
         Some(cloud)
     }
 
-    pub fn handle_depth_camera_info(&mut self, info: CameraInfo) {
+    pub fn handle_depth_camera_info(&mut self, info: CameraModel) {
         if self.depth_info.is_none() {
             self.depth_info = Some(info);
         }
     }
 
     /// cuVSLAM's RGBD contract needs depth pixel-aligned with the rig camera.
-    fn align_depth(&mut self, tf: &Tf) -> Option<DepthChoice> {
+    fn align_depth(&mut self, tf: &dyn TfLookup) -> Option<DepthChoice> {
         let depth = self.depth.as_ref().expect("checked by try_track");
         let camera = &self.cameras[0];
-        if depth.header.frame_id == camera.frame {
+        if depth.frame_id == camera.frame {
             return Some(DepthChoice::Passthrough);
         }
         let Some(depth_info) = self.depth_info.as_ref() else {
             warn_throttled!(
                 Duration::from_secs(10),
-                depth_frame = %depth.header.frame_id,
+                depth_frame = %depth.frame_id,
                 camera_frame = %camera.frame,
                 "cuvslam: depth is in another frame than the camera and needs \
                  depth_camera_info to reproject",
@@ -408,18 +429,18 @@ impl VoCore {
             return None;
         };
         if self.camera_from_depth.is_none() {
-            let Some(camera_from_depth) = tf.get_latest(&camera.frame, &depth.header.frame_id) else {
+            let Some(camera_from_depth) = tf.latest(&camera.frame, &depth.frame_id) else {
                 warn_throttled!(
                     Duration::from_secs(10),
-                    depth_frame = %depth.header.frame_id,
+                    depth_frame = %depth.frame_id,
                     camera_frame = %camera.frame,
                     "cuvslam: tf does not connect the depth frame to the camera",
                 );
                 return None;
             };
-            self.camera_from_depth = Some(transform_to_isometry(&camera_from_depth));
+            self.camera_from_depth = Some(camera_from_depth);
             info!(
-                depth_frame = %depth.header.frame_id,
+                depth_frame = %depth.frame_id,
                 camera_frame = %camera.frame,
                 "cuvslam reprojecting depth onto the rig camera"
             );
@@ -438,11 +459,11 @@ impl VoCore {
         Some(DepthChoice::Aligned)
     }
 
-    fn ensure_tracker(&mut self, tf: &Tf) {
+    fn ensure_tracker(&mut self, tf: &dyn TfLookup) {
         if self.vslam.is_some() || self.tracker_unbuildable {
             return;
         }
-        let Some(base_from_rig) = tf.get_latest(&self.config.base_frame, self.rig_frame()) else {
+        let Some(base_from_rig) = tf.latest(&self.config.base_frame, self.rig_frame()) else {
             warn_throttled!(
                 Duration::from_secs(10),
                 rig_frame = self.rig_frame(),
@@ -451,7 +472,6 @@ impl VoCore {
             );
             return;
         };
-        let base_from_rig = transform_to_isometry(&base_from_rig);
         self.base_from_rig = Some(base_from_rig);
         self.rig_from_base = Some(base_from_rig.inverse());
         self.covariance_adjoint = se3_adjoint(&base_from_rig);
@@ -465,8 +485,8 @@ impl VoCore {
                 CameraParams {
                     width: info.width,
                     height: info.height,
-                    principal: [info.K[2] as f32, info.K[5] as f32],
-                    focal: [info.K[0] as f32, info.K[4] as f32],
+                    principal: [info.intrinsics[2] as f32, info.intrinsics[5] as f32],
+                    focal: [info.intrinsics[0] as f32, info.intrinsics[4] as f32],
                     rig_from_camera: to_cuv_pose(&rig_camera.rig_from_camera),
                     distortion_model,
                     distortion_parameters,
@@ -483,8 +503,8 @@ impl VoCore {
                 );
                 return;
             };
-            let imu_frame = &imu_model.header.frame_id;
-            let Some(rig_from_imu) = tf.get_latest(self.rig_frame(), imu_frame) else {
+            let imu_frame = &imu_model.frame_id;
+            let Some(rig_from_imu) = tf.latest(self.rig_frame(), imu_frame) else {
                 warn_throttled!(
                     Duration::from_secs(10),
                     imu_frame = %imu_frame,
@@ -493,7 +513,7 @@ impl VoCore {
                 return;
             };
             imu_calibration = Some(ffi::CuvImuCalibration {
-                rig_from_imu: to_cuv_pose(&transform_to_isometry(&rig_from_imu)),
+                rig_from_imu: to_cuv_pose(&rig_from_imu),
                 gyroscope_noise_density: imu_model.gyro_noise_density as f32,
                 gyroscope_random_walk: imu_model.gyro_random_walk as f32,
                 accelerometer_noise_density: imu_model.accel_noise_density as f32,
@@ -571,7 +591,7 @@ impl VoCore {
         self.depth = None;
     }
 
-    fn try_track(&mut self, tf: &Tf) -> Option<Odometry> {
+    fn try_track(&mut self, tf: &dyn TfLookup) -> Option<OdometryEstimate> {
         let mode = self.mode();
         if self.cameras.is_empty() || (mode == Mode::Rgbd && self.depth.is_none()) {
             return None;
@@ -585,7 +605,7 @@ impl VoCore {
         let stamps: Vec<i64> = self
             .cameras
             .iter()
-            .map(|camera| stamp_to_ns(&camera.image.as_ref().expect("checked above").header))
+            .map(|camera| camera.image.as_ref().expect("checked above").timestamp_ns)
             .collect();
         let oldest = *stamps.iter().min().expect("nonempty");
         let newest = *stamps.iter().max().expect("nonempty");
@@ -753,28 +773,15 @@ impl VoCore {
         Some(self.output(estimate.timestamp_ns))
     }
 
-    fn output(&self, timestamp_ns: i64) -> Odometry {
-        let world_from_base = self.world_from_base.unwrap_or_else(Isometry3::identity);
-        let mut msg = Odometry::default();
-        msg.header.stamp = to_stamp(timestamp_ns);
-        msg.header.frame_id = self.config.odom_frame.clone();
-        msg.child_frame_id = self.config.base_frame.clone();
-        let translation: Vector3<f64> = world_from_base.translation.vector;
-        msg.pose.pose.position.x = translation.x;
-        msg.pose.pose.position.y = translation.y;
-        msg.pose.pose.position.z = translation.z;
-        let rotation = world_from_base.rotation.quaternion();
-        msg.pose.pose.orientation.x = rotation.i;
-        msg.pose.pose.orientation.y = rotation.j;
-        msg.pose.pose.orientation.z = rotation.k;
-        msg.pose.pose.orientation.w = rotation.w;
-        // Row-major xyz-rpy, the order ROS uses.
-        for row in 0..6 {
-            for column in 0..6 {
-                msg.pose.covariance[row * 6 + column] = self.covariance[(row, column)];
-            }
+    fn output(&self, timestamp_ns: i64) -> OdometryEstimate {
+        OdometryEstimate {
+            timestamp_ns,
+            frame_id: self.config.odom_frame.clone(),
+            child_frame_id: self.config.base_frame.clone(),
+            pose: self.world_from_base.unwrap_or_else(Isometry3::identity),
+            pose_covariance: self.covariance,
+            ..Default::default()
         }
-        msg
     }
 
     pub fn report(&self) {
@@ -789,7 +796,7 @@ impl VoCore {
             covariance_gated = self.covariance_gated,
             speed_gated = self.speed_gated,
             unmatched_images = self.unplaced_images,
-            "cuvslam shutting down"
+            "cuvslam odometry counters"
         );
     }
 }
@@ -797,7 +804,7 @@ impl VoCore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dimos_module::nalgebra::{Translation3, UnitQuaternion};
+    use nalgebra::{Translation3, UnitQuaternion};
 
     #[test]
     fn adjoint_of_identity_is_identity() {

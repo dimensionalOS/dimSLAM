@@ -1,5 +1,6 @@
 // cargo:rustc-link-arg applies only to the package that emits it, so cu_vslam_rs's rpath
-// never reaches this binary and it dies at startup on @rpath/libcuvslam.dylib.
+// never reaches our test binaries and they die at startup on @rpath/libcuvslam.dylib.
+// A downstream binary has to emit this for itself.
 use std::env;
 
 fn main() {

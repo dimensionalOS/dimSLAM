@@ -1,19 +1,19 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Error-state Kalman filter fusing IMU propagation with nav_msgs/Odometry sources told apart
-// by header.frame_id. Without an IMU there is no process model: see `blend`.
+// Error-state Kalman filter fusing IMU propagation with odometry sources told apart by their
+// frame_id. Without an IMU there is no process model: see `blend`.
 
 mod eskf;
 
 use std::collections::{HashMap, VecDeque};
 
-use dimos_module::nalgebra::{DVector, Isometry3, Translation3, UnitQuaternion, Vector3};
-use dimos_module::{native_config, warn_throttled, Transform};
-use lcm_msgs::nav_msgs::Odometry;
-use lcm_msgs::sensor_msgs::Imu;
+use nalgebra::{DVector, Isometry3, Matrix6, Translation3, UnitQuaternion, Vector3};
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use crate::types::{ImuSample, OdometryEstimate, Twist};
+use crate::warn_throttled;
 use eskf::{Filter, Jacobian, Mat15, State, Vec15};
 
 const NS_PER_SEC: i64 = 1_000_000_000;
@@ -24,21 +24,6 @@ const STATIONARY_GYRO_LIMIT: f64 = 0.05;
 /// Raw gyro differences are too noisy for the tangential lever-arm term. A time constant, not
 /// a per-sample weight, so the cutoff does not move with IMU rate.
 const ANGULAR_ACCEL_TIME_CONSTANT: f64 = 0.025;
-
-fn stamp_to_ns(header: &lcm_msgs::std_msgs::Header) -> i64 {
-    header.stamp.sec as i64 * NS_PER_SEC + header.stamp.nsec as i64
-}
-
-fn to_stamp(timestamp_ns: i64) -> lcm_msgs::std_msgs::Time {
-    lcm_msgs::std_msgs::Time {
-        sec: (timestamp_ns / NS_PER_SEC) as i32,
-        nsec: (timestamp_ns % NS_PER_SEC) as i32,
-    }
-}
-
-fn vector3(v: &lcm_msgs::geometry_msgs::Vector3) -> Vector3<f64> {
-    Vector3::new(v.x, v.y, v.z)
-}
 
 /// A non-finite or non-positive variance drops the dimension rather than being divided by.
 fn resolve_variance(configured: f64, from_message: f64) -> f64 {
@@ -54,8 +39,8 @@ fn resolve_variance(configured: f64, from_message: f64) -> f64 {
     }
 }
 
-#[native_config]
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OdometryFusionConfig {
     pub odom_frame: String,
     pub base_frame: String,
@@ -81,7 +66,7 @@ pub struct OdometryFusionConfig {
     pub initial_velocity_std: f64,
     pub initial_rotation_std: f64,
     pub initial_bias_std: f64,
-    /// One entry per source: the header.frame_id its messages carry.
+    /// One entry per source: the frame_id its estimates carry.
     pub source_frames: Vec<String>,
     /// 6 per source, [x y z roll pitch yaw]: <0 message covariance, 0 drop, >0 fixed.
     /// A drifting source's covariance describes accumulated drift, not the delta: prefer a fixed value.
@@ -91,6 +76,35 @@ pub struct OdometryFusionConfig {
     /// Virtual zero-twist [vx vy vz wx wy wz] fused after each source update (use_imu only):
     /// >0 pins that dimension to zero with this variance (e.g. non-holonomic vy, vz), 0 frees it.
     pub constraint_twist_variances: Vec<f64>,
+}
+
+/// The derived default would be all zeros, which `check_config` rejects and gravity needs.
+impl Default for OdometryFusionConfig {
+    fn default() -> Self {
+        Self {
+            odom_frame: "odom".to_string(),
+            base_frame: "base_link".to_string(),
+            publish_rate: 100.0,
+            replay_buffer_seconds: 0.5,
+            mahalanobis_gate: 5.0,
+            max_position_m: 0.0,
+            use_imu: false,
+            imu_gyro_noise_density: 0.0,
+            imu_gyro_random_walk: 0.0,
+            imu_accel_noise_density: 0.0,
+            imu_accel_random_walk: 0.0,
+            gravity: 9.80665,
+            imu_init_samples: 200,
+            initial_position_std: 0.1,
+            initial_velocity_std: 0.1,
+            initial_rotation_std: 0.05,
+            initial_bias_std: 0.01,
+            source_frames: Vec::new(),
+            source_pose_variances: Vec::new(),
+            source_twist_variances: Vec::new(),
+            constraint_twist_variances: vec![0.0; 6],
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -193,12 +207,12 @@ impl FusionCore {
     }
 
     /// The filter's body frame is base_frame, so both IMU vectors are rotated through the mount.
-    pub fn handle_imu(&mut self, imu: &Imu, base_from_imu: &Transform) {
-        let lever = base_from_imu.translation();
-        let base_from_imu = base_from_imu.rotation();
-        let gyro = base_from_imu * vector3(&imu.angular_velocity);
-        let mut accel = base_from_imu * vector3(&imu.linear_acceleration);
-        let ts_ns = stamp_to_ns(&imu.header);
+    pub fn handle_imu(&mut self, imu: &ImuSample, base_from_imu: &Isometry3<f64>) {
+        let lever = base_from_imu.translation.vector;
+        let base_from_imu = base_from_imu.rotation;
+        let gyro = base_from_imu * imu.angular_velocity;
+        let mut accel = base_from_imu * imu.linear_acceleration;
+        let ts_ns = imu.timestamp_ns;
         if self.lever_gyro_ns != 0 {
             let dt = (ts_ns - self.lever_gyro_ns) as f64 / NS_PER_SEC as f64;
             if dt > 0.0 {
@@ -257,14 +271,14 @@ impl FusionCore {
         self.imu_samples += 1;
     }
 
-    pub fn handle_source(&mut self, msg: &Odometry) {
+    pub fn handle_source(&mut self, msg: &OdometryEstimate) {
         if !self.initialized {
             if self.config.use_imu {
                 return;
             }
             self.check_config();
             self.initialize(
-                stamp_to_ns(&msg.header),
+                msg.timestamp_ns,
                 UnitQuaternion::identity(),
                 Vector3::zeros(),
                 Vector3::zeros(),
@@ -274,38 +288,26 @@ impl FusionCore {
             .config
             .source_frames
             .iter()
-            .position(|frame| *frame == msg.header.frame_id)
+            .position(|frame| *frame == msg.frame_id)
         else {
-            warn!(frame_id = %msg.header.frame_id, "odometry from unconfigured frame_id dropped");
+            warn!(frame_id = %msg.frame_id, "odometry from unconfigured frame_id dropped");
             return;
         };
 
-        let absolute = msg.header.frame_id == self.config.odom_frame;
+        let absolute = msg.frame_id == self.config.odom_frame;
         let mut pose_variance = [0.0; 6];
         let mut twist_variance = [0.0; 6];
         for dim in 0..6 {
             pose_variance[dim] = resolve_variance(
                 self.config.source_pose_variances[source * 6 + dim],
-                msg.pose.covariance[dim * 7],
+                msg.pose_covariance[(dim, dim)],
             );
             twist_variance[dim] = resolve_variance(
                 self.config.source_twist_variances[source * 6 + dim],
-                msg.twist.covariance[dim * 7],
+                msg.twist_covariance[(dim, dim)],
             );
         }
 
-        let orientation = UnitQuaternion::from_quaternion(dimos_module::nalgebra::Quaternion::new(
-            msg.pose.pose.orientation.w,
-            msg.pose.pose.orientation.x,
-            msg.pose.pose.orientation.y,
-            msg.pose.pose.orientation.z,
-        ));
-        let raw_norm = (msg.pose.pose.orientation.w.powi(2)
-            + msg.pose.pose.orientation.x.powi(2)
-            + msg.pose.pose.orientation.y.powi(2)
-            + msg.pose.pose.orientation.z.powi(2))
-        .sqrt();
-        let pose_valid = (raw_norm - 1.0).abs() < 0.1;
         let pose_wanted = pose_variance.iter().any(|v| *v > 0.0);
 
         let mut measurement = Measurement {
@@ -315,26 +317,15 @@ impl FusionCore {
             delta: None,
             pose_variance,
             twist_variance,
-            linear: Vector3::new(
-                msg.twist.twist.linear.x,
-                msg.twist.twist.linear.y,
-                msg.twist.twist.linear.z,
-            ),
-            angular: Vector3::new(
-                msg.twist.twist.angular.x,
-                msg.twist.twist.angular.y,
-                msg.twist.twist.angular.z,
-            ),
+            linear: msg.twist.linear,
+            angular: msg.twist.angular,
         };
-        if pose_wanted && pose_valid {
-            let pose = Isometry3::from_parts(
-                Translation3::new(
-                    msg.pose.pose.position.x,
-                    msg.pose.pose.position.y,
-                    msg.pose.pose.position.z,
-                ),
-                orientation,
-            );
+        // A caller building a UnitQuaternion from a zeroed message gets NaN, not an error, and
+        // one NaN reaching the state wedges the filter for good: nothing downstream recovers.
+        let pose_finite = msg.pose.translation.vector.iter().all(|v| v.is_finite())
+            && msg.pose.rotation.coords.iter().all(|v| v.is_finite());
+        if pose_wanted && pose_finite {
+            let pose = msg.pose;
             if absolute {
                 measurement.pose = Some(pose);
             } else {
@@ -346,7 +337,7 @@ impl FusionCore {
         }
 
         self.insert(Event {
-            ts_ns: stamp_to_ns(&msg.header),
+            ts_ns: msg.timestamp_ns,
             kind: EventKind::Measurement(measurement),
             state: State::default(),
             covariance: Mat15::identity(),
@@ -719,7 +710,7 @@ impl FusionCore {
         finite && capped
     }
 
-    pub fn maybe_publish(&mut self) -> Option<(Odometry, Transform)> {
+    pub fn maybe_publish(&mut self) -> Option<OdometryEstimate> {
         let latest = self.events.back()?;
         let period = (1.0e9 / self.config.publish_rate.max(1.0)) as i64;
         if latest.ts_ns - self.last_publish_ns < period {
@@ -738,45 +729,34 @@ impl FusionCore {
         let body_velocity = body_from_world * state.velocity;
         let body_angular = last_gyro - state.gyro_bias;
 
-        let mut msg = Odometry::default();
-        msg.header.stamp = to_stamp(ts_ns);
-        msg.header.frame_id = self.config.odom_frame.clone();
-        msg.child_frame_id = self.config.base_frame.clone();
-        msg.pose.pose.position.x = state.position.x;
-        msg.pose.pose.position.y = state.position.y;
-        msg.pose.pose.position.z = state.position.z;
-        msg.pose.pose.orientation.x = state.q.i;
-        msg.pose.pose.orientation.y = state.q.j;
-        msg.pose.pose.orientation.z = state.q.k;
-        msg.pose.pose.orientation.w = state.q.w;
-        msg.twist.twist.linear.x = body_velocity.x;
-        msg.twist.twist.linear.y = body_velocity.y;
-        msg.twist.twist.linear.z = body_velocity.z;
-        msg.twist.twist.angular.x = body_angular.x;
-        msg.twist.twist.angular.y = body_angular.y;
-        msg.twist.twist.angular.z = body_angular.z;
         let velocity_world = covariance.fixed_view::<3, 3>(3, 3).into_owned();
         let velocity_body =
             body_from_world.matrix() * velocity_world * body_from_world.matrix().transpose();
+        let mut pose_covariance = Matrix6::zeros();
+        let mut twist_covariance = Matrix6::zeros();
         for row in 0..3 {
             for col in 0..3 {
-                msg.pose.covariance[row * 6 + col] = covariance[(row, col)];
-                msg.pose.covariance[row * 6 + col + 3] = covariance[(row, col + 6)];
-                msg.pose.covariance[(row + 3) * 6 + col] = covariance[(row + 6, col)];
-                msg.pose.covariance[(row + 3) * 6 + col + 3] = covariance[(row + 6, col + 6)];
-                msg.twist.covariance[row * 6 + col] = velocity_body[(row, col)];
-                msg.twist.covariance[(row + 3) * 6 + col + 3] = covariance[(row + 9, col + 9)];
+                pose_covariance[(row, col)] = covariance[(row, col)];
+                pose_covariance[(row, col + 3)] = covariance[(row, col + 6)];
+                pose_covariance[(row + 3, col)] = covariance[(row + 6, col)];
+                pose_covariance[(row + 3, col + 3)] = covariance[(row + 6, col + 6)];
+                twist_covariance[(row, col)] = velocity_body[(row, col)];
+                twist_covariance[(row + 3, col + 3)] = covariance[(row + 9, col + 9)];
             }
         }
 
-        let pose = Isometry3::from_parts(Translation3::from(state.position), state.q);
-        let transform = Transform::new(
-            self.config.odom_frame.clone(),
-            self.config.base_frame.clone(),
-            ts_ns as f64 / 1.0e9,
-            pose,
-        );
-        Some((msg, transform))
+        Some(OdometryEstimate {
+            timestamp_ns: ts_ns,
+            frame_id: self.config.odom_frame.clone(),
+            child_frame_id: self.config.base_frame.clone(),
+            pose: Isometry3::from_parts(state.position.into(), state.q),
+            pose_covariance,
+            twist: Twist {
+                linear: body_velocity,
+                angular: body_angular,
+            },
+            twist_covariance,
+        })
     }
 
     pub fn report(&self) {
@@ -786,7 +766,7 @@ impl FusionCore {
             gated = self.gated,
             replayed = self.replayed,
             too_late = self.too_late,
-            "odometry_fusion shutting down"
+            "odometry fusion counters"
         );
     }
 }
@@ -794,6 +774,7 @@ impl FusionCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nalgebra::Quaternion;
 
     const GRAVITY: f64 = 9.80665;
 
@@ -823,37 +804,30 @@ mod tests {
         }
     }
 
-    fn source_message(frame_id: &str, ts_ns: i64, x: f64) -> Odometry {
-        let mut msg = Odometry::default();
-        msg.header.stamp = to_stamp(ts_ns);
-        msg.header.frame_id = frame_id.to_string();
-        msg.pose.pose.position.x = x;
-        msg.pose.pose.orientation.w = 1.0;
-        msg
+    fn source_message(frame_id: &str, ts_ns: i64, x: f64) -> OdometryEstimate {
+        OdometryEstimate {
+            timestamp_ns: ts_ns,
+            frame_id: frame_id.to_string(),
+            pose: Isometry3::translation(x, 0.0, 0.0),
+            ..Default::default()
+        }
     }
 
-    fn imu_message(ts_ns: i64, gyro_z: f64, accel_x: f64) -> Imu {
-        let mut imu = Imu::default();
-        imu.header.stamp = to_stamp(ts_ns);
-        imu.header.frame_id = "imu".to_string();
-        imu.angular_velocity.z = gyro_z;
-        imu.linear_acceleration.x = accel_x;
-        imu.linear_acceleration.z = GRAVITY;
-        imu
+    fn imu_message(ts_ns: i64, gyro_z: f64, accel_x: f64) -> ImuSample {
+        ImuSample {
+            timestamp_ns: ts_ns,
+            frame_id: "imu".to_string(),
+            angular_velocity: Vector3::new(0.0, 0.0, gyro_z),
+            linear_acceleration: Vector3::new(accel_x, 0.0, GRAVITY),
+        }
     }
 
-    fn identity_mount() -> Transform {
-        Transform::new("base", "imu", 0.0, Isometry3::identity())
+    fn identity_mount() -> Isometry3<f64> {
+        Isometry3::identity()
     }
 
     fn published_position(core: &mut FusionCore) -> Option<Vector3<f64>> {
-        core.maybe_publish().map(|(msg, _)| {
-            Vector3::new(
-                msg.pose.pose.position.x,
-                msg.pose.pose.position.y,
-                msg.pose.pose.position.z,
-            )
-        })
+        core.maybe_publish().map(|msg| msg.pose.translation.vector)
     }
 
     #[test]
@@ -887,6 +861,24 @@ mod tests {
     }
 
     #[test]
+    fn a_nan_pose_is_dropped_rather_than_wedging_the_filter() {
+        let mut config = base_config(false);
+        config.source_frames = vec!["visual_odom".to_string()];
+        let mut core = FusionCore::new(config);
+        core.handle_source(&source_message("visual_odom", 0, 10.0));
+
+        let mut nan_pose = source_message("visual_odom", NS_PER_SEC / 20, 10.25);
+        nan_pose.pose.rotation =
+            UnitQuaternion::from_quaternion(Quaternion::new(0.0, 0.0, 0.0, 0.0));
+        assert!(nan_pose.pose.rotation.coords.iter().any(|v| v.is_nan()));
+        core.handle_source(&nan_pose);
+
+        core.handle_source(&source_message("visual_odom", NS_PER_SEC / 10, 10.5));
+        let position = published_position(&mut core).expect("a period has elapsed");
+        assert!((position.x - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
     fn maybe_publish_waits_for_the_period_and_stamps_odom_to_base() {
         let mut config = base_config(false);
         config.publish_rate = 10.0;
@@ -896,11 +888,9 @@ mod tests {
         core.handle_source(&source_message("odom", NS_PER_SEC / 20, 0.5));
         assert!(core.maybe_publish().is_none());
         core.handle_source(&source_message("odom", NS_PER_SEC / 10, 1.0));
-        let (msg, transform) = core.maybe_publish().expect("a full period has elapsed");
-        assert_eq!(msg.header.frame_id, "odom");
+        let msg = core.maybe_publish().expect("a full period has elapsed");
+        assert_eq!(msg.frame_id, "odom");
         assert_eq!(msg.child_frame_id, "base");
-        assert_eq!(transform.parent, "odom");
-        assert_eq!(transform.child, "base");
     }
 
     #[test]
@@ -948,13 +938,9 @@ mod tests {
                 if step % 10 == 0 {
                     core.handle_source(&source_message("odom", ts_ns, step as f64 * 0.02));
                 }
-                if let Some((msg, _)) = core.maybe_publish() {
-                    published.push((
-                        msg.pose.pose.position.x,
-                        msg.pose.pose.position.y,
-                        msg.pose.pose.position.z,
-                        msg.pose.pose.orientation.w,
-                    ));
+                if let Some(msg) = core.maybe_publish() {
+                    let position = msg.pose.translation.vector;
+                    published.push((position.x, position.y, position.z, msg.pose.rotation.w));
                 }
             }
             published

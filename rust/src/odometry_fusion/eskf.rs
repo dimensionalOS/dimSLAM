@@ -4,7 +4,7 @@
 // Error-state order: position(0:3) velocity(3:6) theta(6:9) gyro_bias(9:12)
 // accel_bias(12:15), theta a right (body-frame) perturbation: q_true = q_est * Exp(theta).
 
-use dimos_module::nalgebra::{DVector, Dyn, Matrix3, OMatrix, SMatrix, UnitQuaternion, Vector3, U15};
+use nalgebra::{DVector, Dyn, Matrix3, OMatrix, SMatrix, UnitQuaternion, Vector3, U15};
 
 pub type Mat15 = SMatrix<f64, 15, 15>;
 pub type Vec15 = SMatrix<f64, 15, 1>;
