@@ -16,23 +16,8 @@ fn xyz_field(name: &str, offset: i32) -> PointField {
     }
 }
 
-/// Deprojects depth pixels through the depth intrinsics and keeps the ones inside the
-/// range gate. Stereo depth error grows as range squared, so the far gate is what makes the
-/// cloud usable for mapping; `max_range` of 0 leaves it open. Points come out in
-/// `depth.header.frame_id`, unrotated, for a consumer that already knows where the sensor is.
-///
-/// `decimation` <= 1 emits every pixel. Otherwise each k x k block becomes at most one
-/// point: the median of its in-gate depths, deprojected at the block centre. Median rather
-/// than mean because averaging across a depth discontinuity invents a point mid-air between
-/// foreground and background (the classic flying pixel); the median snaps to one surface.
-/// Blocks where fewer than half the pixels have valid in-gate depth are dropped outright —
-/// those sit on object edges or specular holes where stereo depth is least trustworthy.
-///
-/// The median only outvotes flying pixels that are a minority of their block; a fringe wide
-/// enough to fill blocks becomes the median itself. Those survivors are caught by where they
-/// sit: a block whose median lies well between two opposing neighbour blocks hangs mid-air
-/// across a discontinuity, which no real surface does — a thin object stands in front of
-/// both its neighbours and a sloped surface stays within the mid-gap margin of them.
+/// Points come out in `depth.header.frame_id`, unrotated. Median (not mean) per block so a
+/// flying pixel across a depth discontinuity cannot invent a mid-air point.
 pub fn depth_cloud(
     depth: &Image,
     depth_info: &CameraInfo,

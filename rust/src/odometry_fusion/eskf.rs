@@ -1,14 +1,8 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Error-state Kalman filter for odometry fusion. The IMU is the process model:
-// it propagates position, velocity, orientation, and both biases, while the
-// covariance carries the cross-terms that let position-space measurements
-// correct velocity and bias. Measurements arrive as stacked scalar rows with a
-// diagonal noise, so callers pick dimensions freely.
-//
-// Error-state order: p(0:3) v(3:6) theta(6:9) bg(9:12) ba(12:15), with theta a
-// right (body-frame) rotation perturbation: q_true = q_est * Exp(theta).
+// Error-state order: p(0:3) v(3:6) theta(6:9) bg(9:12) ba(12:15), theta a right
+// (body-frame) perturbation: q_true = q_est * Exp(theta).
 
 use dimos_module::nalgebra::{DVector, Dyn, Matrix3, OMatrix, SMatrix, UnitQuaternion, Vector3, U15};
 
@@ -135,9 +129,8 @@ impl Filter {
         self.p_cov = f * self.p_cov * f.transpose() + q_noise;
     }
 
-    /// One stacked update with a diagonal noise. `gate` is a Mahalanobis
-    /// threshold in standard deviations per degree of freedom; 0 disables the
-    /// gate. Returns false when the measurement was rejected.
+    /// `gate` is a Mahalanobis threshold in standard deviations per degree of freedom;
+    /// 0 disables it.
     // The negated comparison is deliberate: a NaN distance must reject.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub fn update(

@@ -2,18 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Error-state Kalman filter fusing IMU propagation with any number of
-// nav_msgs/Odometry sources, told apart by header.frame_id.
-//
-// Source semantics come from the frame ids alone: a source whose header.frame_id
-// equals odom_frame is fused absolutely; any other frame drifts on its own, so
-// consecutive poses are fused as filter-anchored deltas. Twist is fused in the
-// body frame either way. Per-source, per-dimension variances pick the trust:
-// negative uses the message covariance, zero drops the dimension, positive is a
-// fixed variance. Late measurements roll the filter back and replay.
-//
-// Without an IMU there is no process model, and a Kalman update cannot both pass a lone
-// source through and average several, so that mode is not a Kalman filter: see
-// `blend`.
+// nav_msgs/Odometry sources, told apart by header.frame_id. Without an IMU there is no
+// process model, so that mode is not a Kalman filter: see `blend`.
 
 mod eskf;
 
@@ -111,7 +101,6 @@ pub struct OdometryFusionConfig {
 struct Measurement {
     source: usize,
     absolute: bool,
-    /// Absolute pose, or `None` when the message carried no usable pose.
     pose: Option<Isometry3<f64>>,
     /// Consecutive-message delta when the source drifts.
     delta: Option<Isometry3<f64>>,
@@ -158,7 +147,6 @@ struct Event {
     last_gyro: Vector3<f64>,
 }
 
-/// The filter itself, free of any transport; the module in main.rs drives it.
 pub struct FusionCore {
     config: OdometryFusionConfig,
     filter: Filter,
@@ -212,16 +200,15 @@ impl FusionCore {
         }
     }
 
-    /// `base_from_imu` places the IMU's mount frame (e.g. a camera optical frame) in
-    /// base_frame, where the filter state lives; both vectors are rotated through it.
+    /// The filter state lives in base_frame, so both IMU vectors are rotated through the
+    /// mount.
     pub fn handle_imu(&mut self, imu: &Imu, base_from_imu: &Transform) {
         let lever = base_from_imu.translation();
         let base_from_imu = base_from_imu.rotation();
         let gyro = base_from_imu * vector3(&imu.angular_velocity);
         let mut accel = base_from_imu * vector3(&imu.linear_acceleration);
-        // The IMU rides half a metre off the base origin, so any rotation adds
-        // centripetal and tangential acceleration at its location -- kinematics of the
-        // mount, not base motion. ~1.2 m/s^2 during this robot's in-place spins.
+        // A non-zero lever arm adds centripetal and tangential acceleration that is mount
+        // kinematics, not base motion.
         let ts_ns = stamp_to_ns(&imu.header);
         if self.lever_gyro_ns != 0 {
             let dt = (ts_ns - self.lever_gyro_ns) as f64 / NS_PER_SEC as f64;
@@ -235,8 +222,6 @@ impl FusionCore {
         accel -= gyro.cross(&gyro.cross(&lever)) + self.lever_alpha.cross(&lever);
         if !self.initialized {
             self.check_config();
-            // Gyro bias is only observable while stationary; a sample this large is real
-            // rotation (MEMS bias is ~0.01 rad/s), so restart the window until it is over.
             if gyro.norm() > STATIONARY_GYRO_LIMIT {
                 warn_throttled!(
                     std::time::Duration::from_secs(5),
@@ -461,7 +446,6 @@ impl FusionCore {
             warn!("measurement older than the replay buffer dropped");
             return;
         } else {
-            // Roll back to the event just before the late slot and replay forward.
             let slot = self.events.partition_point(|e| e.ts_ns <= event.ts_ns);
             self.events.insert(slot, event);
             for index in slot..self.events.len() {
@@ -476,8 +460,7 @@ impl FusionCore {
         }
     }
 
-    /// Runs the event at `index` against the filter restored from its predecessor's
-    /// snapshot, then snapshots into it. Replay is just calling this again in order.
+    /// Replay is just calling this again in order.
     fn process_at(&mut self, index: usize) {
         {
             let previous = &self.events[index - 1];
@@ -583,7 +566,6 @@ impl FusionCore {
             self.anchor(measurement.source);
         }
 
-        // The configured constraints ride along with every source message.
         let mut constraint_variance = [0.0; 6];
         constraint_variance.copy_from_slice(&self.config.constraint_twist_variances);
         let mut constraint_rows = Vec::new();
@@ -604,12 +586,8 @@ impl FusionCore {
         );
     }
 
-    /// No-IMU fusion. Each message contributes a body-frame pose increment — a drifting
-    /// source its consecutive-message delta, an absolute one the offset from the current
-    /// estimate to its pose — composed onto the estimate scaled per dimension by the
-    /// source's inverse-variance share among the currently active sources. Shares sum to
-    /// one, so the blend advances at true scale, a lone source passes through exactly,
-    /// and a source falling silent releases its share to the others.
+    /// Not a Kalman update: inverse-variance shares sum to one, so a lone source passes
+    /// through exactly and the blend advances at true scale.
     fn blend(&mut self, measurement: &Measurement, ts_ns: i64) {
         let activity = &mut self.activity[measurement.source];
         activity.last_ns = ts_ns;

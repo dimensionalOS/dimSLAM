@@ -59,9 +59,7 @@ pub fn transform_to_isometry(transform: &Transform) -> Isometry3<f64> {
     Isometry3::from_parts(Translation3::from(transform.translation()), transform.rotation())
 }
 
-/// Pinhole for a rectified camera, whose camera_info carries D all zero, Brown for one
-/// whose camera_info carries real plumb_bob coefficients. ROS orders plumb_bob
-/// (k1, k2, p1, p2, k3); cuVSLAM's Brown wants (k1, k2, k3, p1, p2).
+/// ROS orders plumb_bob (k1, k2, p1, p2, k3); cuVSLAM's Brown wants (k1, k2, k3, p1, p2).
 pub fn to_distortion(info: &CameraInfo) -> (u8, Vec<f32>) {
     let d = &info.D;
     let distorted = d.len() >= 5 && d.iter().any(|coefficient| *coefficient != 0.0);

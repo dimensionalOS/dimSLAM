@@ -1,10 +1,7 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Vendored `sensor_msgs.ImuInfo` until dimos-lcm ships the type, mirroring the
-//! C++ module's vendored lcm-gen output. The fingerprint is the lcm hash chain
-//! (ImuInfo -> Header -> Time) precomputed; a test pins it against the constants
-//! of the generated types this decodes alongside.
+//! Vendored `sensor_msgs.ImuInfo` until dimos-lcm ships the type.
 
 use std::io::{self, Cursor, Read};
 #[cfg(test)]
