@@ -129,8 +129,7 @@ impl Filter {
         self.p_cov = f * self.p_cov * f.transpose() + q_noise;
     }
 
-    /// `gate` is a Mahalanobis threshold in standard deviations per degree of freedom;
-    /// 0 disables it.
+    /// `gate` is a Mahalanobis threshold in standard deviations per degree of freedom; 0 disables.
     // The negated comparison is deliberate: a NaN distance must reject.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     pub fn update(

@@ -1,9 +1,8 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Error-state Kalman filter fusing IMU propagation with any number of
-// nav_msgs/Odometry sources, told apart by header.frame_id. Without an IMU there is no
-// process model, so that mode is not a Kalman filter: see `blend`.
+// Error-state Kalman filter fusing IMU propagation with nav_msgs/Odometry sources told apart
+// by header.frame_id. Without an IMU there is no process model: see `blend`.
 
 mod eskf;
 
@@ -19,12 +18,11 @@ use eskf::{Filter, Jacobian, Mat15, State, Vec15};
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 
-/// Bias calibration only accepts samples below this rate: high enough to clear the gyro's
-/// own bias, low enough that real rotation is never averaged into the bias estimate.
+/// Bias calibration restarts above this rate: above the gyro's own bias, below real rotation.
 const STATIONARY_GYRO_LIMIT: f64 = 0.05;
 
-/// Raw finite differences of the gyro are too noisy for the tangential lever-arm term.
-/// A time constant rather than a per-sample weight, so the cutoff does not move with rate.
+/// Raw gyro differences are too noisy for the tangential lever-arm term. A time constant, not
+/// a per-sample weight, so the cutoff does not move with IMU rate.
 const ANGULAR_ACCEL_TIME_CONSTANT: f64 = 0.025;
 
 fn stamp_to_ns(header: &lcm_msgs::std_msgs::Header) -> i64 {
@@ -67,11 +65,9 @@ pub struct OdometryFusionConfig {
     pub replay_buffer_seconds: f64,
     /// Outlier gate in standard deviations per measurement dimension; 0 disables.
     pub mahalanobis_gate: f64,
-    /// The other gates judge incoming measurements; this one judges the filter's own
-    /// state, which can still run away on its own. 0 disables it.
+    /// Gate on the filter's own state, which can run away with no bad measurement; 0 disables.
     pub max_position_m: f64,
-    /// Off bypasses the Kalman machinery and seeds the filter level from the first
-    /// source message; see `blend`.
+    /// Off bypasses the Kalman machinery and seeds level from the first source message; see `blend`.
     pub use_imu: bool,
     /// Required when use_imu is on; 0 counts as unset.
     pub imu_gyro_noise_density: f64,
@@ -79,7 +75,7 @@ pub struct OdometryFusionConfig {
     pub imu_accel_noise_density: f64,
     pub imu_accel_random_walk: f64,
     pub gravity: f64,
-    /// Samples averaged while stationary to level the filter and take the gyro bias.
+    /// Samples averaged while stationary to level the filter and take the IMU biases.
     pub imu_init_samples: i64,
     pub initial_position_std: f64,
     pub initial_velocity_std: f64,
@@ -88,14 +84,12 @@ pub struct OdometryFusionConfig {
     /// One entry per source: the header.frame_id its messages carry.
     pub source_frames: Vec<String>,
     /// 6 per source, [x y z roll pitch yaw]: <0 message covariance, 0 drop, >0 fixed.
-    /// For a drifting (non-odom_frame) source a fixed variance is usually the right
-    /// choice, since its message covariance describes accumulated drift, not the delta.
+    /// A drifting source's covariance describes accumulated drift, not the delta: prefer a fixed value.
     pub source_pose_variances: Vec<f64>,
     /// 6 per source, [vx vy vz wx wy wz], same convention, body frame.
     pub source_twist_variances: Vec<f64>,
-    /// Virtual zero-twist measurement [vx vy vz wx wy wz] applied with every source
-    /// message: >0 constrains that dimension toward zero with this variance (e.g. the
-    /// vy, vz a non-holonomic platform cannot move along), 0 leaves it free.
+    /// Virtual zero-twist [vx vy vz wx wy wz] fused after each source update (use_imu only):
+    /// >0 pins that dimension to zero with this variance (e.g. non-holonomic vy, vz), 0 frees it.
     pub constraint_twist_variances: Vec<f64>,
 }
 
@@ -112,8 +106,7 @@ struct Measurement {
     angular: Vector3<f64>,
 }
 
-/// What a source last contributed to the no-IMU blend. It keeps claiming its share of
-/// every increment until it has been silent for the timeout.
+/// A source keeps its share of the no-IMU blend until it has been silent for the timeout.
 #[derive(Clone, Debug, Default)]
 struct SourceActivity {
     last_ns: i64,
@@ -134,8 +127,7 @@ enum EventKind {
     Measurement(Measurement),
 }
 
-/// One filter step, with the state it left behind so a late arrival can roll
-/// back to just before its own slot and replay everything after it.
+/// One filter step and the state it left behind, so a late arrival can replay from its slot.
 #[derive(Clone, Debug)]
 struct Event {
     ts_ns: i64,
@@ -163,8 +155,7 @@ pub struct FusionCore {
     lever_gyro: Vector3<f64>,
     lever_gyro_ns: i64,
     lever_alpha: Vector3<f64>,
-    /// Per-source last raw pose; deltas are a property of the message stream, so they
-    /// are computed once at arrival and survive replay untouched.
+    /// Per-source last raw pose. A delta belongs to the message stream, so replay never redoes it.
     previous_source_pose: HashMap<usize, Isometry3<f64>>,
     last_publish_ns: i64,
     imu_samples: u64,
@@ -201,8 +192,7 @@ impl FusionCore {
         }
     }
 
-    /// The filter state lives in base_frame, so both IMU vectors are rotated through the
-    /// mount.
+    /// The filter's body frame is base_frame, so both IMU vectors are rotated through the mount.
     pub fn handle_imu(&mut self, imu: &Imu, base_from_imu: &Transform) {
         let lever = base_from_imu.translation();
         let base_from_imu = base_from_imu.rotation();
@@ -219,8 +209,7 @@ impl FusionCore {
         }
         self.lever_gyro = gyro;
         self.lever_gyro_ns = ts_ns;
-        // A non-zero lever arm adds centripetal and tangential acceleration that is mount
-        // kinematics, not base motion.
+        // The lever arm adds centripetal and tangential terms: mount kinematics, not base motion.
         accel -= gyro.cross(&gyro.cross(&lever)) + self.lever_alpha.cross(&lever);
         if !self.initialized {
             self.check_config();
@@ -244,8 +233,7 @@ impl FusionCore {
                 // Stationary accel reads the specific force R^T (0,0,g): level so it maps to +z.
                 let world_from_body = UnitQuaternion::rotation_between(&mean_accel, &Vector3::z())
                     .unwrap_or_default();
-                // Whatever magnitude the sensor reads beyond g while stationary is accel
-                // bias; left at zero it dead-reckons z away and tilts pitch to compensate.
+                // Any stationary reading beyond g is accel bias; left at zero it dead-reckons z away.
                 let accel_bias = mean_accel
                     - world_from_body.inverse_transform_vector(&Vector3::new(
                         0.0,
@@ -524,7 +512,7 @@ impl FusionCore {
             match self.anchors[measurement.source] {
                 Some(anchor) => Some(anchor * delta),
                 None => {
-                    // First delta after (re)start: adopt the filter pose, fuse nothing.
+                    // First delta from this source: adopt the filter pose, fuse nothing.
                     self.anchor(measurement.source);
                     return;
                 }
@@ -565,9 +553,7 @@ impl FusionCore {
         );
         let accepted = self.update(&rows, &residuals, &variances);
         if accepted && !measurement.absolute && target.is_some() {
-            // Re-basing to the corrected pose keeps every source's anchor on the one fused
-            // trajectory. Anchoring each source to its own integrated chain instead makes
-            // drifting sources diverge without bound and the filter oscillate between them.
+            // Anchoring to the corrected pose, not each source's own chain, keeps drifters bounded.
             self.anchor(measurement.source);
         }
 
@@ -591,8 +577,7 @@ impl FusionCore {
         );
     }
 
-    /// Not a Kalman update: inverse-variance shares sum to one, so a lone source passes
-    /// through exactly and the blend advances at true scale.
+    /// Not a Kalman update: inverse-variance shares sum to one, so a lone source passes through exactly.
     fn blend(&mut self, measurement: &Measurement, ts_ns: i64) {
         let activity = &mut self.activity[measurement.source];
         activity.last_ns = ts_ns;
@@ -642,8 +627,7 @@ impl FusionCore {
         ));
     }
 
-    /// Body-frame twist rows. Linear velocity observes velocity and rotation; angular
-    /// velocity is measured against the latest gyro sample, so it observes the gyro bias.
+    /// Body-frame twist rows. Angular rate is not a state: it is predicted from the last gyro sample.
     fn add_twist_rows(
         &self,
         linear: &Vector3<f64>,

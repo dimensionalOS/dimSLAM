@@ -16,8 +16,7 @@ fn xyz_field(name: &str, offset: i32) -> PointField {
     }
 }
 
-/// Median (not mean) per block, so a flying pixel across a depth discontinuity cannot
-/// invent a mid-air point.
+/// Median, not mean, per block: a flying pixel must not invent a mid-air point.
 pub fn depth_cloud(
     depth: &Image,
     depth_info: &CameraInfo,
@@ -92,10 +91,7 @@ pub fn depth_cloud(
                 let Some(median) = median_at(block_u, block_v) else {
                     continue;
                 };
-                // A sloped surface seen at grazing incidence also lies between its
-                // neighbours, so the margin has to clear the per-block depth change of
-                // the steepest legitimate surface: relative in z (a ground plane's
-                // per-block change grows as z^2) with an absolute floor for close range.
+                // A grazing surface also lies between its neighbours, so only a wider gap is air.
                 let margin = (0.3 * units_per_meter).max(0.1 * median as f64) as i32;
                 let mid = median as i32;
                 let mid_gap = [(1, 0), (0, 1), (1, 1), (1, -1)].iter().any(|&(du, dv)| {
@@ -179,7 +175,6 @@ mod tests {
     #[test]
     fn decimation_takes_the_block_median_not_the_mean() {
         let mut depth = make_depth(4, 4, 2000);
-        // One flying pixel per block; a mean would land mid-air, the median stays on the wall.
         set_pixel(&mut depth, 0, 0, 9000);
         set_pixel(&mut depth, 2, 2, 9000);
         let mut cloud = PointCloud2::default();

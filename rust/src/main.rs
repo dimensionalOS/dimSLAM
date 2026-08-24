@@ -22,8 +22,7 @@ struct DimSlamConfig {
     camera_frames: Vec<String>,
     rectified: bool,
     use_gpu: bool,
-    /// Frame the tracker's internal odometry drifts in; fused as a drifting source,
-    /// so it must appear in source_frames.
+    /// Fused as a drifting source, so it must also appear in source_frames.
     visual_odom_frame: String,
     rig_frame: String,
     covariance_gate_translation_std: f64,
@@ -83,7 +82,7 @@ struct DimSlam {
     sources: Input<Odometry>,
     #[output(encode = Odometry::encode)]
     odometry: Output<Odometry>,
-    /// rgbd only: the depth sensor's own points, range-gated, in the depth frame.
+    /// rgbd only: range-gated depth points, in the depth frame.
     #[output(encode = PointCloud2::encode)]
     depth_cloud: Output<PointCloud2>,
     #[tf]

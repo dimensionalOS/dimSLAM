@@ -137,8 +137,6 @@ mod tests {
 
     #[test]
     fn nearest_surface_wins_on_collision() {
-        // Two depth pixels, one behind the other, forced onto one target pixel by a
-        // low-resolution target camera.
         let depth_info = make_info(4, 4, 1000.0);
         // Principal point at the corner so every ray lands on pixel (0, 0).
         let mut target_info = make_info(1, 1, 0.001);
@@ -164,7 +162,6 @@ mod tests {
         let info = make_info(8, 8, 100.0);
         let mut depth = make_depth(8, 8);
         set_pixel(&mut depth, 4, 4, 500);
-        // Push the point 1 m behind the target camera.
         let camera_from_depth =
             Isometry3::from_parts(Translation3::new(0.0, 0.0, -1.0), UnitQuaternion::identity());
         let mut out = Image::default();

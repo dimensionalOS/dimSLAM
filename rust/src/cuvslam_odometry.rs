@@ -1,8 +1,7 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// cuVSLAM keeps one world frame for the tracker's life, so tracking loss resumes in the
-// same frame; nothing is emitted while lost.
+// cuVSLAM keeps one world frame for the tracker's life; nothing is emitted while lost.
 
 mod depth_cloud;
 mod depth_reproject;
@@ -29,8 +28,7 @@ use cu_vslam_rs::{ffi, CameraParams, ImageRef, Tracker};
 /// cuVSLAM's Track() contract asks for stereo stamps within 1 ms.
 const MAX_PAIR_SKEW_NS: i64 = 1_000_000;
 
-/// A tracking stall long enough to overflow this has already outlived any use the
-/// buffered inertial data had.
+/// A stall long enough to overflow this has outlived any use the buffered IMU had.
 const MAX_PENDING_IMU: usize = 2048;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -40,8 +38,7 @@ enum Mode {
     Rgbd,
 }
 
-/// First order in the rotation block, where fixed-axis rpy rates and rotation-vector
-/// components coincide.
+/// Exact for rotation vectors; ROS's fixed-axis rpy block matches only to first order.
 fn se3_adjoint(parent_from_child: &Isometry3<f64>) -> Matrix6<f64> {
     let rotation = parent_from_child.rotation.to_rotation_matrix().into_inner();
     let translation = parent_from_child.translation.vector;
@@ -65,8 +62,7 @@ fn se3_adjoint(parent_from_child: &Isometry3<f64>) -> Matrix6<f64> {
     adjoint
 }
 
-/// cuVSLAM wants camera 0 to be the left of a pair, which is the one whose
-/// partner sits at +x (optical convention, x to the right).
+/// cuVSLAM wants camera 0 to be the left one: its partner sits at +x (optical x is right).
 fn needs_left_swap(first_rig_from_camera: &Isometry3<f64>, second_rig_from_camera: &Isometry3<f64>) -> bool {
     (first_rig_from_camera.inverse() * second_rig_from_camera).translation.x < 0.0
 }
@@ -75,7 +71,7 @@ fn odometry_mode(mode: Mode, enable_imu: bool) -> u8 {
     match mode {
         Mode::Rgbd => ffi::CUV_ODOMETRY_RGBD,
         Mode::Mono => ffi::CUV_ODOMETRY_MONO,
-        // Inertial is the stereo pair plus an IMU; there is no inertial mono or rgbd.
+        // There is no inertial mono or rgbd.
         Mode::Stereo => {
             if enable_imu {
                 ffi::CUV_ODOMETRY_INERTIAL
@@ -86,8 +82,7 @@ fn odometry_mode(mode: Mode, enable_imu: bool) -> u8 {
     }
 }
 
-/// A three-channel image has to be declared as such: fed as MONO, cuVSLAM
-/// reads a third of each row and tracks nothing.
+/// Fed as MONO, a three-channel image makes cuVSLAM read a third of each row and track nothing.
 fn image_encoding(encoding: &str) -> u8 {
     if encoding == "mono8" {
         ffi::CUV_ENCODING_MONO
@@ -101,8 +96,7 @@ fn image_encoding(encoding: &str) -> u8 {
 pub struct CuvslamOdometryConfig {
     /// "stereo", "mono" or "rgbd". Mono is accurate only up to scale.
     pub camera_mode: String,
-    /// One tf frame per camera, in cuVSLAM's index order. Empty discovers them off
-    /// camera_info.
+    /// One tf frame per camera in cuVSLAM's index order; empty discovers them off camera_info.
     pub camera_frames: Vec<String>,
     pub rectified: bool,
     /// Needs a libcuvslam built with ENFORCE_GPU=OFF; stock SDK binaries are GPU-only.
@@ -110,18 +104,14 @@ pub struct CuvslamOdometryConfig {
     /// Frame stamped on the emitted odometry; the tracker's world, drifting freely.
     pub odom_frame: String,
     pub base_frame: String,
-    /// Empty means base_frame. Set it to a camera's optical frame to match NVIDIA's
-    /// examples, whose rig IS the left camera.
+    /// Empty means base_frame; NVIDIA's examples use the left camera's optical frame.
     pub rig_frame: String,
-    /// Meters; over this the frame's motion is dropped and later frames rebase onto the
-    /// held pose. 0 disables.
+    /// Meters; over this the frame's motion is dropped and later frames rebase onto the held pose. 0 disables.
     pub covariance_gate_translation_std: f64,
-    /// A confident-covariance teleport still cannot exceed platform kinematics. Linear
-    /// m/s, angular rad/s, against the previous raw pose; 0 disables.
+    /// A teleport the covariance gate believes: m/s and rad/s against the previous raw pose.
     pub speed_gate_max_linear: f64,
     pub speed_gate_max_angular: f64,
-    /// cuVSLAM's Inertial mode is stereo plus one IMU. The noise model and frame come
-    /// from the imu_info stream, published by the driver the way camera_info is.
+    /// cuVSLAM's Inertial mode: stereo plus one IMU, with its noise model from imu_info.
     pub enable_imu: bool,
     /// Raw depth units per metre. 1000 for sixteen-bit millimetres.
     pub depth_units_per_meter: f64,
@@ -150,8 +140,7 @@ pub struct VoCore {
     cameras: Vec<RigCamera>,
     camera_info_by_frame: HashMap<String, CameraInfo>,
     imu_model: Option<ImuInfo>,
-    /// cuVSLAM needs Track() and RegisterImuMeasurement() in non-decreasing stamp order,
-    /// but the dispatcher lets images overtake the IMU.
+    /// cuVSLAM needs non-decreasing stamps, but the dispatcher lets images overtake the IMU.
     pending_imu: VecDeque<ffi::CuvImuMeasurement>,
     vslam: Option<Tracker>,
     tracker_unbuildable: bool,
@@ -167,7 +156,6 @@ pub struct VoCore {
     rig_from_base: Option<Isometry3<f64>>,
     /// Adjoint of base_from_rig, fixed with it at tracker creation.
     covariance_adjoint: Matrix6<f64>,
-    /// identity until the gate first fires
     rebase: Option<Isometry3<f64>>,
     covariance: Matrix6<f64>,
     previous_raw: Option<Isometry3<f64>>,
@@ -311,11 +299,9 @@ impl VoCore {
 
     pub fn handle_imu(&mut self, msg: &Imu) {
         if self.vslam.is_none() {
-            // No tracker yet; this is the window inertial init needs.
             self.imu_dropped += 1;
             return;
         }
-        // Track() has already consumed everything up to last_ts_ns.
         self.pending_imu.push_back(ffi::CuvImuMeasurement {
             timestamp_ns: stamp_to_ns(&msg.header),
             linear_accelerations: [
@@ -359,8 +345,7 @@ impl VoCore {
         img: Image,
         tf: &Tf,
     ) -> (Option<PointCloud2>, Option<Odometry>) {
-        // Everything downstream walks the buffer by the header's step and height, so a
-        // driver that undersizes it would index out of bounds and take the process down.
+        // Downstream indexes by step and height, so an undersized buffer would panic.
         let expected_bytes = img.step as usize * img.height as usize;
         if img.step < img.width * 2 || img.data.len() < expected_bytes {
             warn_throttled!(
@@ -521,22 +506,17 @@ impl VoCore {
         let mut tracker_config = ffi::CuvConfig {
             odometry_mode: odometry_mode(mode, self.config.enable_imu),
             use_gpu: self.config.use_gpu,
-            // cuVSLAM rejects this outright unless the rig has a stereo pair: "Rectified
-            // stereo camera mode only works with 1+ stereo cameras".
+            // cuVSLAM: "Rectified stereo camera mode only works with 1+ stereo cameras".
             rectified_stereo_camera: self.config.rectified && mode == Mode::Stereo,
             rgbd_depth_scale_factor: 1.0,
             rgbd_depth_camera_id: -1,
         };
         if mode == Mode::Rgbd {
             tracker_config.rgbd_depth_scale_factor = self.config.depth_units_per_meter as f32;
-            // align_depth hands every frame over in cameras[0]'s frame. The -1 default means
-            // no camera, and depth belonging to nothing is silently ignored.
+            // align_depth delivers in cameras[0]'s frame; the -1 default silently ignores depth.
             tracker_config.rgbd_depth_camera_id = 0;
         }
 
-        // Each libcuvslam build carries one backend, GPU or CPU, so a construction failure
-        // with a well-formed rig means this build has the other one. Retrying the same
-        // config would run vision-less forever while the fusion filter keeps publishing.
         let vslam = match Tracker::new(&cameras, imu_calibration.as_ref(), &tracker_config) {
             Ok(vslam) => vslam,
             Err(message) => {
@@ -555,9 +535,7 @@ impl VoCore {
                         vslam
                     }
                     Err(fallback_message) => {
-                        // Nothing about the rig changes later, so a retry would only
-                        // repeat this. Give up on vision and leave the rest of the
-                        // process, fusion filter included, running.
+                        // Nothing about the rig changes later, so a retry would only repeat this.
                         self.tracker_unbuildable = true;
                         error!(
                             configured_use_gpu = tracker_config.use_gpu,
@@ -602,7 +580,7 @@ impl VoCore {
             return None;
         }
         self.ensure_tracker(tf);
-        self.vslam.as_ref()?; // no tf placement yet
+        self.vslam.as_ref()?;
 
         let stamps: Vec<i64> = self
             .cameras
@@ -635,8 +613,7 @@ impl VoCore {
         };
 
         let vslam = self.vslam.as_mut().expect("checked above");
-        // Popping the front rather than partitioning: one late sample would make the deque
-        // unsorted, and partition_point would then silently drop the whole backlog.
+        // A late sample can leave the deque unsorted, so drain from the front.
         while self.pending_imu.front().is_some_and(|m| m.timestamp_ns <= newest) {
             let measurement = self.pending_imu.pop_front().expect("checked above");
             if let Err(message) = vslam.register_imu(&measurement) {
@@ -689,7 +666,7 @@ impl VoCore {
         let estimate = match result {
             Ok(estimate) => estimate,
             Err(message) => {
-                // The shim catches Track()'s C++ exception; the frame is skipped.
+                // The shim catches Track()'s C++ exception.
                 error!(error = %message, "cuvslam Track failed");
                 return None;
             }
@@ -699,21 +676,17 @@ impl VoCore {
             if self.was_tracking {
                 self.segment_id += 1;
                 self.was_tracking = false;
-                // The next tracked frame restarts across an unmeasured gap; its speed
-                // against the pre-loss pose would be meaningless.
+                // Speed against the pre-loss pose would be meaningless across the untracked gap.
                 self.previous_raw = None;
                 warn!(segment = self.segment_id, "cuvslam tracking lost");
             }
             return None;
         };
-        // cuVSLAM tracks rig_frame(); the contract is base_frame starting at identity. Both
-        // collapse to the raw pose when the two frames are the same.
+        // cuVSLAM tracks rig_frame(); the published pose is base_frame.
         let base_from_rig = self.base_from_rig.expect("set with the tracker");
         let rig_from_base = self.rig_from_base.expect("set with the tracker");
         let raw_pose = base_from_rig * cuv_pose_to_isometry(&pose) * rig_from_base;
-        // cuVSLAM reports the 6x6 on the rig frame; the published pose is on base_frame,
-        // so the covariance moves through the same fixed transform. NaN (the tracker's
-        // unconstrained marker) survives the product and still trips the gate below.
+        // NaN, the tracker's unconstrained marker, survives the product and still trips the gate.
         self.covariance = self.covariance_adjoint
             * Matrix6::from_row_slice(&rig_covariance)
             * self.covariance_adjoint.transpose();
@@ -742,9 +715,7 @@ impl VoCore {
                 "cuvslam covariance gate holding pose",
             );
         }
-        // Speed is judged against the previous raw pose even when that frame was gated:
-        // after a teleport the tracker keeps integrating from the far side, so later
-        // frames are near the teleported pose and only the jump frame itself trips.
+        // previous_raw advances even on gated frames: after a teleport only the jump frame trips.
         if self.config.speed_gate_max_linear > 0.0 || self.config.speed_gate_max_angular > 0.0 {
             if let Some(previous_raw) = &self.previous_raw {
                 // Track() rejects non-increasing stamps, so dt is strictly positive here.
@@ -772,8 +743,7 @@ impl VoCore {
         let rebase = self.rebase.unwrap_or_else(Isometry3::identity);
         let world_from_base = self.world_from_base.unwrap_or_else(Isometry3::identity);
         if gate_frame {
-            // Blank wall, repeated texture, teleport: hold the pose and rebase so recovery
-            // keeps only post-recovery deltas.
+            // Hold the pose and rebase so only post-recovery deltas reach the output.
             self.rebase = Some(world_from_base * raw_pose.inverse());
         } else {
             self.world_from_base = Some(rebase * raw_pose);
@@ -798,8 +768,7 @@ impl VoCore {
         msg.pose.pose.orientation.y = rotation.j;
         msg.pose.pose.orientation.z = rotation.k;
         msg.pose.pose.orientation.w = rotation.w;
-        // cuVSLAM's own 6x6, row-major xyz-rpy, the order ROS uses, already moved onto
-        // base_frame with the pose.
+        // Row-major xyz-rpy, the order ROS uses.
         for row in 0..6 {
             for column in 0..6 {
                 msg.pose.covariance[row * 6 + column] = self.covariance[(row, column)];
@@ -848,8 +817,6 @@ mod tests {
 
     #[test]
     fn adjoint_translation_couples_rotation_into_translation() {
-        // A yaw-rate uncertainty at a 2 m lever arm reads as lateral translation
-        // uncertainty: the (x, yaw) coupling term is skew(t) * R with R = I.
         let lever_arm = Isometry3::from_parts(Translation3::new(2.0, 0.0, 0.0), UnitQuaternion::identity());
         let adjoint = se3_adjoint(&lever_arm);
         assert!((adjoint[(1, 5)] + 2.0).abs() < 1.0e-12); // y <- yaw
@@ -859,8 +826,7 @@ mod tests {
 
     #[test]
     fn adjoint_moves_covariance_between_frames() {
-        // Pure yaw variance on the rig maps into y-translation variance on a base
-        // displaced 2 m along x: sigma_y = arm^2 * sigma_yaw.
+        // A 2 m lever arm turns rig yaw variance into base y variance: var_y = arm^2 * var_yaw.
         let lever_arm = Isometry3::from_parts(Translation3::new(2.0, 0.0, 0.0), UnitQuaternion::identity());
         let adjoint = se3_adjoint(&lever_arm);
         let mut rig_covariance = Matrix6::zeros();

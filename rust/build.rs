@@ -1,7 +1,5 @@
-// cu_vslam_rs embeds the SDK rpath with cargo:rustc-link-arg, which cargo applies only
-// to its own package. Without repeating it here, dim_slam links but dies at startup on
-// @rpath/libcuvslam.dylib. cu_vslam_rs declares links = "cuvslam" and exports the
-// directory, so the path arrives as DEP_CUVSLAM_LIB_DIR and is never named twice.
+// cargo:rustc-link-arg applies only to the package that emits it, so cu_vslam_rs's rpath
+// never reaches this binary and it dies at startup on @rpath/libcuvslam.dylib.
 use std::env;
 
 fn main() {
