@@ -123,7 +123,7 @@ pub struct CuvslamOdometryConfig {
     /// cuVSLAM's Inertial mode is stereo plus one IMU. The noise model and frame come
     /// from the imu_info stream, published by the driver the way camera_info is.
     pub enable_imu: bool,
-    /// rgbd only: raw depth units per metre. 1000 for sixteen-bit millimetres.
+    /// Raw depth units per metre. 1000 for sixteen-bit millimetres.
     pub depth_units_per_meter: f64,
     /// Range gate on the published depth_cloud, metres; 0 leaves it open.
     pub depth_cloud_min_range: f64,
