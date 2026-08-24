@@ -33,6 +33,10 @@ use cu_vslam_rs::{ffi, CameraParams, ImageRef, Tracker};
 /// cuVSLAM's Track() contract asks for stereo stamps within 1 ms.
 const MAX_PAIR_SKEW_NS: i64 = 1_000_000;
 
+/// Roughly five seconds at 400 Hz; a tracking stall longer than that has already
+/// outlived any use the buffered inertial data had.
+const MAX_PENDING_IMU: usize = 2048;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Stereo,
@@ -171,7 +175,7 @@ pub struct VoCore {
     /// Buffered. cuVSLAM requires Track() and RegisterImuMeasurement() in
     /// non-decreasing timestamp order; the round-robin dispatcher lets images
     /// overtake a 400 Hz IMU.
-    pending_imu: Vec<ffi::CuvImuMeasurement>,
+    pending_imu: VecDeque<ffi::CuvImuMeasurement>,
     vslam: Option<Tracker>,
 
     depth: Option<Image>,
@@ -213,7 +217,7 @@ impl VoCore {
             cameras: Vec::new(),
             camera_info_by_frame: HashMap::new(),
             imu_model: None,
-            pending_imu: Vec::new(),
+            pending_imu: VecDeque::new(),
             vslam: None,
             depth: None,
             depth_info: None,
@@ -340,7 +344,7 @@ impl VoCore {
             return;
         }
         // Track() has already consumed everything up to last_ts_ns.
-        self.pending_imu.push(ffi::CuvImuMeasurement {
+        self.pending_imu.push_back(ffi::CuvImuMeasurement {
             timestamp_ns: stamp_to_ns(&msg.header),
             linear_accelerations: [
                 msg.linear_acceleration.x as f32,
@@ -353,6 +357,12 @@ impl VoCore {
                 msg.angular_velocity.z as f32,
             ],
         });
+        // try_track returns early on a skewed or unplaceable frame set, so nothing
+        // drains the buffer while tracking is stalled. Once the stall outlasts the
+        // window, the oldest samples are past any frame that will still be tracked.
+        while self.pending_imu.len() > MAX_PENDING_IMU {
+            self.pending_imu.pop_front();
+        }
         self.imu_samples += 1;
     }
 
