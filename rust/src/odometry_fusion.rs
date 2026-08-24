@@ -932,6 +932,10 @@ mod tests {
         };
         let first = run();
         assert!(first.len() > 10);
+        // Identical output proves nothing unless the filter actually moved and turned.
+        let last = first.last().expect("published above");
+        assert!(last.0.hypot(last.1) > 0.05, "the fused pose barely moved: {last:?}");
+        assert!(last.3 < 0.999, "the fused pose barely turned: {last:?}");
         assert_eq!(first, run());
     }
 }
