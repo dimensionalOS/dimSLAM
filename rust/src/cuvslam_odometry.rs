@@ -345,11 +345,9 @@ impl VoCore {
 
     pub fn handle_imu(&mut self, msg: &Imu) {
         if self.vslam.is_none() {
-            // No tracker yet; this is the window inertial init needs.
             self.imu_dropped += 1;
             return;
         }
-        // Track() has already consumed everything up to last_ts_ns.
         self.pending_imu.push_back(ffi::CuvImuMeasurement {
             timestamp_ns: stamp_to_ns(&msg.header),
             linear_accelerations: [
@@ -496,6 +494,17 @@ impl VoCore {
                 .find(|camera| camera.frame == depth.header.frame_id)
                 .map(|camera| &camera.info)
         })?;
+        if depth.width != info.width || depth.height != info.height {
+            error_throttled!(
+                Duration::from_secs(10),
+                depth_width = depth.width,
+                depth_height = depth.height,
+                info_width = info.width,
+                info_height = info.height,
+                "depth image does not match its intrinsics; skipping the cloud",
+            );
+            return None;
+        }
         let mut cloud = PointCloud2::default();
         depth_cloud(
             depth,
@@ -712,7 +721,7 @@ impl VoCore {
             return None;
         }
         self.ensure_tracker(tf);
-        self.vslam.as_ref()?; // no tf placement yet
+        self.vslam.as_ref()?; // no tracker
 
         let stamps: Vec<i64> = self
             .cameras

@@ -87,7 +87,7 @@ struct DimSlam {
     sources: Input<Odometry>,
     #[output(encode = Odometry::encode)]
     odometry: Output<Odometry>,
-    /// The depth sensor's own points, range-gated, in the depth frame.
+    /// Range-gated points cut from the depth image, in the depth frame.
     #[output(encode = PointCloud2::encode)]
     depth_cloud: Output<PointCloud2>,
     #[tf]
