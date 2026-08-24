@@ -128,14 +128,14 @@ pub struct CuvslamOdometryConfig {
     /// cuVSLAM's Inertial mode is stereo plus one IMU. The noise model and frame come
     /// from the imu_info stream, published by the driver the way camera_info is.
     pub enable_imu: bool,
-    /// rgbd only: raw depth units per metre. 1000 for sixteen-bit millimetres.
+    /// Raw depth units per metre. 1000 for sixteen-bit millimetres.
     pub depth_units_per_meter: f64,
     /// Range gate on the published depth_cloud, metres; 0 leaves it open.
     pub depth_cloud_min_range: f64,
     pub depth_cloud_max_range: f64,
     /// One median point per k x k depth block; <= 1 is off.
     pub depth_cloud_decimation: i64,
-    /// rgbd only: RGB-guided densification of the depth image before the cloud is cut
+    /// RGB-guided densification of the depth image before the cloud is cut
     /// from it. Both safetensors paths set turns it on; needs the `depth2depth` cargo
     /// feature (`depth2depth-cuda`/`-cudnn`/`-metal` for a GPU).
     pub depth2depth_dinov2_weights: String,
