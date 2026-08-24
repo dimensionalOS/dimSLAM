@@ -3,7 +3,7 @@
 
 //! Visual-inertial odometry: a cuVSLAM front end and an error-state Kalman fuser.
 //!
-//! [`VoCore`] turns camera, depth and IMU frames into a pose; [`FusionCore`] blends that pose
+//! [`CuvslamCore`] turns camera, depth and IMU frames into a pose; [`FusionCore`] blends that pose
 //! with any other odometry source against IMU propagation. Either runs on its own.
 //!
 //! Both are synchronous and own no threads or transport: feed them frames, ask for output.
@@ -37,7 +37,7 @@ pub mod log;
 pub mod odometry_fusion;
 pub mod types;
 
-pub use cuvslam_odometry::{CuvslamOdometryConfig, VoCore};
+pub use cuvslam_odometry::{CuvslamCore, CuvslamOdometryConfig};
 pub use odometry_fusion::{FusionCore, OdometryFusionConfig, SourceConfig};
 pub use types::{
     CameraModel, ImageFrame, ImuNoiseModel, ImuSample, OdometryEstimate, PointCloud, TfLookup,

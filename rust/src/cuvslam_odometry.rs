@@ -155,7 +155,7 @@ enum DepthChoice {
     Aligned,
 }
 
-pub struct VoCore {
+pub struct CuvslamCore {
     config: CuvslamOdometryConfig,
     /// The rig, in cuVSLAM's camera order.
     cameras: Vec<RigCamera>,
@@ -195,7 +195,7 @@ pub struct VoCore {
     unplaced_images: u64,
 }
 
-impl VoCore {
+impl CuvslamCore {
     pub fn new(config: CuvslamOdometryConfig) -> Self {
         Self {
             config,
