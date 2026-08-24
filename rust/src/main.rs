@@ -8,8 +8,7 @@
 //
 // in:  image, camera_info, depth_image, depth_camera_info, imu, imu_info, sources
 // out: odometry (fused, odom_frame -> base_frame), depth_cloud
-// tf:  odom_frame -> base_frame, and identity map_frame -> odom_frame until a map
-//      correction exists.
+// tf:  odom_frame -> base_frame
 
 mod cuvslam_odometry;
 mod odometry_fusion;
@@ -17,7 +16,7 @@ mod odometry_fusion;
 use cuvslam_odometry::imu_info::ImuInfo;
 use cuvslam_odometry::{CuvslamOdometryConfig, VoCore};
 use dimos_module::{
-    native_config, run_with_transport, warn_throttled, Input, Module, Output, Tf, Transform,
+    native_config, run_with_transport, warn_throttled, Input, Module, Output, Tf,
 };
 use lcm_msgs::nav_msgs::Odometry;
 use lcm_msgs::sensor_msgs::{CameraInfo, Image, Imu, PointCloud2};
@@ -47,17 +46,15 @@ struct DimSlamConfig {
     // --- fusion (see OdometryFusionConfig for the full field docs) ---
     odom_frame: String,
     base_frame: String,
-    map_frame: String,
-    publish_map_to_odom: bool,
     publish_tf: bool,
     publish_rate: f64,
     replay_buffer_seconds: f64,
     mahalanobis_gate: f64,
     use_imu: bool,
-    imu_gyro_noise_density: f64,
-    imu_gyro_random_walk: f64,
-    imu_accel_noise_density: f64,
-    imu_accel_random_walk: f64,
+    imu_gyro_noise_density: Option<f64>,
+    imu_gyro_random_walk: Option<f64>,
+    imu_accel_noise_density: Option<f64>,
+    imu_accel_random_walk: Option<f64>,
     gravity: f64,
     imu_init_samples: i64,
     initial_position_std: f64,
@@ -216,17 +213,7 @@ impl DimSlam {
         if !self.config.publish_tf {
             return;
         }
-        let ts_secs = odom_from_base.ts;
-        let mut transforms = vec![odom_from_base];
-        if self.config.publish_map_to_odom {
-            transforms.push(Transform::new(
-                self.config.map_frame.clone(),
-                self.config.odom_frame.clone(),
-                ts_secs,
-                dimos_module::nalgebra::Isometry3::identity(),
-            ));
-        }
-        self.tf.publish(&transforms).await.ok();
+        self.tf.publish(&[odom_from_base]).await.ok();
     }
 
     async fn report(&mut self) {

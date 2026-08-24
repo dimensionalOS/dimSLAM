@@ -562,11 +562,9 @@ impl VoCore {
                 .map_or(0, |index| index as i32);
         }
 
-        // A construction failure with a well-formed rig means this build has no such
-        // backend (each libcuvslam build carries one: GPU or CPU), so retrying the
-        // same config every frame set would run vision-less forever while the fusion
-        // filter keeps publishing. Try the other backend instead; if neither
-        // constructs, exit like the C++ module did rather than degrade silently.
+        // Each libcuvslam build carries one backend, GPU or CPU, so a construction failure
+        // with a well-formed rig means this build has the other one. Retrying the same
+        // config would run vision-less forever while the fusion filter keeps publishing.
         let vslam = match Tracker::new(&cameras, imu_calibration.as_ref(), &tracker_config) {
             Ok(vslam) => vslam,
             Err(message) => {

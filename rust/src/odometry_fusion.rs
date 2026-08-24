@@ -11,11 +11,9 @@
 // negative uses the message covariance, zero drops the dimension, positive is a
 // fixed variance. Late measurements roll the filter back and replay.
 //
-// Without an IMU there is no process model, and a Kalman update cannot both pass a
-// lone source through (gain 1) and average several (gain 1 is last-writer-wins). So
-// the no-IMU mode is not a Kalman filter: each message's pose increment is composed
-// onto the estimate scaled by its inverse-variance share among the active sources.
-// One source gets share 1 and passes through exactly; several blend their drifts.
+// Without an IMU there is no process model, and a Kalman update cannot both pass a lone
+// source through and average several, so that mode is not a Kalman filter: see
+// `blend`.
 
 mod eskf;
 
@@ -80,14 +78,14 @@ pub struct OdometryFusionConfig {
     pub replay_buffer_seconds: f64,
     /// Outlier gate in standard deviations per measurement dimension; 0 disables.
     pub mahalanobis_gate: f64,
-    /// With no IMU there is no process model and the Kalman machinery is bypassed:
-    /// the filter is seeded level from the first source message and pose increments
-    /// are blended by inverse-variance share, so a lone source passes through exactly.
+    /// Off bypasses the Kalman machinery and seeds the filter level from the first
+    /// source message; see `blend`.
     pub use_imu: bool,
-    pub imu_gyro_noise_density: f64,
-    pub imu_gyro_random_walk: f64,
-    pub imu_accel_noise_density: f64,
-    pub imu_accel_random_walk: f64,
+    /// Required when use_imu is on; a property of the IMU, so the blueprint supplies them.
+    pub imu_gyro_noise_density: Option<f64>,
+    pub imu_gyro_random_walk: Option<f64>,
+    pub imu_accel_noise_density: Option<f64>,
+    pub imu_accel_random_walk: Option<f64>,
     pub gravity: f64,
     /// Samples averaged while stationary to level the filter and take the gyro bias.
     pub imu_init_samples: i64,
@@ -123,9 +121,8 @@ struct Measurement {
     angular: Vector3<f64>,
 }
 
-/// What a source last contributed, for the no-IMU blend: a source keeps claiming its
-/// inverse-variance share of every increment until it has been silent for the timeout,
-/// after which the remaining sources scale back up to a full share between them.
+/// What a source last contributed to the no-IMU blend. It keeps claiming its share of
+/// every increment until it has been silent for the timeout.
 #[derive(Clone, Debug, Default)]
 struct SourceActivity {
     last_ns: i64,
@@ -397,6 +394,14 @@ impl FusionCore {
             self.config.constraint_twist_variances.len() == 6,
             "constraint_twist_variances needs exactly 6 entries"
         );
+        assert!(
+            !self.config.use_imu
+                || (self.config.imu_gyro_noise_density.is_some()
+                    && self.config.imu_gyro_random_walk.is_some()
+                    && self.config.imu_accel_noise_density.is_some()
+                    && self.config.imu_accel_random_walk.is_some()),
+            "use_imu needs all four imu noise figures set"
+        );
     }
 
     fn initialize(
@@ -407,10 +412,10 @@ impl FusionCore {
         accel_bias: Vector3<f64>,
     ) {
         self.filter.noise = eskf::Noise {
-            gyro_noise_density: self.config.imu_gyro_noise_density,
-            gyro_random_walk: self.config.imu_gyro_random_walk,
-            accel_noise_density: self.config.imu_accel_noise_density,
-            accel_random_walk: self.config.imu_accel_random_walk,
+            gyro_noise_density: self.config.imu_gyro_noise_density.unwrap_or_default(),
+            gyro_random_walk: self.config.imu_gyro_random_walk.unwrap_or_default(),
+            accel_noise_density: self.config.imu_accel_noise_density.unwrap_or_default(),
+            accel_random_walk: self.config.imu_accel_random_walk.unwrap_or_default(),
         };
         self.filter.gravity = self.config.gravity;
         self.filter.init(
