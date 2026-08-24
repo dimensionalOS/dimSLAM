@@ -782,3 +782,160 @@ impl FusionCore {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GRAVITY: f64 = 9.80665;
+
+    fn base_config(use_imu: bool) -> OdometryFusionConfig {
+        OdometryFusionConfig {
+            odom_frame: "odom".to_string(),
+            base_frame: "base".to_string(),
+            publish_rate: 1000.0,
+            replay_buffer_seconds: 2.0,
+            mahalanobis_gate: 3.0,
+            use_imu,
+            imu_gyro_noise_density: 0.01,
+            imu_gyro_random_walk: 0.001,
+            imu_accel_noise_density: 0.1,
+            imu_accel_random_walk: 0.01,
+            gravity: GRAVITY,
+            imu_init_samples: 5,
+            initial_position_std: 0.1,
+            initial_velocity_std: 0.1,
+            initial_rotation_std: 0.05,
+            initial_bias_std: 0.01,
+            source_frames: vec!["odom".to_string()],
+            source_pose_variances: vec![1e-4; 6],
+            source_twist_variances: vec![0.0; 6],
+            constraint_twist_variances: vec![0.0; 6],
+        }
+    }
+
+    fn source_message(frame_id: &str, ts_ns: i64, x: f64) -> Odometry {
+        let mut msg = Odometry::default();
+        msg.header.stamp = to_stamp(ts_ns);
+        msg.header.frame_id = frame_id.to_string();
+        msg.pose.pose.position.x = x;
+        msg.pose.pose.orientation.w = 1.0;
+        msg
+    }
+
+    fn imu_message(ts_ns: i64, gyro_z: f64, accel_x: f64) -> Imu {
+        let mut imu = Imu::default();
+        imu.header.stamp = to_stamp(ts_ns);
+        imu.header.frame_id = "imu".to_string();
+        imu.angular_velocity.z = gyro_z;
+        imu.linear_acceleration.x = accel_x;
+        imu.linear_acceleration.z = GRAVITY;
+        imu
+    }
+
+    fn identity_mount() -> Transform {
+        Transform::new("base", "imu", 0.0, Isometry3::identity())
+    }
+
+    fn published_position(core: &mut FusionCore) -> Option<Vector3<f64>> {
+        core.maybe_publish().map(|(msg, _)| {
+            Vector3::new(
+                msg.pose.pose.position.x,
+                msg.pose.pose.position.y,
+                msg.pose.pose.position.z,
+            )
+        })
+    }
+
+    #[test]
+    fn a_single_source_without_an_imu_drives_the_fused_pose() {
+        let mut core = FusionCore::new(base_config(false));
+        core.handle_source(&source_message("odom", 0, 0.0));
+        core.handle_source(&source_message("odom", NS_PER_SEC / 10, 1.0));
+        let position = published_position(&mut core).expect("a period has elapsed");
+        assert!((position.x - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_drifting_source_contributes_only_its_delta() {
+        let mut config = base_config(false);
+        config.source_frames = vec!["visual_odom".to_string()];
+        let mut core = FusionCore::new(config);
+        core.handle_source(&source_message("visual_odom", 0, 10.0));
+        core.handle_source(&source_message("visual_odom", NS_PER_SEC / 10, 10.5));
+        let position = published_position(&mut core).expect("a period has elapsed");
+        assert!((position.x - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_source_from_an_unconfigured_frame_is_ignored() {
+        let mut core = FusionCore::new(base_config(false));
+        core.handle_source(&source_message("odom", 0, 0.0));
+        core.handle_source(&source_message("odom", NS_PER_SEC / 10, 1.0));
+        core.handle_source(&source_message("stray", NS_PER_SEC / 5, 99.0));
+        let position = published_position(&mut core).expect("a period has elapsed");
+        assert!((position.x - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn maybe_publish_waits_for_the_period_and_stamps_odom_to_base() {
+        let mut config = base_config(false);
+        config.publish_rate = 10.0;
+        let mut core = FusionCore::new(config);
+        core.handle_source(&source_message("odom", 0, 0.0));
+        assert!(core.maybe_publish().is_none());
+        core.handle_source(&source_message("odom", NS_PER_SEC / 20, 0.5));
+        assert!(core.maybe_publish().is_none());
+        core.handle_source(&source_message("odom", NS_PER_SEC / 10, 1.0));
+        let (msg, transform) = core.maybe_publish().expect("a full period has elapsed");
+        assert_eq!(msg.header.frame_id, "odom");
+        assert_eq!(msg.child_frame_id, "base");
+        assert_eq!(transform.parent, "odom");
+        assert_eq!(transform.child, "base");
+    }
+
+    #[test]
+    fn the_mahalanobis_gate_rejects_a_wild_pose_and_accepts_a_consistent_one() {
+        let mut core = FusionCore::new(base_config(true));
+        for sample in 0..5 {
+            core.handle_imu(&imu_message(sample * NS_PER_SEC / 100, 0.0, 0.0), &identity_mount());
+        }
+        core.handle_source(&source_message("odom", NS_PER_SEC / 10, 1000.0));
+        let after_outlier = published_position(&mut core).expect("a period has elapsed");
+        assert!(after_outlier.x.abs() < 1e-9);
+        core.handle_source(&source_message("odom", NS_PER_SEC / 5, 0.01));
+        let after_inlier = published_position(&mut core).expect("a period has elapsed");
+        assert!(after_inlier.x > 0.005);
+    }
+
+    #[test]
+    fn the_same_imu_and_source_sequence_replays_bit_identically() {
+        let mount = identity_mount();
+        let run = || {
+            let mut core = FusionCore::new(base_config(true));
+            let mut published = Vec::new();
+            for step in 0..60_i64 {
+                let ts_ns = step * NS_PER_SEC / 100;
+                let moving = step >= 10;
+                let gyro_z = if moving { 0.3 } else { 0.0 };
+                let accel_x = if moving { 0.5 } else { 0.0 };
+                core.handle_imu(&imu_message(ts_ns, gyro_z, accel_x), &mount);
+                if step % 10 == 0 {
+                    core.handle_source(&source_message("odom", ts_ns, step as f64 * 0.02));
+                }
+                if let Some((msg, _)) = core.maybe_publish() {
+                    published.push((
+                        msg.pose.pose.position.x,
+                        msg.pose.pose.position.y,
+                        msg.pose.pose.position.z,
+                        msg.pose.pose.orientation.w,
+                    ));
+                }
+            }
+            published
+        };
+        let first = run();
+        assert!(first.len() > 10);
+        assert_eq!(first, run());
+    }
+}
