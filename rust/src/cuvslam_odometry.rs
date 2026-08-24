@@ -162,8 +162,8 @@ pub struct CuvslamOdometryConfig {
     pub depth2depth_quality: f64,
     /// Frame whose images on the ``image`` stream feed the model. Empty uses the rig
     /// camera on the depth frame; set it when depth is aligned to a sensor that has no
-    /// color (a D455 aligns depth to the left IR camera, so the color camera's frame
-    /// goes here — the few cm of parallax is small against the model's own error).
+    /// color, such as an infrared imager. The few cm of parallax between the two is small
+    /// against the model's own error.
     pub depth2depth_color_frame: String,
     /// Each depth image is fused with the recent color image closest in stamp; a
     /// stalled color stream would silently guide densification with another moment's
@@ -487,11 +487,8 @@ impl VoCore {
             }
             Some(_) => {
                 if self.fused_once {
-                    // Densifying with color from another moment paints that moment's
-                    // geometry into a correctly-posed cloud, so a color stream that
-                    // stalled after fusion was working is fatal. A boot flood drains
-                    // its backlog in well under this window; only a genuinely stopped
-                    // stream stays out of sync this long.
+                    // A boot flood drains its backlog in well under this window, so
+                    // staying out of sync this long means the stream genuinely stopped.
                     let stale = self.color_stale_since.get_or_insert_with(Instant::now);
                     if stale.elapsed().as_secs_f64() > 10.0 * limit_seconds {
                         error!(
