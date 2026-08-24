@@ -67,6 +67,9 @@ pub struct OdometryFusionConfig {
     pub replay_buffer_seconds: f64,
     /// Outlier gate in standard deviations per measurement dimension; 0 disables.
     pub mahalanobis_gate: f64,
+    /// The other gates judge incoming measurements; this one judges the filter's own
+    /// state, which can still run away on its own. 0 disables it.
+    pub max_position_m: f64,
     /// Off bypasses the Kalman machinery and seeds the filter level from the first
     /// source message; see `blend`.
     pub use_imu: bool,
@@ -715,6 +718,23 @@ impl FusionCore {
         event.last_gyro = self.last_gyro;
     }
 
+    fn state_is_publishable(&self, state: &State) -> bool {
+        let finite = state.position.iter().all(|v| v.is_finite())
+            && state.velocity.iter().all(|v| v.is_finite())
+            && state.q.coords.iter().all(|v| v.is_finite());
+        let distance = state.position.norm();
+        let capped = self.config.max_position_m <= 0.0 || distance <= self.config.max_position_m;
+        if !finite || !capped {
+            warn_throttled!(
+                std::time::Duration::from_secs(10),
+                distance,
+                max_position_m = self.config.max_position_m,
+                "filter state is not publishable; holding the last pose",
+            );
+        }
+        finite && capped
+    }
+
     pub fn maybe_publish(&mut self) -> Option<(Odometry, Transform)> {
         let latest = self.events.back()?;
         let period = (1.0e9 / self.config.publish_rate.max(1.0)) as i64;
@@ -723,6 +743,9 @@ impl FusionCore {
         }
         self.last_publish_ns = latest.ts_ns;
         let state = latest.state.clone();
+        if !self.state_is_publishable(&state) {
+            return None;
+        }
         let covariance = latest.covariance;
         let last_gyro = latest.last_gyro;
         let ts_ns = latest.ts_ns;
@@ -797,6 +820,7 @@ mod tests {
             publish_rate: 1000.0,
             replay_buffer_seconds: 2.0,
             mahalanobis_gate: 3.0,
+            max_position_m: 10000.0,
             use_imu,
             imu_gyro_noise_density: 0.01,
             imu_gyro_random_walk: 0.001,
@@ -907,6 +931,22 @@ mod tests {
         core.handle_source(&source_message("odom", NS_PER_SEC / 5, 0.01));
         let after_inlier = published_position(&mut core).expect("a period has elapsed");
         assert!(after_inlier.x > 0.005);
+    }
+
+    #[test]
+    fn a_state_past_the_position_cap_is_held_back_unless_the_cap_is_zero() {
+        let mut config = base_config(false);
+        config.max_position_m = 0.5;
+        let mut core = FusionCore::new(config.clone());
+        core.handle_source(&source_message("odom", 0, 0.0));
+        core.handle_source(&source_message("odom", NS_PER_SEC / 10, 1.0));
+        assert!(core.maybe_publish().is_none());
+
+        config.max_position_m = 0.0;
+        let mut core = FusionCore::new(config);
+        core.handle_source(&source_message("odom", 0, 0.0));
+        core.handle_source(&source_message("odom", NS_PER_SEC / 10, 1.0));
+        assert!(core.maybe_publish().is_some());
     }
 
     #[test]
