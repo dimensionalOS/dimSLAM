@@ -425,9 +425,9 @@ dependencies = [
 
 [[package]]
 name = "cu_vslam_rs"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "83eb1463aa249ad1da64055d34be9c6443d95b25d530acc0c0aa5cd0e3f56f00"
+checksum = "d6c2d4e30f876f55f242c8dee0f221a8e3290a57da26907da73fa3514b116ece"
 dependencies = [
  "cc",
 ]

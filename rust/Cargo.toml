@@ -8,7 +8,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-cu_vslam_rs = "0.1"
+cu_vslam_rs = "0.1.1"
 dimos-module = { git = "https://github.com/dimensionalOS/dimos.git", branch = "main" }
 lcm-msgs = { git = "https://github.com/dimensionalOS/dimos-lcm.git", branch = "rust-codegen" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
