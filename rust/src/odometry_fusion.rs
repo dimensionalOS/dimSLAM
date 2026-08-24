@@ -442,7 +442,11 @@ impl FusionCore {
             self.process_at(index);
         } else if event.ts_ns <= self.events.front().expect("seeded at init").ts_ns {
             self.too_late += 1;
-            warn!("measurement older than the replay buffer dropped");
+            warn_throttled!(
+                std::time::Duration::from_secs(10),
+                dropped = self.too_late,
+                "measurement older than the replay buffer dropped",
+            );
             return;
         } else {
             let slot = self.events.partition_point(|e| e.ts_ns <= event.ts_ns);
