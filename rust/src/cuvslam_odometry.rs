@@ -131,25 +131,21 @@ pub struct CuvslamOdometryConfig {
     pub depth_cloud_max_range: f64,
     /// One median point per k x k depth block; <= 1 is off.
     pub depth_cloud_decimation: i64,
-    /// rgbd only: densify the depth image with the depth2depth crate before the cloud
-    /// is cut from it — Depth Anything V2 predicts dense depth from the color image,
-    /// the prediction is affine-anchored to the trusted raw pixels, and holes and
-    /// outliers get filled from it. Both safetensors paths set turns it on; needs the
-    /// `depth2depth` cargo feature (`depth2depth-cuda`/`-cudnn`/`-metal` for a GPU).
+    /// rgbd only: RGB-guided densification of the depth image before the cloud is cut
+    /// from it. Both safetensors paths set turns it on; needs the `depth2depth` cargo
+    /// feature (`depth2depth-cuda`/`-cudnn`/`-metal` for a GPU).
     pub depth2depth_dinov2_weights: String,
     pub depth2depth_head_weights: String,
-    /// Scales the model input resolution, the quality/speed knob: 1.0 is the crate
-    /// default (280x504), 0.5 is ~4x faster and coarser.
+    /// Scales the model input resolution: 1.0 is the crate default (280x504), 0.5 is
+    /// ~4x faster and coarser.
     pub depth2depth_quality: f64,
-    /// Frame whose images on the ``image`` stream feed the model. Empty uses the rig
-    /// camera on the depth frame; set it when depth is aligned to a sensor that has no
-    /// color, such as an infrared imager. The few cm of parallax between the two is small
-    /// against the model's own error.
+    /// Frame whose images on the ``image`` stream feed the model; empty uses the rig
+    /// camera on the depth frame. Set it when depth is aligned to a sensor with no
+    /// color of its own — the few cm of parallax is small against the model's own error.
     pub depth2depth_color_frame: String,
-    /// Each depth image is fused with the recent color image closest in stamp; a
-    /// stalled color stream would silently guide densification with another moment's
-    /// scene. A depth frame with no color inside this stamp window gets a raw
-    /// (undensified) cloud, and once fusion has begun, staying in that state is fatal.
+    /// A depth image fuses with the color image closest in stamp; outside this window it
+    /// gets a raw (undensified) cloud, and staying outside it for 10x this long after
+    /// fusion has started gives up on densification for the rest of the run.
     pub depth2depth_max_color_skew_seconds: f64,
 }
 
@@ -179,9 +175,8 @@ pub struct VoCore {
     depth: Option<Image>,
     depth_info: Option<CameraInfo>,
     depth_fuser: Option<fused_depth::Fuser>,
-    /// Recent color frames, matched to depth frames by stamp. After an ingest stall
-    /// (model load, boot flood) the per-topic queues drain unevenly, so the last
-    /// color seen can be seconds away from the depth frame being processed.
+    /// After an ingest stall (model load, boot flood) the per-topic queues drain
+    /// unevenly, so the last color seen can be seconds from the depth being processed.
     fusion_colors: VecDeque<Image>,
     fused_once: bool,
     color_stale_since: Option<Instant>,
@@ -401,8 +396,6 @@ impl VoCore {
 
     fn push_fusion_color(&mut self, img: Image) {
         self.fusion_colors.push_back(img);
-        // Bounds memory when depth processing stalls; depth-side pruning in
-        // depth_cloud_msg is what normally keeps the ring short.
         if self.fusion_colors.len() > 64 {
             self.fusion_colors.pop_front();
         }
@@ -418,8 +411,7 @@ impl VoCore {
         (cloud, self.try_track(tf))
     }
 
-    /// A driver's own cloud carries every far, noisy pixel; this one is range-gated, and
-    /// cut from the densified image when a fuser is configured.
+    /// A driver's own cloud carries every far, noisy pixel; this one is range-gated.
     fn depth_cloud_msg(&mut self, depth: &Image) -> Option<PointCloud2> {
         let depth_ns = stamp_to_ns(&depth.header);
         let limit_seconds = self.config.depth2depth_max_color_skew_seconds;
@@ -445,6 +437,7 @@ impl VoCore {
         let skew_seconds = color
             .map(|color| (stamp_to_ns(&color.header) - depth_ns).abs() as f64 / 1e9)
             .unwrap_or(f64::INFINITY);
+        let mut give_up = false;
         let fused = match self.depth_fuser.as_mut() {
             Some(fuser) if skew_seconds <= limit_seconds => {
                 self.fused_once = true;
@@ -452,29 +445,33 @@ impl VoCore {
                 fuser.fuse(color.unwrap(), depth, self.config.depth_units_per_meter)
             }
             Some(_) => {
-                if self.fused_once {
-                    // A boot flood drains its backlog in well under this window, so
-                    // staying out of sync this long means the stream genuinely stopped.
-                    let stale = self.color_stale_since.get_or_insert_with(Instant::now);
-                    if stale.elapsed().as_secs_f64() > 10.0 * limit_seconds {
-                        error!(
-                            skew_seconds,
-                            limit_seconds,
-                            "depth2depth color stream stalled: no color image within the skew limit",
-                        );
-                        std::process::exit(1);
-                    }
+                // A boot flood drains its backlog in well under this window, so staying
+                // out of sync this long means the color stream genuinely stopped.
+                let stale_since = self.color_stale_since.get_or_insert_with(Instant::now);
+                give_up = self.fused_once
+                    && stale_since.elapsed().as_secs_f64() > 10.0 * limit_seconds;
+                if !give_up {
+                    warn_throttled!(
+                        Duration::from_secs(10),
+                        skew_seconds,
+                        depth_frame = %depth.header.frame_id,
+                        "depth2depth has no color within the skew limit; publishing raw depth",
+                    );
                 }
-                warn_throttled!(
-                    Duration::from_secs(10),
-                    skew_seconds,
-                    depth_frame = %depth.header.frame_id,
-                    "depth2depth has no color image within the skew limit; publishing raw depth clouds",
-                );
                 None
             }
             None => None,
         };
+        if give_up {
+            error!(
+                limit_seconds,
+                "depth2depth color stream stalled; densification is off for the rest of \
+                 this run, depth clouds stay raw",
+            );
+            self.depth_fuser = None;
+            self.fusion_colors.clear();
+            self.color_stale_since = None;
+        }
         let depth = fused.as_ref().unwrap_or(depth);
         let info = self.depth_info.as_ref().or_else(|| {
             self.cameras

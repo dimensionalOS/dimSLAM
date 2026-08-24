@@ -1,12 +1,11 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// RGB-guided densification of the raw depth image before the depth cloud is cut
-// from it: the depth2depth crate predicts dense depth from the color image
-// (Depth Anything V2), affine-anchors the prediction to the trusted raw pixels,
-// keeps raw wherever the two agree and fills holes and outliers from the aligned
-// prediction. Compiled to a stub unless the `depth2depth` cargo feature is on, so
-// the model and its GPU backends stay out of builds that do not use them.
+// RGB-guided densification of the raw depth image: the depth2depth crate predicts
+// dense depth from the color image, affine-anchors it to the trusted raw pixels, and
+// fills holes and outliers from the aligned prediction. Compiled to a stub unless the
+// `depth2depth` cargo feature is on, so the model and its GPU backends stay out of
+// builds that do not use them.
 
 use lcm_msgs::sensor_msgs::Image;
 
@@ -17,7 +16,7 @@ pub struct Fuser {
 
 impl Fuser {
     /// None means disabled: a weight path is empty, the feature is compiled out, or
-    /// the model failed to load (logged). The caller then publishes raw clouds.
+    /// the model failed to load (logged).
     pub fn new(dinov2_weights: &str, head_weights: &str, quality: f64) -> Option<Self> {
         if dinov2_weights.is_empty() || head_weights.is_empty() {
             return None;
@@ -61,9 +60,8 @@ impl Fuser {
         }
     }
 
-    /// The densified depth image (same resolution and units as the input), or None
-    /// when the pieces are missing or inference fails — the caller falls back to the
-    /// raw image, so a fault degrades quality rather than dropping the cloud.
+    /// The densified depth image, same resolution and units as the input; None when the
+    /// inputs are unusable or inference fails.
     #[cfg(feature = "depth2depth")]
     pub fn fuse(&mut self, color: &Image, depth: &Image, units_per_meter: f64) -> Option<Image> {
         use dimos_module::warn_throttled;
