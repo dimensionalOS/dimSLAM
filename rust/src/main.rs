@@ -71,7 +71,7 @@ struct DimSlam {
     camera_info: Input<CameraInfo>,
     #[input(decode = Image::decode)]
     image: Input<Image>,
-    /// rgbd only; unconnected otherwise.
+    /// Tracked against in rgbd mode; feeds depth_cloud in every mode.
     #[input(decode = Image::decode)]
     depth_image: Input<Image>,
     /// Only needed when depth has to be reprojected onto the rig camera.
@@ -87,7 +87,7 @@ struct DimSlam {
     sources: Input<Odometry>,
     #[output(encode = Odometry::encode)]
     odometry: Output<Odometry>,
-    /// rgbd only: the depth sensor's own points, range-gated, in the depth frame.
+    /// The depth sensor's own points, range-gated, in the depth frame.
     #[output(encode = PointCloud2::encode)]
     depth_cloud: Output<PointCloud2>,
     #[tf]

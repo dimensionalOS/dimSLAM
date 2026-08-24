@@ -193,7 +193,6 @@ pub struct VoCore {
     rig_from_base: Option<Isometry3<f64>>,
     /// Adjoint of base_from_rig, fixed with it at tracker creation.
     covariance_adjoint: Matrix6<f64>,
-    /// identity until the gate first fires
     rebase: Option<Isometry3<f64>>,
     covariance: Matrix6<f64>,
     previous_raw: Option<Isometry3<f64>>,
