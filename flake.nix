@@ -78,9 +78,13 @@
           // sdkPackages
           // { default = moduleFor defaultVariant; };
 
-        devShells.default = pkgs.mkShell {
-          packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt ];
-          CUVSLAM_SDK_DIR = sdkPackages."sdk-${defaultVariant}";
-        };
+        devShells.default = let sdkPackage = sdkPackages."sdk-${defaultVariant}"; in
+          pkgs.mkShell {
+            packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt ];
+            CUVSLAM_SDK_DIR = sdkPackage;
+            # Same reason as moduleFor: without the rpath the test binary cannot find
+            # libcuvslam and aborts before the first test runs.
+            RUSTFLAGS = "-C link-arg=-Wl,-rpath,${sdkPackage}/lib";
+          };
       });
 }
