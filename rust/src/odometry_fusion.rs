@@ -463,7 +463,6 @@ impl FusionCore {
         }
     }
 
-    /// Replay is just calling this again in order.
     fn process_at(&mut self, index: usize) {
         {
             let previous = &self.events[index - 1];
