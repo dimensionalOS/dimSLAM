@@ -81,11 +81,11 @@ pub struct OdometryFusionConfig {
     /// Off bypasses the Kalman machinery and seeds the filter level from the first
     /// source message; see `blend`.
     pub use_imu: bool,
-    /// Required when use_imu is on; a property of the IMU, so the blueprint supplies them.
-    pub imu_gyro_noise_density: Option<f64>,
-    pub imu_gyro_random_walk: Option<f64>,
-    pub imu_accel_noise_density: Option<f64>,
-    pub imu_accel_random_walk: Option<f64>,
+    /// Required when use_imu is on; 0 counts as unset.
+    pub imu_gyro_noise_density: f64,
+    pub imu_gyro_random_walk: f64,
+    pub imu_accel_noise_density: f64,
+    pub imu_accel_random_walk: f64,
     pub gravity: f64,
     /// Samples averaged while stationary to level the filter and take the gyro bias.
     pub imu_init_samples: i64,
@@ -396,10 +396,10 @@ impl FusionCore {
         );
         assert!(
             !self.config.use_imu
-                || (self.config.imu_gyro_noise_density.is_some()
-                    && self.config.imu_gyro_random_walk.is_some()
-                    && self.config.imu_accel_noise_density.is_some()
-                    && self.config.imu_accel_random_walk.is_some()),
+                || (self.config.imu_gyro_noise_density > 0.0
+                    && self.config.imu_gyro_random_walk > 0.0
+                    && self.config.imu_accel_noise_density > 0.0
+                    && self.config.imu_accel_random_walk > 0.0),
             "use_imu needs all four imu noise figures set"
         );
     }
@@ -412,10 +412,10 @@ impl FusionCore {
         accel_bias: Vector3<f64>,
     ) {
         self.filter.noise = eskf::Noise {
-            gyro_noise_density: self.config.imu_gyro_noise_density.unwrap_or_default(),
-            gyro_random_walk: self.config.imu_gyro_random_walk.unwrap_or_default(),
-            accel_noise_density: self.config.imu_accel_noise_density.unwrap_or_default(),
-            accel_random_walk: self.config.imu_accel_random_walk.unwrap_or_default(),
+            gyro_noise_density: self.config.imu_gyro_noise_density,
+            gyro_random_walk: self.config.imu_gyro_random_walk,
+            accel_noise_density: self.config.imu_accel_noise_density,
+            accel_random_walk: self.config.imu_accel_random_walk,
         };
         self.filter.gravity = self.config.gravity;
         self.filter.init(

@@ -13,7 +13,7 @@ mod depth_reproject;
 pub mod imu_info;
 mod msg_convert;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use dimos_module::nalgebra::{Isometry3, Matrix3, Matrix6, Vector3};
