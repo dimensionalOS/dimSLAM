@@ -16,8 +16,8 @@ fn xyz_field(name: &str, offset: i32) -> PointField {
     }
 }
 
-/// Points come out in `depth.header.frame_id`, unrotated. Median (not mean) per block so a
-/// flying pixel across a depth discontinuity cannot invent a mid-air point.
+/// Median (not mean) per block, so a flying pixel across a depth discontinuity cannot
+/// invent a mid-air point.
 pub fn depth_cloud(
     depth: &Image,
     depth_info: &CameraInfo,

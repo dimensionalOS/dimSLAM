@@ -1,7 +1,5 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
-//
-// Depth-to-camera reprojection for the cuVSLAM module's rgbd mode.
 
 use dimos_module::nalgebra::Isometry3;
 use lcm_msgs::sensor_msgs::{CameraInfo, Image};
