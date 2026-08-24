@@ -136,8 +136,7 @@ pub struct CuvslamOdometryConfig {
     /// feature (`depth2depth-cuda`/`-cudnn`/`-metal` for a GPU).
     pub depth2depth_dinov2_weights: String,
     pub depth2depth_head_weights: String,
-    /// Scales the model input resolution: 1.0 is the crate default (280x504), 0.5 is
-    /// ~4x faster and coarser.
+    /// Scales the model input resolution; 0.5 is ~4x faster and coarser.
     pub depth2depth_quality: f64,
     /// Frame whose images on the ``image`` stream feed the model; empty uses the rig
     /// camera on the depth frame. Set it when depth is aligned to a sensor with no
@@ -410,7 +409,6 @@ impl VoCore {
         (cloud, self.try_track(tf))
     }
 
-    /// A driver's own cloud carries every far, noisy pixel; this one is range-gated.
     fn depth_cloud_msg(&mut self, depth: &Image) -> Option<PointCloud2> {
         let depth_ns = stamp_to_ns(&depth.header);
         let limit_seconds = self.config.depth2depth_max_color_skew_seconds;

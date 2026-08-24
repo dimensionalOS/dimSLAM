@@ -60,8 +60,8 @@ impl Fuser {
         }
     }
 
-    /// The densified depth image, same resolution and units as the input; None when the
-    /// inputs are unusable or inference fails.
+    /// The densified depth image comes back at the input's resolution and units, not the
+    /// model's.
     #[cfg(feature = "depth2depth")]
     pub fn fuse(&mut self, color: &Image, depth: &Image, units_per_meter: f64) -> Option<Image> {
         use dimos_module::warn_throttled;
