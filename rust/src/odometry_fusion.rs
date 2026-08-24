@@ -6,7 +6,7 @@
 
 mod eskf;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use nalgebra::{DVector, Isometry3, Matrix6, Translation3, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,16 @@ fn resolve_variance(configured: f64, from_message: f64) -> f64 {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SourceConfig {
+    /// [x y z roll pitch yaw]: <0 message covariance, 0 drop, >0 fixed.
+    /// A drifting source's covariance describes accumulated drift, not the delta: prefer a fixed value.
+    pub pose_variances: [f64; 6],
+    /// [vx vy vz wx wy wz], same convention, body frame.
+    pub twist_variances: [f64; 6],
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OdometryFusionConfig {
@@ -66,16 +76,12 @@ pub struct OdometryFusionConfig {
     pub initial_velocity_std: f64,
     pub initial_rotation_std: f64,
     pub initial_bias_std: f64,
-    /// One entry per source: the frame_id its estimates carry.
-    pub source_frames: Vec<String>,
-    /// 6 per source, [x y z roll pitch yaw]: <0 message covariance, 0 drop, >0 fixed.
-    /// A drifting source's covariance describes accumulated drift, not the delta: prefer a fixed value.
-    pub source_pose_variances: Vec<f64>,
-    /// 6 per source, [vx vy vz wx wy wz], same convention, body frame.
-    pub source_twist_variances: Vec<f64>,
+    /// Keyed by the frame_id a source's estimates carry. Ordered, not hashed: the blend sums in
+    /// iteration order and floating-point addition is not associative.
+    pub sources: BTreeMap<String, SourceConfig>,
     /// Virtual zero-twist [vx vy vz wx wy wz] fused after each source update (use_imu only):
     /// >0 pins that dimension to zero with this variance (e.g. non-holonomic vy, vz), 0 frees it.
-    pub constraint_twist_variances: Vec<f64>,
+    pub constraint_twist_variances: [f64; 6],
 }
 
 /// The derived default would be all zeros, which `check_config` rejects and gravity needs.
@@ -99,10 +105,8 @@ impl Default for OdometryFusionConfig {
             initial_velocity_std: 0.1,
             initial_rotation_std: 0.05,
             initial_bias_std: 0.01,
-            source_frames: Vec::new(),
-            source_pose_variances: Vec::new(),
-            source_twist_variances: Vec::new(),
-            constraint_twist_variances: vec![0.0; 6],
+            sources: BTreeMap::new(),
+            constraint_twist_variances: [0.0; 6],
         }
     }
 }
@@ -284,11 +288,12 @@ impl FusionCore {
                 Vector3::zeros(),
             );
         }
-        let Some(source) = self
+        let Some((source, (_, source_config))) = self
             .config
-            .source_frames
+            .sources
             .iter()
-            .position(|frame| *frame == msg.frame_id)
+            .enumerate()
+            .find(|(_, (frame_id, _))| **frame_id == msg.frame_id)
         else {
             warn!(frame_id = %msg.frame_id, "odometry from unconfigured frame_id dropped");
             return;
@@ -299,11 +304,11 @@ impl FusionCore {
         let mut twist_variance = [0.0; 6];
         for dim in 0..6 {
             pose_variance[dim] = resolve_variance(
-                self.config.source_pose_variances[source * 6 + dim],
+                source_config.pose_variances[dim],
                 msg.pose_covariance[(dim, dim)],
             );
             twist_variance[dim] = resolve_variance(
-                self.config.source_twist_variances[source * 6 + dim],
+                source_config.twist_variances[dim],
                 msg.twist_covariance[(dim, dim)],
             );
         }
@@ -350,16 +355,6 @@ impl FusionCore {
     }
 
     fn check_config(&self) {
-        let sources = self.config.source_frames.len();
-        assert!(
-            self.config.source_pose_variances.len() == 6 * sources
-                && self.config.source_twist_variances.len() == 6 * sources,
-            "source_pose_variances and source_twist_variances need 6 entries per source_frames entry"
-        );
-        assert!(
-            self.config.constraint_twist_variances.len() == 6,
-            "constraint_twist_variances needs exactly 6 entries"
-        );
         assert!(
             !self.config.use_imu
                 || (self.config.imu_gyro_noise_density > 0.0
@@ -393,8 +388,8 @@ impl FusionCore {
             self.config.initial_rotation_std,
             self.config.initial_bias_std,
         );
-        self.anchors = vec![None; self.config.source_frames.len()];
-        self.activity = vec![SourceActivity::default(); self.config.source_frames.len()];
+        self.anchors = vec![None; self.config.sources.len()];
+        self.activity = vec![SourceActivity::default(); self.config.sources.len()];
         self.initialized = true;
         self.last_publish_ns = timestamp_ns;
         let mut seed = Event {
@@ -548,8 +543,7 @@ impl FusionCore {
             self.anchor(measurement.source);
         }
 
-        let mut constraint_variance = [0.0; 6];
-        constraint_variance.copy_from_slice(&self.config.constraint_twist_variances);
+        let constraint_variance = self.config.constraint_twist_variances;
         let mut constraint_rows = Vec::new();
         let mut constraint_residuals = Vec::new();
         let mut constraint_variances = Vec::new();
@@ -797,11 +791,19 @@ mod tests {
             initial_velocity_std: 0.1,
             initial_rotation_std: 0.05,
             initial_bias_std: 0.01,
-            source_frames: vec!["odom".to_string()],
-            source_pose_variances: vec![1e-4; 6],
-            source_twist_variances: vec![0.0; 6],
-            constraint_twist_variances: vec![0.0; 6],
+            sources: one_source("odom"),
+            constraint_twist_variances: [0.0; 6],
         }
+    }
+
+    fn one_source(frame_id: &str) -> BTreeMap<String, SourceConfig> {
+        BTreeMap::from([(
+            frame_id.to_string(),
+            SourceConfig {
+                pose_variances: [1e-4; 6],
+                twist_variances: [0.0; 6],
+            },
+        )])
     }
 
     fn source_message(frame_id: &str, ts_ns: i64, x: f64) -> OdometryEstimate {
@@ -842,7 +844,7 @@ mod tests {
     #[test]
     fn a_drifting_source_contributes_only_its_delta() {
         let mut config = base_config(false);
-        config.source_frames = vec!["visual_odom".to_string()];
+        config.sources = one_source("visual_odom");
         let mut core = FusionCore::new(config);
         core.handle_source(&source_message("visual_odom", 0, 10.0));
         core.handle_source(&source_message("visual_odom", NS_PER_SEC / 10, 10.5));
@@ -863,7 +865,7 @@ mod tests {
     #[test]
     fn a_nan_pose_is_dropped_rather_than_wedging_the_filter() {
         let mut config = base_config(false);
-        config.source_frames = vec!["visual_odom".to_string()];
+        config.sources = one_source("visual_odom");
         let mut core = FusionCore::new(config);
         core.handle_source(&source_message("visual_odom", 0, 10.0));
 

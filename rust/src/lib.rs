@@ -10,12 +10,13 @@
 //!
 //! ```
 //! use dim_slam::nalgebra::Isometry3;
-//! use dim_slam::{FusionCore, OdometryEstimate, OdometryFusionConfig};
+//! use dim_slam::{FusionCore, OdometryEstimate, OdometryFusionConfig, SourceConfig};
 //!
 //! let mut fusion = FusionCore::new(OdometryFusionConfig {
-//!     source_frames: vec!["visual_odom".into()],
-//!     source_pose_variances: vec![1e-4; 6],
-//!     source_twist_variances: vec![0.0; 6],
+//!     sources: [("visual_odom".into(), SourceConfig {
+//!         pose_variances: [1e-4; 6],
+//!         twist_variances: [0.0; 6],
+//!     })].into(),
 //!     ..Default::default()
 //! });
 //! for (step, timestamp_ns) in [0, 20_000_000, 40_000_000].into_iter().enumerate() {
@@ -37,7 +38,7 @@ pub mod odometry_fusion;
 pub mod types;
 
 pub use cuvslam_odometry::{CuvslamOdometryConfig, VoCore};
-pub use odometry_fusion::{FusionCore, OdometryFusionConfig};
+pub use odometry_fusion::{FusionCore, OdometryFusionConfig, SourceConfig};
 pub use types::{
     CameraModel, ImageFrame, ImuNoiseModel, ImuSample, OdometryEstimate, PointCloud, TfLookup,
     Twist,
