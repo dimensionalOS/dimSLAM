@@ -24,7 +24,8 @@ const NS_PER_SEC: i64 = 1_000_000_000;
 const STATIONARY_GYRO_LIMIT: f64 = 0.05;
 
 /// Raw finite differences of the gyro are too noisy for the tangential lever-arm term.
-const ANGULAR_ACCEL_SMOOTHING: f64 = 0.1;
+/// A time constant rather than a per-sample weight, so the cutoff does not move with rate.
+const ANGULAR_ACCEL_TIME_CONSTANT: f64 = 0.025;
 
 fn stamp_to_ns(header: &lcm_msgs::std_msgs::Header) -> i64 {
     header.stamp.sec as i64 * NS_PER_SEC + header.stamp.nsec as i64
@@ -211,7 +212,8 @@ impl FusionCore {
             let dt = (ts_ns - self.lever_gyro_ns) as f64 / NS_PER_SEC as f64;
             if dt > 0.0 {
                 let raw_alpha = (gyro - self.lever_gyro) / dt;
-                self.lever_alpha += (raw_alpha - self.lever_alpha) * ANGULAR_ACCEL_SMOOTHING;
+                let blend = 1.0 - (-dt / ANGULAR_ACCEL_TIME_CONSTANT).exp();
+                self.lever_alpha += (raw_alpha - self.lever_alpha) * blend;
             }
         }
         self.lever_gyro = gyro;
