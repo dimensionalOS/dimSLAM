@@ -34,6 +34,10 @@ const MAX_PAIR_SKEW_NS: i64 = 1_000_000;
 /// buffered inertial data had.
 const MAX_PENDING_IMU: usize = 2048;
 
+/// Colors waiting for a depth frame to pair with. The stamp cutoff normally keeps this
+/// far smaller; this only bounds it when depth stops arriving.
+const MAX_FUSION_COLORS: usize = 64;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Stereo,
@@ -371,6 +375,7 @@ impl VoCore {
             self.resolve_rig(tf);
         }
         let for_fusion = self.depth_fuser.is_some()
+            && !self.config.depth2depth_color_frame.is_empty()
             && img.header.frame_id == self.config.depth2depth_color_frame;
         let Some(index) = self.camera_index(&img.header.frame_id) else {
             if for_fusion {
@@ -396,7 +401,7 @@ impl VoCore {
 
     fn push_fusion_color(&mut self, img: Image) {
         self.fusion_colors.push_back(img);
-        if self.fusion_colors.len() > 64 {
+        if self.fusion_colors.len() > MAX_FUSION_COLORS {
             self.fusion_colors.pop_front();
         }
     }
@@ -451,13 +456,13 @@ impl VoCore {
             .map(|color| (stamp_to_ns(&color.header) - depth_ns).abs() as f64 / 1e9)
             .unwrap_or(f64::INFINITY);
         let mut give_up = false;
-        let fused = match self.depth_fuser.as_mut() {
-            Some(fuser) if skew_seconds <= limit_seconds => {
+        let fused = match (self.depth_fuser.as_mut(), color) {
+            (Some(fuser), Some(color)) if skew_seconds <= limit_seconds => {
                 self.fused_once = true;
                 self.color_stale_since = None;
-                fuser.fuse(color.unwrap(), depth, self.config.depth_units_per_meter)
+                fuser.fuse(color, depth, self.config.depth_units_per_meter)
             }
-            Some(_) => {
+            (Some(_), _) => {
                 // A boot flood drains its backlog in well under this window, so staying
                 // out of sync this long means the color stream genuinely stopped.
                 let stale_since = self.color_stale_since.get_or_insert_with(Instant::now);
@@ -473,7 +478,7 @@ impl VoCore {
                 }
                 None
             }
-            None => None,
+            (None, _) => None,
         };
         if give_up {
             error!(
