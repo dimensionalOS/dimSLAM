@@ -426,9 +426,8 @@ impl VoCore {
 
     /// Depth pixel-aligned with the rig camera, as cuVSLAM's RGBD contract requires.
     /// Passthrough when it was recorded against that camera; reprojected through the depth
-    /// intrinsics and the tf between the two sensors when it was not (a D455 records depth
-    /// against the left IR camera, not the color camera). None while the pieces to
-    /// reproject are still missing.
+    /// intrinsics and the tf between the two sensors when it was not. None while the pieces
+    /// to reproject are still missing.
     fn align_depth(&mut self, tf: &Tf) -> Option<DepthChoice> {
         let depth = self.depth.as_ref().expect("checked by try_track");
         let camera = &self.cameras[0];

@@ -24,10 +24,9 @@ fn xyz_field(name: &str, offset: i32) -> PointField {
 /// `decimation` <= 1 emits every pixel. Otherwise each k x k block becomes at most one
 /// point: the median of its in-gate depths, deprojected at the block centre. Median rather
 /// than mean because averaging across a depth discontinuity invents a point mid-air between
-/// foreground and background (the classic flying pixel); the median snaps to one surface,
-/// which is why the RealSense D400 post-processing decimation filter uses it. Blocks where
-/// fewer than half the pixels have valid in-gate depth are dropped outright — those sit on
-/// object edges or specular holes where stereo depth is least trustworthy.
+/// foreground and background (the classic flying pixel); the median snaps to one surface.
+/// Blocks where fewer than half the pixels have valid in-gate depth are dropped outright —
+/// those sit on object edges or specular holes where stereo depth is least trustworthy.
 ///
 /// The median only outvotes flying pixels that are a minority of their block; a fringe wide
 /// enough to fill blocks becomes the median itself. Those survivors are caught by where they
