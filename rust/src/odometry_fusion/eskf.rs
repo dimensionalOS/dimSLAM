@@ -1,8 +1,8 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Error-state order: p(0:3) v(3:6) theta(6:9) bg(9:12) ba(12:15), theta a right
-// (body-frame) perturbation: q_true = q_est * Exp(theta).
+// Error-state order: position(0:3) velocity(3:6) theta(6:9) gyro_bias(9:12)
+// accel_bias(12:15), theta a right (body-frame) perturbation: q_true = q_est * Exp(theta).
 
 use dimos_module::nalgebra::{DVector, Dyn, Matrix3, OMatrix, SMatrix, UnitQuaternion, Vector3, U15};
 
@@ -24,21 +24,21 @@ pub struct Noise {
 
 #[derive(Clone, Debug)]
 pub struct State {
-    pub p: Vector3<f64>,           // world position of the body
-    pub v: Vector3<f64>,           // world velocity
-    pub q: UnitQuaternion<f64>,    // world_from_body
-    pub bg: Vector3<f64>,          // gyro bias
-    pub ba: Vector3<f64>,          // accel bias
+    pub position: Vector3<f64>, // world frame
+    pub velocity: Vector3<f64>, // world frame
+    pub q: UnitQuaternion<f64>, // world_from_body
+    pub gyro_bias: Vector3<f64>,
+    pub accel_bias: Vector3<f64>,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
-            p: Vector3::zeros(),
-            v: Vector3::zeros(),
+            position: Vector3::zeros(),
+            velocity: Vector3::zeros(),
             q: UnitQuaternion::identity(),
-            bg: Vector3::zeros(),
-            ba: Vector3::zeros(),
+            gyro_bias: Vector3::zeros(),
+            accel_bias: Vector3::zeros(),
         }
     }
 }
@@ -76,8 +76,8 @@ impl Filter {
     ) {
         self.x = State::default();
         self.x.q = world_from_body;
-        self.x.bg = gyro_bias;
-        self.x.ba = accel_bias;
+        self.x.gyro_bias = gyro_bias;
+        self.x.accel_bias = accel_bias;
         self.p_cov = Mat15::zeros();
         for (block, std) in [
             (0, position_std),
@@ -94,8 +94,8 @@ impl Filter {
 
     pub fn propagate(&mut self, dt: f64, gyro: &Vector3<f64>, accel: &Vector3<f64>) {
         let rotation = self.x.q.to_rotation_matrix();
-        let unbiased_gyro = gyro - self.x.bg;
-        let unbiased_accel = accel - self.x.ba;
+        let unbiased_gyro = gyro - self.x.gyro_bias;
+        let unbiased_accel = accel - self.x.accel_bias;
         let gravity_vector = Vector3::new(0.0, 0.0, -self.gravity);
         let world_accel = rotation * unbiased_accel + gravity_vector;
 
@@ -111,8 +111,8 @@ impl Filter {
         f.fixed_view_mut::<3, 3>(6, 9)
             .copy_from(&(-Matrix3::identity() * dt));
 
-        self.x.p += self.x.v * dt + 0.5 * world_accel * dt * dt;
-        self.x.v += world_accel * dt;
+        self.x.position += self.x.velocity * dt + 0.5 * world_accel * dt * dt;
+        self.x.velocity += world_accel * dt;
         self.x.q *= UnitQuaternion::from_scaled_axis(unbiased_gyro * dt);
 
         let mut q_noise = Mat15::zeros();
@@ -161,11 +161,11 @@ impl Filter {
     }
 
     fn inject(&mut self, dx: &Vec15) {
-        self.x.p += dx.fixed_rows::<3>(0);
-        self.x.v += dx.fixed_rows::<3>(3);
+        self.x.position += dx.fixed_rows::<3>(0);
+        self.x.velocity += dx.fixed_rows::<3>(3);
         self.x.q *= UnitQuaternion::from_scaled_axis(dx.fixed_rows::<3>(6).into_owned());
-        self.x.bg += dx.fixed_rows::<3>(9);
-        self.x.ba += dx.fixed_rows::<3>(12);
+        self.x.gyro_bias += dx.fixed_rows::<3>(9);
+        self.x.accel_bias += dx.fixed_rows::<3>(12);
     }
 }
 
@@ -197,7 +197,6 @@ mod tests {
         filter
     }
 
-    /// Gravity-compensating accel for a level, stationary body.
     fn static_accel() -> Vector3<f64> {
         Vector3::new(0.0, 0.0, GRAVITY)
     }
@@ -237,18 +236,18 @@ mod tests {
         for _ in 0..100 {
             filter.propagate(0.01, &Vector3::zeros(), &static_accel());
         }
-        assert!(filter.x.p.norm() < 1e-9);
-        assert!(filter.x.v.norm() < 1e-9);
+        assert!(filter.x.position.norm() < 1e-9);
+        assert!(filter.x.velocity.norm() < 1e-9);
     }
 
     #[test]
     fn propagation_integrates_constant_velocity() {
         let mut filter = level_filter();
-        filter.x.v = Vector3::new(1.0, 0.0, 0.0);
+        filter.x.velocity = Vector3::new(1.0, 0.0, 0.0);
         for _ in 0..100 {
             filter.propagate(0.01, &Vector3::zeros(), &static_accel());
         }
-        assert!((filter.x.p.x - 1.0).abs() < 1e-9);
+        assert!((filter.x.position.x - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -268,22 +267,22 @@ mod tests {
         let residual = DVector::from_vec(vec![1.0, 0.0, 0.0]);
         let variance = DVector::from_element(3, 1e-4);
         assert!(filter.update(&residual, &position_jacobian(3), &variance, 0.0));
-        assert!(filter.x.p.x > 0.9);
+        assert!(filter.x.position.x > 0.9);
         assert!(filter.p_cov.trace() < 15.0);
     }
 
     #[test]
     fn position_updates_correct_velocity_through_the_cross_covariance() {
         let mut filter = level_filter();
-        filter.x.v = Vector3::new(1.0, 0.0, 0.0); // true velocity is zero; the filter is wrong
+        filter.x.velocity = Vector3::new(1.0, 0.0, 0.0); // true velocity is zero; the filter is wrong
         for _ in 0..50 {
             filter.propagate(0.01, &Vector3::zeros(), &static_accel());
             // The truth stays at the origin, so the residual is minus the estimate.
-            let residual = DVector::from_vec(vec![-filter.x.p.x, -filter.x.p.y, -filter.x.p.z]);
+            let residual = DVector::from_vec(vec![-filter.x.position.x, -filter.x.position.y, -filter.x.position.z]);
             let variance = DVector::from_element(3, 1e-6);
             filter.update(&residual, &position_jacobian(3), &variance, 0.0);
         }
-        assert!(filter.x.v.x.abs() < 0.1);
+        assert!(filter.x.velocity.x.abs() < 0.1);
     }
 
     #[test]
@@ -323,9 +322,8 @@ mod tests {
         let gyro_reading = Vector3::new(0.05, 0.0, 0.0); // still body, biased gyro
         for _ in 0..50 {
             filter.propagate(0.01, &gyro_reading, &static_accel());
-            // A perfect rate sensor says the body is not rotating: residual is
-            // 0 - (gyro - bg), jacobian -I on the bias block.
-            let predicted = gyro_reading - filter.x.bg;
+            // A perfect rate sensor says the body is not rotating.
+            let predicted = gyro_reading - filter.x.gyro_bias;
             let residual = DVector::from_vec(vec![-predicted.x, -predicted.y, -predicted.z]);
             let mut jacobian = Jacobian::zeros(3);
             jacobian
@@ -334,7 +332,7 @@ mod tests {
             let variance = DVector::from_element(3, 1e-6);
             filter.update(&residual, &jacobian, &variance, 0.0);
         }
-        assert!((filter.x.bg.x - 0.05).abs() < 1e-3);
+        assert!((filter.x.gyro_bias.x - 0.05).abs() < 1e-3);
     }
 
     #[test]
@@ -353,6 +351,6 @@ mod tests {
         assert!((filter.p_cov[(3, 3)] - 9.0).abs() < 1e-12);
         assert!((filter.p_cov[(6, 6)] - 0.25).abs() < 1e-12);
         assert!((filter.p_cov[(9, 9)] - 1e-4).abs() < 1e-12);
-        assert!((filter.x.bg.x - 0.1).abs() < 1e-12);
+        assert!((filter.x.gyro_bias.x - 0.1).abs() < 1e-12);
     }
 }

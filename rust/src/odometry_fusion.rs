@@ -19,12 +19,11 @@ use eskf::{Filter, Jacobian, Mat15, State, Vec15};
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 
-/// Above this the robot is rotating for real: MEMS gyro bias sits around 0.01 rad/s,
-/// so a bias-calibration window containing such samples would swallow true motion.
+/// Bias calibration only accepts samples below this rate: high enough to clear the gyro's
+/// own bias, low enough that real rotation is never averaged into the bias estimate.
 const STATIONARY_GYRO_LIMIT: f64 = 0.05;
 
-/// First-order low-pass on the differentiated gyro (~6 Hz at 400 Hz sampling); raw
-/// finite differences are too noisy to use in the tangential lever-arm term.
+/// Raw finite differences of the gyro are too noisy for the tangential lever-arm term.
 const ANGULAR_ACCEL_SMOOTHING: f64 = 0.1;
 
 fn stamp_to_ns(header: &lcm_msgs::std_msgs::Header) -> i64 {
@@ -42,8 +41,7 @@ fn vector3(v: &lcm_msgs::geometry_msgs::Vector3) -> Vector3<f64> {
     Vector3::new(v.x, v.y, v.z)
 }
 
-/// Fixed and message policies share a guard: a non-finite or non-positive
-/// variance can only drop the dimension, never divide by it.
+/// A non-finite or non-positive variance drops the dimension rather than being divided by.
 fn resolve_variance(configured: f64, from_message: f64) -> f64 {
     let variance = if configured < 0.0 {
         from_message
@@ -93,7 +91,7 @@ pub struct OdometryFusionConfig {
     pub source_twist_variances: Vec<f64>,
     /// Virtual zero-twist measurement [vx vy vz wx wy wz] applied with every source
     /// message: >0 constrains that dimension toward zero with this variance (e.g. the
-    /// non-holonomic vy, vz of a differential-drive base), 0 leaves it free.
+    /// vy, vz a non-holonomic platform cannot move along), 0 leaves it free.
     pub constraint_twist_variances: Vec<f64>,
 }
 
@@ -138,7 +136,6 @@ enum EventKind {
 struct Event {
     ts_ns: i64,
     kind: EventKind,
-    // snapshot after processing
     state: State,
     covariance: Mat15,
     anchors: Vec<Option<Isometry3<f64>>>,
@@ -528,7 +525,7 @@ impl FusionCore {
             None
         };
         if let Some(target) = target {
-            let position_residual = target.translation.vector - self.filter.x.p;
+            let position_residual = target.translation.vector - self.filter.x.position;
             let rotation_residual = (self.filter.x.q.inverse() * target.rotation).scaled_axis();
             for dim in 0..3 {
                 if measurement.pose_variance[dim] > 0.0 {
@@ -601,7 +598,7 @@ impl FusionCore {
 
         let increment = if measurement.absolute {
             let Some(pose) = measurement.pose else { return };
-            Isometry3::from_parts(Translation3::from(self.filter.x.p), self.filter.x.q).inverse()
+            Isometry3::from_parts(Translation3::from(self.filter.x.position), self.filter.x.q).inverse()
                 * pose
         } else {
             let Some(delta) = measurement.delta else { return };
@@ -624,7 +621,7 @@ impl FusionCore {
 
         let translation = increment.translation.vector;
         let rotation = increment.rotation.scaled_axis();
-        self.filter.x.p += self.filter.x.q
+        self.filter.x.position += self.filter.x.q
             * Vector3::new(
                 share[0] * translation.x,
                 share[1] * translation.y,
@@ -637,8 +634,8 @@ impl FusionCore {
         ));
     }
 
-    /// Body-frame twist rows. Linear velocity observes v and theta; angular velocity
-    /// is measured against the latest gyro sample, so it observes the gyro bias.
+    /// Body-frame twist rows. Linear velocity observes velocity and rotation; angular
+    /// velocity is measured against the latest gyro sample, so it observes the gyro bias.
     fn add_twist_rows(
         &self,
         linear: &Vector3<f64>,
@@ -649,7 +646,7 @@ impl FusionCore {
         variances: &mut Vec<f64>,
     ) {
         let body_from_world = self.filter.x.q.inverse().to_rotation_matrix();
-        let body_velocity = body_from_world * self.filter.x.v;
+        let body_velocity = body_from_world * self.filter.x.velocity;
         let velocity_skew = eskf::skew(&body_velocity);
         for dim in 0..3 {
             if variance[dim] > 0.0 {
@@ -663,7 +660,7 @@ impl FusionCore {
                 variances.push(variance[dim]);
             }
         }
-        let predicted_angular = self.last_gyro - self.filter.x.bg;
+        let predicted_angular = self.last_gyro - self.filter.x.gyro_bias;
         for dim in 0..3 {
             if variance[3 + dim] > 0.0 {
                 let mut row = Vec15::zeros();
@@ -699,7 +696,7 @@ impl FusionCore {
 
     fn anchor(&mut self, source: usize) {
         self.anchors[source] = Some(Isometry3::from_parts(
-            Translation3::from(self.filter.x.p),
+            Translation3::from(self.filter.x.position),
             self.filter.x.q,
         ));
     }
@@ -713,7 +710,6 @@ impl FusionCore {
         event.last_gyro = self.last_gyro;
     }
 
-    /// Rate-gated: the fused Odometry and the odom->base transform, when due.
     pub fn maybe_publish(&mut self) -> Option<(Odometry, Transform)> {
         let latest = self.events.back()?;
         let period = (1.0e9 / self.config.publish_rate.max(1.0)) as i64;
@@ -727,16 +723,16 @@ impl FusionCore {
         let ts_ns = latest.ts_ns;
 
         let body_from_world = state.q.inverse().to_rotation_matrix();
-        let body_velocity = body_from_world * state.v;
-        let body_angular = last_gyro - state.bg;
+        let body_velocity = body_from_world * state.velocity;
+        let body_angular = last_gyro - state.gyro_bias;
 
         let mut msg = Odometry::default();
         msg.header.stamp = to_stamp(ts_ns);
         msg.header.frame_id = self.config.odom_frame.clone();
         msg.child_frame_id = self.config.base_frame.clone();
-        msg.pose.pose.position.x = state.p.x;
-        msg.pose.pose.position.y = state.p.y;
-        msg.pose.pose.position.z = state.p.z;
+        msg.pose.pose.position.x = state.position.x;
+        msg.pose.pose.position.y = state.position.y;
+        msg.pose.pose.position.z = state.position.z;
         msg.pose.pose.orientation.x = state.q.i;
         msg.pose.pose.orientation.y = state.q.j;
         msg.pose.pose.orientation.z = state.q.k;
@@ -761,7 +757,7 @@ impl FusionCore {
             }
         }
 
-        let pose = Isometry3::from_parts(Translation3::from(state.p), state.q);
+        let pose = Isometry3::from_parts(Translation3::from(state.position), state.q);
         let transform = Transform::new(
             self.config.odom_frame.clone(),
             self.config.base_frame.clone(),

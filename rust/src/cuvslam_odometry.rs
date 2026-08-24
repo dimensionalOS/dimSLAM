@@ -30,8 +30,8 @@ use cu_vslam_rs::{ffi, CameraParams, ImageRef, Tracker};
 /// cuVSLAM's Track() contract asks for stereo stamps within 1 ms.
 const MAX_PAIR_SKEW_NS: i64 = 1_000_000;
 
-/// Roughly five seconds at 400 Hz; a tracking stall longer than that has already
-/// outlived any use the buffered inertial data had.
+/// A tracking stall long enough to overflow this has already outlived any use the
+/// buffered inertial data had.
 const MAX_PENDING_IMU: usize = 2048;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -184,7 +184,6 @@ pub struct VoCore {
     camera_from_depth: Option<Isometry3<f64>>,
     last_ts_ns: Option<i64>,
 
-    /// last published pose, on base_frame
     world_from_base: Option<Isometry3<f64>>,
     base_from_rig: Option<Isometry3<f64>>,
     rig_from_base: Option<Isometry3<f64>>,
@@ -622,12 +621,9 @@ impl VoCore {
         };
         if mode == Mode::Rgbd {
             tracker_config.rgbd_depth_scale_factor = self.config.depth_units_per_meter as f32;
-            // The default of -1 means no camera, and depth belonging to nothing is silently
-            // ignored. A depth stream usually reports its own frame, so unrecognised means 0.
-            let depth_frame = self.depth.as_ref().map(|depth| depth.header.frame_id.clone());
-            tracker_config.rgbd_depth_camera_id = depth_frame
-                .and_then(|frame| self.camera_index(&frame))
-                .map_or(0, |index| index as i32);
+            // align_depth hands every frame over in cameras[0]'s frame. The -1 default means
+            // no camera, and depth belonging to nothing is silently ignored.
+            tracker_config.rgbd_depth_camera_id = 0;
         }
 
         // Each libcuvslam build carries one backend, GPU or CPU, so a construction failure
@@ -726,10 +722,10 @@ impl VoCore {
         };
 
         let vslam = self.vslam.as_mut().expect("checked above");
-        let consumed = self
-            .pending_imu
-            .partition_point(|measurement| measurement.timestamp_ns <= newest);
-        for measurement in self.pending_imu.drain(..consumed) {
+        // Popping the front rather than partitioning: one late sample would make the deque
+        // unsorted, and partition_point would then silently drop the whole backlog.
+        while self.pending_imu.front().is_some_and(|m| m.timestamp_ns <= newest) {
+            let measurement = self.pending_imu.pop_front().expect("checked above");
             if let Err(message) = vslam.register_imu(&measurement) {
                 warn_throttled!(Duration::from_secs(10), error = %message, "cuvslam rejected an IMU sample");
             }

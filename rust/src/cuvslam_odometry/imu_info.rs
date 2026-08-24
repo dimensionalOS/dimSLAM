@@ -9,7 +9,6 @@ use std::io::Write;
 
 use lcm_msgs::std_msgs::Header;
 
-/// The IMU's noise model, published by the driver the way camera_info is.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImuInfo {
     pub header: Header,

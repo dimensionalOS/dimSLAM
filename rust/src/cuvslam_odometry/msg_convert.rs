@@ -1,8 +1,5 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
-//
-// Converters between dimos-lcm messages, cuVSLAM shim types and nalgebra:
-// stamps, poses, distortion models.
 
 use dimos_module::nalgebra::{Isometry3, Translation3, UnitQuaternion};
 use dimos_module::Transform;
