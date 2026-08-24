@@ -154,6 +154,7 @@ pub struct VoCore {
     /// but the dispatcher lets images overtake the IMU.
     pending_imu: VecDeque<ffi::CuvImuMeasurement>,
     vslam: Option<Tracker>,
+    tracker_unbuildable: bool,
 
     depth: Option<Image>,
     depth_info: Option<CameraInfo>,
@@ -194,6 +195,7 @@ impl VoCore {
             imu_model: None,
             pending_imu: VecDeque::new(),
             vslam: None,
+            tracker_unbuildable: false,
             depth: None,
             depth_info: None,
             aligned_depth: Image::default(),
@@ -357,6 +359,20 @@ impl VoCore {
         img: Image,
         tf: &Tf,
     ) -> (Option<PointCloud2>, Option<Odometry>) {
+        // Everything downstream walks the buffer by the header's step and height, so a
+        // driver that undersizes it would index out of bounds and take the process down.
+        let expected_bytes = img.step as usize * img.height as usize;
+        if img.step < img.width * 2 || img.data.len() < expected_bytes {
+            warn_throttled!(
+                Duration::from_secs(10),
+                width = img.width,
+                height = img.height,
+                step = img.step,
+                bytes = img.data.len(),
+                "cuvslam dropping a depth image smaller than its header claims",
+            );
+            return (None, None);
+        }
         let cloud = self.depth_cloud_msg(&img);
         self.depth = Some(img);
         (cloud, self.try_track(tf))
@@ -438,7 +454,7 @@ impl VoCore {
     }
 
     fn ensure_tracker(&mut self, tf: &Tf) {
-        if self.vslam.is_some() {
+        if self.vslam.is_some() || self.tracker_unbuildable {
             return;
         }
         let Some(base_from_rig) = tf.get_latest(&self.config.base_frame, self.rig_frame()) else {
@@ -539,13 +555,18 @@ impl VoCore {
                         vslam
                     }
                     Err(fallback_message) => {
+                        // Nothing about the rig changes later, so a retry would only
+                        // repeat this. Give up on vision and leave the rest of the
+                        // process, fusion filter included, running.
+                        self.tracker_unbuildable = true;
                         error!(
                             configured_use_gpu = tracker_config.use_gpu,
                             configured_error = %message,
                             fallback_error = %fallback_message,
-                            "cuvslam tracker construction failed on both backends"
+                            "cuvslam tracker construction failed on both backends; \
+                             this module will not publish odometry"
                         );
-                        std::process::exit(1);
+                        return;
                     }
                 }
             }
