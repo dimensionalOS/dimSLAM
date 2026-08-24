@@ -1,14 +1,8 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// dimSLAM: cuVSLAM visual odometry feeding an error-state Kalman fusion filter
-// in-process. The tracker's pose stream never touches the wire; it enters the
-// filter as a drifting source under visual_odom_frame, alongside any external
-// sources on the `sources` input.
-//
-// in:  image, camera_info, depth_image, depth_camera_info, imu, imu_info, sources
-// out: odometry (fused, odom_frame -> base_frame), depth_cloud
-// tf:  odom_frame -> base_frame
+// cuVSLAM visual odometry enters the fusion filter in-process as a drifting source, so its
+// pose never touches the wire.
 
 mod cuvslam_odometry;
 mod odometry_fusion;
@@ -24,7 +18,6 @@ use odometry_fusion::{FusionCore, OdometryFusionConfig};
 
 #[native_config]
 struct DimSlamConfig {
-    // --- cuVSLAM (see CuvslamOdometryConfig for the full field docs) ---
     camera_mode: String,
     camera_frames: Vec<String>,
     rectified: bool,
@@ -48,7 +41,6 @@ struct DimSlamConfig {
     depth2depth_color_frame: String,
     depth2depth_max_color_skew_seconds: f64,
 
-    // --- fusion (see OdometryFusionConfig for the full field docs) ---
     odom_frame: String,
     base_frame: String,
     publish_tf: bool,
@@ -56,10 +48,10 @@ struct DimSlamConfig {
     replay_buffer_seconds: f64,
     mahalanobis_gate: f64,
     use_imu: bool,
-    imu_gyro_noise_density: Option<f64>,
-    imu_gyro_random_walk: Option<f64>,
-    imu_accel_noise_density: Option<f64>,
-    imu_accel_random_walk: Option<f64>,
+    imu_gyro_noise_density: f64,
+    imu_gyro_random_walk: f64,
+    imu_accel_noise_density: f64,
+    imu_accel_random_walk: f64,
     gravity: f64,
     imu_init_samples: i64,
     initial_position_std: f64,
@@ -207,7 +199,6 @@ impl DimSlam {
         self.publish().await;
     }
 
-    /// The tracker's pose enters the filter like any other source, without a wire hop.
     async fn fuse(&mut self, tracked: Option<Odometry>) {
         let Some(visual_odometry) = tracked else { return };
         self.fusion.as_mut().expect("setup ran").handle_source(&visual_odometry);

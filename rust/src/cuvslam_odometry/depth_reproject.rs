@@ -6,10 +6,7 @@
 use dimos_module::nalgebra::Isometry3;
 use lcm_msgs::sensor_msgs::{CameraInfo, Image};
 
-/// Depth recorded against one camera, reprojected onto another: deproject through the depth
-/// intrinsics, move through camera_from_depth, project through the target intrinsics. Where
-/// several depth pixels land on one target pixel the nearest surface wins, matching what the
-/// target camera would have seen. Unhit pixels stay 0, which cuVSLAM reads as no depth.
+/// Nearest surface wins on collision; unhit pixels stay 0, which cuVSLAM reads as no depth.
 pub fn reproject_depth(
     depth: &Image,
     depth_info: &CameraInfo,

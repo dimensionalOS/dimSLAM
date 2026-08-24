@@ -1,12 +1,8 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 //
-// NVIDIA cuVSLAM visual odometry. cuVSLAM itself stays C++, behind the cu_vslam_rs
-// crate: an extern-C shim over the three calls used (construct, Track,
-// RegisterImuMeasurement) plus a safe Tracker wrapper.
-//
-// Nothing is emitted while tracking is lost. cuVSLAM keeps one world frame for the
-// life of the tracker, so it resumes in the same frame. The rig comes from the tf tree.
+// cuVSLAM keeps one world frame for the tracker's life, so tracking loss resumes in the
+// same frame; nothing is emitted while lost.
 
 mod depth_cloud;
 mod depth_reproject;
@@ -45,9 +41,8 @@ enum Mode {
     Rgbd,
 }
 
-/// SE(3) adjoint on (xyz, rpy) coordinates: how a small motion expressed in the child
-/// frame reads in the parent frame. First order in the rotation block, where fixed-axis
-/// rpy rates and rotation-vector components coincide.
+/// First order in the rotation block, where fixed-axis rpy rates and rotation-vector
+/// components coincide.
 fn se3_adjoint(parent_from_child: &Isometry3<f64>) -> Matrix6<f64> {
     let rotation = parent_from_child.rotation.to_rotation_matrix().into_inner();
     let translation = parent_from_child.translation.vector;
@@ -110,30 +105,20 @@ pub struct CuvslamOdometryConfig {
     /// One tf frame per camera, in cuVSLAM's index order. Empty discovers them off
     /// camera_info.
     pub camera_frames: Vec<String>,
-    /// Images arrive rectified: no distortion, rows aligned.
     pub rectified: bool,
-    /// Off runs the tracker on the CPU. Needs a libcuvslam built with ENFORCE_GPU=OFF
-    /// (the jeff-hykin/cuVSLAM fork build); NVIDIA's stock SDK binaries are GPU-only.
+    /// Needs a libcuvslam built with ENFORCE_GPU=OFF; stock SDK binaries are GPU-only.
     pub use_gpu: bool,
     /// Frame stamped on the emitted odometry; the tracker's world, drifting freely.
     pub odom_frame: String,
     pub base_frame: String,
-    /// Frame the cuVSLAM rig is expressed in. Empty means base_frame. Setting it to a camera's
-    /// optical frame reproduces NVIDIA's examples, whose rig IS the left camera; the emitted
-    /// odometry stays on base_frame either way, since the two differ by a fixed transform.
+    /// Empty means base_frame. Set it to a camera's optical frame to match NVIDIA's
+    /// examples, whose rig IS the left camera.
     pub rig_frame: String,
-    /// Rebase guard. A frame whose translation standard deviation (root of the largest
-    /// translation term of cuVSLAM's covariance) exceeds this is unconstrained: its motion
-    /// is dropped, the pose holds, and later frames are rebased onto the held pose so the
-    /// published path never carries the teleport. Meters; 0 disables the guard and the raw
-    /// integrator is published untouched.
+    /// Meters; over this the frame's motion is dropped and later frames rebase onto the
+    /// held pose. 0 disables.
     pub covariance_gate_translation_std: f64,
-    /// Rebase guard on physically implausible frame-to-frame motion, sharing the
-    /// covariance gate's hold-and-rebase machinery but trusting kinematics instead of the
-    /// tracker's self-report: a teleport with confident covariance still cannot claim the
-    /// rig moved faster than the platform can. Linear is metres/second, angular is
-    /// radians/second, both measured on the raw pose against the previous tracked frame;
-    /// 0 disables that limit.
+    /// A confident-covariance teleport still cannot exceed platform kinematics. Linear
+    /// m/s, angular rad/s, against the previous raw pose; 0 disables.
     pub speed_gate_max_linear: f64,
     pub speed_gate_max_angular: f64,
     /// cuVSLAM's Inertial mode is stereo plus one IMU. The noise model and frame come
@@ -141,14 +126,10 @@ pub struct CuvslamOdometryConfig {
     pub enable_imu: bool,
     /// rgbd only: raw depth units per metre. 1000 for sixteen-bit millimetres.
     pub depth_units_per_meter: f64,
-    /// Range gate on the published depth_cloud, metres. Stereo depth error grows as range
-    /// squared, so the far gate is what decides whether the cloud is worth mapping with;
-    /// 0 leaves it open.
+    /// Range gate on the published depth_cloud, metres; 0 leaves it open.
     pub depth_cloud_min_range: f64,
     pub depth_cloud_max_range: f64,
-    /// Emit one median point per k x k depth block instead of every pixel; <= 1 is off.
-    /// The median (not mean) suppresses flying pixels at depth discontinuities, and a
-    /// block with under half its pixels valid is dropped as edge noise.
+    /// One median point per k x k depth block; <= 1 is off.
     pub depth_cloud_decimation: i64,
     /// rgbd only: densify the depth image with the depth2depth crate before the cloud
     /// is cut from it — Depth Anything V2 predicts dense depth from the color image,
@@ -180,22 +161,18 @@ struct RigCamera {
 }
 
 enum DepthChoice {
-    /// Depth already recorded against the rig camera.
     Passthrough,
-    /// Reprojected into `aligned_depth`.
     Aligned,
 }
 
-/// The tracker pipeline, free of any transport; the module in main.rs drives it.
 pub struct VoCore {
     config: CuvslamOdometryConfig,
     /// The rig, in cuVSLAM's camera order.
     cameras: Vec<RigCamera>,
     camera_info_by_frame: HashMap<String, CameraInfo>,
     imu_model: Option<ImuInfo>,
-    /// Buffered. cuVSLAM requires Track() and RegisterImuMeasurement() in
-    /// non-decreasing timestamp order; the round-robin dispatcher lets images
-    /// overtake a 400 Hz IMU.
+    /// cuVSLAM needs Track() and RegisterImuMeasurement() in non-decreasing stamp order,
+    /// but the dispatcher lets images overtake the IMU.
     pending_imu: VecDeque<ffi::CuvImuMeasurement>,
     vslam: Option<Tracker>,
 
@@ -212,7 +189,6 @@ pub struct VoCore {
     camera_from_depth: Option<Isometry3<f64>>,
     last_ts_ns: Option<i64>,
 
-    // tracking state; identity transforms are set in ensure_tracker before first use
     /// last published pose, on base_frame
     world_from_base: Option<Isometry3<f64>>,
     base_from_rig: Option<Isometry3<f64>>,
@@ -291,7 +267,6 @@ impl VoCore {
         }
     }
 
-    /// The frame cuVSLAM's rig is expressed in, which need not be the published frame.
     fn rig_frame(&self) -> &str {
         if self.config.rig_frame.is_empty() {
             &self.config.base_frame
@@ -308,10 +283,7 @@ impl VoCore {
         self.resolve_rig(tf);
     }
 
-    /// Place every camera against the rig frame, or nothing until they all resolve.
-    ///
-    /// The C++ module retried this on every tf message; here tf intake belongs to the
-    /// SDK, so the retry rides on camera_info and image arrivals instead.
+    /// All-or-nothing: no camera is placed until every camera resolves.
     fn resolve_rig(&mut self, tf: &Tf) {
         if !self.cameras.is_empty() {
             return;
@@ -361,7 +333,6 @@ impl VoCore {
         self.cameras = cameras;
     }
 
-    /// Which camera in the rig a frame_id names.
     fn camera_index(&self, frame_id: &str) -> Option<usize> {
         self.cameras.iter().position(|camera| camera.frame == frame_id)
     }
@@ -394,9 +365,6 @@ impl VoCore {
                 msg.angular_velocity.z as f32,
             ],
         });
-        // try_track returns early on a skewed or unplaceable frame set, so nothing
-        // drains the buffer while tracking is stalled. Once the stall outlasts the
-        // window, the oldest samples are past any frame that will still be tracked.
         while self.pending_imu.len() > MAX_PENDING_IMU {
             self.pending_imu.pop_front();
         }
@@ -450,10 +418,8 @@ impl VoCore {
         (cloud, self.try_track(tf))
     }
 
-    /// The depth sensor's own points, gated by range, in the sensor's frame. A driver's
-    /// cloud carries every far, noisy pixel, and the tracker already holds the intrinsics and
-    /// the depth scale a clean one needs. With a depth fuser configured the cloud is cut
-    /// from the densified image instead, using the color image recorded on the same frame.
+    /// A driver's own cloud carries every far, noisy pixel; this one is range-gated, and
+    /// cut from the densified image when a fuser is configured.
     fn depth_cloud_msg(&mut self, depth: &Image) -> Option<PointCloud2> {
         let depth_ns = stamp_to_ns(&depth.header);
         let limit_seconds = self.config.depth2depth_max_color_skew_seconds;
@@ -535,10 +501,7 @@ impl VoCore {
         }
     }
 
-    /// Depth pixel-aligned with the rig camera, as cuVSLAM's RGBD contract requires.
-    /// Passthrough when it was recorded against that camera; reprojected through the depth
-    /// intrinsics and the tf between the two sensors when it was not. None while the pieces
-    /// to reproject are still missing.
+    /// cuVSLAM's RGBD contract needs depth pixel-aligned with the rig camera.
     fn align_depth(&mut self, tf: &Tf) -> Option<DepthChoice> {
         let depth = self.depth.as_ref().expect("checked by try_track");
         let camera = &self.cameras[0];
@@ -586,8 +549,6 @@ impl VoCore {
         Some(DepthChoice::Aligned)
     }
 
-    /// Builds the tracker against rig_frame(). Poses are converted back onto base_frame on
-    /// publish, so rig_frame is an internal choice with no effect on the output contract.
     fn ensure_tracker(&mut self, tf: &Tf) {
         if self.vslam.is_some() {
             return;
@@ -767,7 +728,6 @@ impl VoCore {
             None
         };
 
-        // Hand cuVSLAM every sample that precedes the frame about to be tracked.
         let vslam = self.vslam.as_mut().expect("checked above");
         let consumed = self
             .pending_imu
@@ -823,8 +783,7 @@ impl VoCore {
         let estimate = match result {
             Ok(estimate) => estimate,
             Err(message) => {
-                // Track() throwing aborted the C++ module; the shim catches it instead
-                // and the frame is skipped.
+                // The shim catches Track()'s C++ exception; the frame is skipped.
                 error!(error = %message, "cuvslam Track failed");
                 return None;
             }
@@ -861,9 +820,7 @@ impl VoCore {
             .iter()
             .fold(f64::NEG_INFINITY, |a, b| a.max(*b))
             .sqrt();
-        // NaN covariance is the tracker's own way of saying unconstrained; a NaN never
-        // exceeds a threshold, so it has to be gated explicitly. (f64::max skips NaN,
-        // hence the separate finiteness check.)
+        // f64::max skips NaN, so unconstrained frames need the explicit finiteness check.
         let translation_finite = translation_variances.iter().all(|variance| variance.is_finite());
         let mut gate_frame = false;
         if self.config.covariance_gate_translation_std > 0.0
@@ -909,9 +866,8 @@ impl VoCore {
         let rebase = self.rebase.unwrap_or_else(Isometry3::identity);
         let world_from_base = self.world_from_base.unwrap_or_else(Isometry3::identity);
         if gate_frame {
-            // Implausible frame (blank wall, repeated texture, teleport): drop its motion
-            // and keep rebasing onto the held pose, so recovery continues from here with
-            // only the delta measured after tracking became sane again.
+            // Blank wall, repeated texture, teleport: hold the pose and rebase so recovery
+            // keeps only post-recovery deltas.
             self.rebase = Some(world_from_base * raw_pose.inverse());
         } else {
             self.world_from_base = Some(rebase * raw_pose);
