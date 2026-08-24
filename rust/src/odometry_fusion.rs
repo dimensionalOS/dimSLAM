@@ -114,9 +114,6 @@ impl Default for OdometryFusionConfig {
 #[derive(Clone, Debug)]
 struct Measurement {
     source: usize,
-    absolute: bool,
-    pose: Option<Isometry3<f64>>,
-    /// Consecutive-message delta when the source drifts.
     delta: Option<Isometry3<f64>>,
     pose_variance: [f64; 6], // 0 means dropped
     twist_variance: [f64; 6],
@@ -299,7 +296,6 @@ impl FusionCore {
             return;
         };
 
-        let absolute = msg.frame_id == self.config.odom_frame;
         let mut pose_variance = [0.0; 6];
         let mut twist_variance = [0.0; 6];
         for dim in 0..6 {
@@ -317,8 +313,6 @@ impl FusionCore {
 
         let mut measurement = Measurement {
             source,
-            absolute,
-            pose: None,
             delta: None,
             pose_variance,
             twist_variance,
@@ -330,15 +324,10 @@ impl FusionCore {
         let pose_finite = msg.pose.translation.vector.iter().all(|v| v.is_finite())
             && msg.pose.rotation.coords.iter().all(|v| v.is_finite());
         if pose_wanted && pose_finite {
-            let pose = msg.pose;
-            if absolute {
-                measurement.pose = Some(pose);
-            } else {
-                if let Some(previous) = self.previous_source_pose.get(&source) {
-                    measurement.delta = Some(previous.inverse() * pose);
-                }
-                self.previous_source_pose.insert(source, pose);
+            if let Some(previous) = self.previous_source_pose.get(&source) {
+                measurement.delta = Some(previous.inverse() * msg.pose);
             }
+            self.previous_source_pose.insert(source, msg.pose);
         }
 
         self.insert(Event {
@@ -492,9 +481,7 @@ impl FusionCore {
         let mut residuals: Vec<f64> = Vec::new();
         let mut variances: Vec<f64> = Vec::new();
 
-        let target = if measurement.absolute {
-            measurement.pose
-        } else if let Some(delta) = measurement.delta {
+        let target = if let Some(delta) = measurement.delta {
             match self.anchors[measurement.source] {
                 Some(anchor) => Some(anchor * delta),
                 None => {
@@ -538,7 +525,7 @@ impl FusionCore {
             &mut variances,
         );
         let accepted = self.update(&rows, &residuals, &variances);
-        if accepted && !measurement.absolute && target.is_some() {
+        if accepted && target.is_some() {
             // Anchoring to the corrected pose, not each source's own chain, keeps drifters bounded.
             self.anchor(measurement.source);
         }
@@ -574,14 +561,7 @@ impl FusionCore {
             };
         }
 
-        let increment = if measurement.absolute {
-            let Some(pose) = measurement.pose else { return };
-            Isometry3::from_parts(Translation3::from(self.filter.x.position), self.filter.x.q).inverse()
-                * pose
-        } else {
-            let Some(delta) = measurement.delta else { return };
-            delta
-        };
+        let Some(increment) = measurement.delta else { return };
 
         let horizon = ts_ns - (SOURCE_ACTIVITY_TIMEOUT_SECONDS * 1.0e9) as i64;
         let mut share = [0.0; 6];
@@ -901,10 +881,14 @@ mod tests {
         for sample in 0..5 {
             core.handle_imu(&imu_message(sample * NS_PER_SEC / 100, 0.0, 0.0), &identity_mount());
         }
-        core.handle_source(&source_message("odom", NS_PER_SEC / 10, 1000.0));
+        // Two to anchor: the first delta needs a predecessor, the second adopts the filter pose.
+        core.handle_source(&source_message("odom", NS_PER_SEC / 20, 0.0));
+        core.handle_source(&source_message("odom", NS_PER_SEC / 10, 0.0));
+        core.handle_source(&source_message("odom", 3 * NS_PER_SEC / 20, 1000.0));
         let after_outlier = published_position(&mut core).expect("a period has elapsed");
         assert!(after_outlier.x.abs() < 1e-9);
-        core.handle_source(&source_message("odom", NS_PER_SEC / 5, 0.01));
+        // From the outlier's own pose, so this delta is the small one.
+        core.handle_source(&source_message("odom", NS_PER_SEC / 5, 1000.01));
         let after_inlier = published_position(&mut core).expect("a period has elapsed");
         assert!(after_inlier.x > 0.005);
     }
@@ -929,7 +913,11 @@ mod tests {
     fn the_same_imu_and_source_sequence_replays_bit_identically() {
         let mount = identity_mount();
         let run = || {
-            let mut core = FusionCore::new(base_config(true));
+            let mut config = base_config(true);
+            // Position only: the source reports no rotation, so it must not argue against the yaw.
+            config.sources.get_mut("odom").expect("named by base_config").pose_variances =
+                [1e-4, 1e-4, 1e-4, 0.0, 0.0, 0.0];
+            let mut core = FusionCore::new(config);
             let mut published = Vec::new();
             for step in 0..60_i64 {
                 let ts_ns = step * NS_PER_SEC / 100;
