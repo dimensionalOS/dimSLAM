@@ -103,7 +103,7 @@ struct Measurement {
     pose: Option<Isometry3<f64>>,
     /// Consecutive-message delta when the source drifts.
     delta: Option<Isometry3<f64>>,
-    pose_variance: [f64; 6], // resolved; <=0 means dropped
+    pose_variance: [f64; 6], // 0 means dropped
     twist_variance: [f64; 6],
     linear: Vector3<f64>,
     angular: Vector3<f64>,
@@ -205,8 +205,6 @@ impl FusionCore {
         let base_from_imu = base_from_imu.rotation();
         let gyro = base_from_imu * vector3(&imu.angular_velocity);
         let mut accel = base_from_imu * vector3(&imu.linear_acceleration);
-        // A non-zero lever arm adds centripetal and tangential acceleration that is mount
-        // kinematics, not base motion.
         let ts_ns = stamp_to_ns(&imu.header);
         if self.lever_gyro_ns != 0 {
             let dt = (ts_ns - self.lever_gyro_ns) as f64 / NS_PER_SEC as f64;
@@ -218,6 +216,8 @@ impl FusionCore {
         }
         self.lever_gyro = gyro;
         self.lever_gyro_ns = ts_ns;
+        // A non-zero lever arm adds centripetal and tangential acceleration that is mount
+        // kinematics, not base motion.
         accel -= gyro.cross(&gyro.cross(&lever)) + self.lever_alpha.cross(&lever);
         if !self.initialized {
             self.check_config();
