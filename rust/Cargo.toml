@@ -11,7 +11,7 @@ repository = "https://github.com/dimensionalOS/dimSLAM"
 
 
 [dependencies]
-cu_vslam_rs = "0.1.1"
+cu_vslam_rs = "0.1.2"
 nalgebra = "0.35"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }

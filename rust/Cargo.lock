@@ -43,9 +43,9 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cu_vslam_rs"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6c2d4e30f876f55f242c8dee0f221a8e3290a57da26907da73fa3514b116ece"
+checksum = "4dc114705c95783caf6a638391345ccb9fe20af553b2590f933a54e7a3c2ff88"
 dependencies = [
  "cc",
 ]
