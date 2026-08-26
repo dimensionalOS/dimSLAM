@@ -7,7 +7,7 @@ mod depth_cloud;
 mod depth_reproject;
 mod msg_convert;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
 use nalgebra::{Isometry3, Matrix3, Matrix6};
@@ -89,14 +89,45 @@ fn image_encoding(encoding: &str) -> u8 {
     }
 }
 
+/// Per-camera settings, keyed by the frame_id its images carry. A depth stream is a camera of its
+/// own here: it is looked up under the depth image's frame_id, which need not be a rig camera.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CameraConfig {
+    /// cuVSLAM takes one rectified flag for the whole rig, so the rig cameras must agree.
+    pub rectified: bool,
+    /// Raw depth units per metre. 1000 for sixteen-bit millimetres. Depth streams only.
+    pub depth_units_per_meter: f64,
+    /// Range gate on the returned depth cloud, metres; 0 leaves it open.
+    pub depth_cloud_min_range: f64,
+    pub depth_cloud_max_range: f64,
+    /// One median point per k x k depth block; <= 1 is off.
+    pub depth_cloud_decimation: i64,
+}
+
+/// A zeroed default would divide depth by nothing.
+impl Default for CameraConfig {
+    fn default() -> Self {
+        Self {
+            rectified: true,
+            depth_units_per_meter: 1000.0,
+            depth_cloud_min_range: 0.0,
+            depth_cloud_max_range: 0.0,
+            depth_cloud_decimation: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CuvslamOdometryConfig {
     /// "stereo", "mono" or "rgbd". Mono is accurate only up to scale.
     pub camera_mode: String,
     /// One tf frame per camera in cuVSLAM's index order; empty discovers them off camera_info.
+    /// Separate from `cameras` because a JSON object's key order does not survive deserialization.
     pub camera_frames: Vec<String>,
-    pub rectified: bool,
+    /// Keyed by image frame_id; an absent camera falls back to `CameraConfig::default`.
+    pub cameras: BTreeMap<String, CameraConfig>,
     /// Needs a libcuvslam built with ENFORCE_GPU=OFF; stock SDK binaries are GPU-only.
     pub use_gpu: bool,
     /// Frame stamped on the emitted odometry; the tracker's world, drifting freely.
@@ -111,22 +142,15 @@ pub struct CuvslamOdometryConfig {
     pub speed_gate_max_angular: f64,
     /// cuVSLAM's Inertial mode: stereo plus one IMU, whose noise model `handle_imu_info` supplies.
     pub enable_imu: bool,
-    /// Raw depth units per metre. 1000 for sixteen-bit millimetres.
-    pub depth_units_per_meter: f64,
-    /// Range gate on the returned depth cloud, metres; 0 leaves it open.
-    pub depth_cloud_min_range: f64,
-    pub depth_cloud_max_range: f64,
-    /// One median point per k x k depth block; <= 1 is off.
-    pub depth_cloud_decimation: i64,
 }
 
-/// A zeroed default would divide depth by nothing and silently pick mono.
+/// A zeroed default would silently pick mono.
 impl Default for CuvslamOdometryConfig {
     fn default() -> Self {
         Self {
             camera_mode: "stereo".to_string(),
             camera_frames: Vec::new(),
-            rectified: true,
+            cameras: BTreeMap::new(),
             use_gpu: true,
             odom_frame: "odom".to_string(),
             base_frame: "base_link".to_string(),
@@ -135,10 +159,6 @@ impl Default for CuvslamOdometryConfig {
             speed_gate_max_linear: 0.0,
             speed_gate_max_angular: 0.0,
             enable_imu: false,
-            depth_units_per_meter: 1000.0,
-            depth_cloud_min_range: 0.0,
-            depth_cloud_max_range: 0.0,
-            depth_cloud_decimation: 0,
         }
     }
 }
@@ -310,6 +330,37 @@ impl CuvslamCore {
         self.cameras.iter().position(|camera| camera.frame == frame_id)
     }
 
+    fn camera_config(&self, frame_id: &str) -> CameraConfig {
+        match self.config.cameras.get(frame_id) {
+            Some(camera_config) => *camera_config,
+            None => {
+                warn_throttled!(
+                    Duration::from_secs(30),
+                    frame_id = %frame_id,
+                    "cuvslam has no per-camera config for this frame_id, using defaults",
+                );
+                CameraConfig::default()
+            }
+        }
+    }
+
+    /// cuVSLAM takes one rectified flag for the whole rig; disagreement is a config mistake.
+    fn rig_rectified(&self) -> bool {
+        let rectified = self
+            .cameras
+            .first()
+            .map(|camera| self.camera_config(&camera.frame).rectified)
+            .unwrap_or(true);
+        if self.cameras.iter().any(|camera| self.camera_config(&camera.frame).rectified != rectified) {
+            error_throttled!(
+                Duration::from_secs(10),
+                using = rectified,
+                "cuvslam rig cameras disagree on `rectified`; it applies to the whole rig",
+            );
+        }
+        rectified
+    }
+
     pub fn handle_imu_info(&mut self, info: ImuNoiseModel, tf: &dyn TfLookup) {
         if self.vslam.is_some() {
             return; // rig is fixed once the tracker exists
@@ -392,14 +443,15 @@ impl CuvslamCore {
                 .find(|camera| camera.frame == depth.frame_id)
                 .map(|camera| &camera.info)
         })?;
+        let camera_config = self.camera_config(&depth.frame_id);
         let mut cloud = PointCloud::default();
         depth_cloud(
             depth,
             info,
-            self.config.depth_units_per_meter,
-            self.config.depth_cloud_min_range,
-            self.config.depth_cloud_max_range,
-            self.config.depth_cloud_decimation.max(0) as u32,
+            camera_config.depth_units_per_meter,
+            camera_config.depth_cloud_min_range,
+            camera_config.depth_cloud_max_range,
+            camera_config.depth_cloud_decimation.max(0) as u32,
             &mut cloud,
         );
         Some(cloud)
@@ -445,13 +497,14 @@ impl CuvslamCore {
                 "cuvslam reprojecting depth onto the rig camera"
             );
         }
+        let depth_units_per_meter = self.camera_config(&depth.frame_id).depth_units_per_meter;
         let mut aligned = std::mem::take(&mut self.aligned_depth);
         reproject_depth(
             depth,
             depth_info,
             &camera.info,
             self.camera_from_depth.as_ref().expect("set above"),
-            self.config.depth_units_per_meter,
+            depth_units_per_meter,
             &mut aligned,
         );
         self.aligned_depth = aligned;
@@ -527,12 +580,16 @@ impl CuvslamCore {
             odometry_mode: odometry_mode(mode, self.config.enable_imu),
             use_gpu: self.config.use_gpu,
             // cuVSLAM: "Rectified stereo camera mode only works with 1+ stereo cameras".
-            rectified_stereo_camera: self.config.rectified && mode == Mode::Stereo,
+            rectified_stereo_camera: self.rig_rectified() && mode == Mode::Stereo,
             rgbd_depth_scale_factor: 1.0,
             rgbd_depth_camera_id: -1,
         };
         if mode == Mode::Rgbd {
-            tracker_config.rgbd_depth_scale_factor = self.config.depth_units_per_meter as f32;
+            // try_track only reaches here with a depth image in hand, so its own frame_id picks the
+            // scale. cuVSLAM's RGBD mode takes one scale because it takes one depth camera.
+            let depth_frame = self.depth.as_ref().expect("checked by try_track").frame_id.clone();
+            tracker_config.rgbd_depth_scale_factor =
+                self.camera_config(&depth_frame).depth_units_per_meter as f32;
             // align_depth delivers in cameras[0]'s frame; the -1 default silently ignores depth.
             tracker_config.rgbd_depth_camera_id = 0;
         }
