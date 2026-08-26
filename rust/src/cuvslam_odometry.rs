@@ -331,17 +331,21 @@ impl CuvslamCore {
     }
 
     fn camera_config(&self, frame_id: &str) -> CameraConfig {
-        match self.config.cameras.get(frame_id) {
-            Some(camera_config) => *camera_config,
-            None => {
-                warn_throttled!(
-                    Duration::from_secs(30),
-                    frame_id = %frame_id,
-                    "cuvslam has no per-camera config for this frame_id, using defaults",
-                );
-                CameraConfig::default()
-            }
+        self.config.cameras.get(frame_id).copied().unwrap_or_default()
+    }
+
+    /// Worth a warning where the plain lookup is not: the default scale is right for the common
+    /// sixteen-bit-millimetre sensor and silently ruins every reading from anything else.
+    fn depth_config(&self, frame_id: &str) -> CameraConfig {
+        if !self.config.cameras.contains_key(frame_id) {
+            warn_throttled!(
+                Duration::from_secs(30),
+                frame_id = %frame_id,
+                depth_units_per_meter = CameraConfig::default().depth_units_per_meter,
+                "cuvslam has no config for this depth frame_id, using defaults",
+            );
         }
+        self.camera_config(frame_id)
     }
 
     /// cuVSLAM takes one rectified flag for the whole rig; disagreement is a config mistake.
@@ -443,7 +447,7 @@ impl CuvslamCore {
                 .find(|camera| camera.frame == depth.frame_id)
                 .map(|camera| &camera.info)
         })?;
-        let camera_config = self.camera_config(&depth.frame_id);
+        let camera_config = self.depth_config(&depth.frame_id);
         let mut cloud = PointCloud::default();
         depth_cloud(
             depth,
@@ -497,7 +501,7 @@ impl CuvslamCore {
                 "cuvslam reprojecting depth onto the rig camera"
             );
         }
-        let depth_units_per_meter = self.camera_config(&depth.frame_id).depth_units_per_meter;
+        let depth_units_per_meter = self.depth_config(&depth.frame_id).depth_units_per_meter;
         let mut aligned = std::mem::take(&mut self.aligned_depth);
         reproject_depth(
             depth,
@@ -589,7 +593,7 @@ impl CuvslamCore {
             // scale. cuVSLAM's RGBD mode takes one scale because it takes one depth camera.
             let depth_frame = self.depth.as_ref().expect("checked by try_track").frame_id.clone();
             tracker_config.rgbd_depth_scale_factor =
-                self.camera_config(&depth_frame).depth_units_per_meter as f32;
+                self.depth_config(&depth_frame).depth_units_per_meter as f32;
             // align_depth delivers in cameras[0]'s frame; the -1 default silently ignores depth.
             tracker_config.rgbd_depth_camera_id = 0;
         }
