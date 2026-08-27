@@ -65,16 +65,22 @@ struct RigCamera {
     sensor_msgs::CameraInfo info;
     sensor_msgs::Image image;
     bool have_image{false};
+    // multisensor only: this camera's depth image, already aligned to it.
+    sensor_msgs::Image depth;
+    bool have_depth{false};
+    std::vector<float> depth_meters;  // scratch for mixed-unit conversion
 };
 
 
 }  // namespace
 
 struct CuvslamConfig {
-    /// "stereo", "mono" or "rgbd". Mono is accurate only up to scale.
+    /// "stereo", "mono", "rgbd" or "multisensor". Mono is accurate only up to scale.
+    /// Multisensor (experimental in cuVSLAM) takes any mix of RGB and RGB-D cameras plus an
+    /// optional IMU; the depth_units_per_meter keys mark which cameras provide depth.
     std::string camera_mode;
     /// One tf frame per camera, in cuVSLAM's index order. Empty discovers them off
-    /// camera_info.
+    /// camera_info; multisensor cannot discover (any count is legal) so it requires this.
     std::vector<std::string> camera_frames;
     /// Images arrive rectified: no distortion, rows aligned.
     bool rectified;
@@ -117,14 +123,15 @@ struct CuvslamConfig {
     /// cuVSLAM's Inertial mode is stereo plus one IMU. The noise model arrives on the
     /// imu_info stream, the way camera intrinsics arrive on camera_info.
     bool enable_imu;
-    /// rgbd only: raw depth units per metre, keyed by the depth image's frame_id. 1000 for
-    /// sixteen-bit millimetres. Depth from a frame with no entry is a fatal config error.
+    /// rgbd and multisensor: raw depth units per metre, keyed by the depth image's frame_id.
+    /// 1000 for sixteen-bit millimetres. Depth from a frame with no entry is a fatal config
+    /// error. In multisensor mode the keys also select which rig cameras provide depth.
     std::unordered_map<std::string, double> depth_units_per_meter;
 };
 
 class CuvslamOdometry : public Module {
 public:
-    enum class Mode { Stereo, Mono, Rgbd };
+    enum class Mode { Stereo, Mono, Rgbd, Multisensor };
 
     void build(Builder& builder, Config& config) override {
         cfg_ = config.parse<CuvslamConfig>();
@@ -134,21 +141,30 @@ public:
             mode_ = Mode::Rgbd;
         } else if (cfg_.camera_mode == "mono") {
             mode_ = Mode::Mono;
+        } else if (cfg_.camera_mode == "multisensor") {
+            mode_ = Mode::Multisensor;
         } else {
-            throw std::runtime_error("config: camera_mode must be 'stereo', 'mono' or 'rgbd', "
-                                     "got '" + cfg_.camera_mode + "'");
-        }
-        if (cfg_.enable_imu && mode_ != Mode::Stereo) {
             throw std::runtime_error(
-                "config: enable_imu requires camera_mode 'stereo'; cuVSLAM has no inertial "
-                "mono or rgbd mode");
+                "config: camera_mode must be 'stereo', 'mono', 'rgbd' or 'multisensor', "
+                "got '" + cfg_.camera_mode + "'");
+        }
+        if (cfg_.enable_imu && mode_ != Mode::Stereo && mode_ != Mode::Multisensor) {
+            throw std::runtime_error(
+                "config: enable_imu requires camera_mode 'stereo' or 'multisensor'; cuVSLAM "
+                "has no inertial mono or rgbd mode");
+        }
+        if (mode_ == Mode::Multisensor && cfg_.camera_frames.empty()) {
+            // Discovery expects a fixed camera count, and multisensor has none.
+            throw std::runtime_error(
+                "config: camera_mode 'multisensor' requires camera_frames to list the rig");
         }
 
         builder.input<tf2_msgs::TFMessage>("tf", &CuvslamOdometry::on_tf, this);
         builder.input<sensor_msgs::CameraInfo>("camera_info", &CuvslamOdometry::on_camera_info,
                                                this);
         builder.input<sensor_msgs::Image>("image", &CuvslamOdometry::on_image, this);
-        if (mode_ == Mode::Rgbd) {
+        if (mode_ == Mode::Rgbd ||
+            (mode_ == Mode::Multisensor && !cfg_.depth_units_per_meter.empty())) {
             builder.input<sensor_msgs::Image>("depth_image", &CuvslamOdometry::on_depth, this);
             builder.input<sensor_msgs::CameraInfo>("depth_camera_info",
                                                    &CuvslamOdometry::on_depth_camera_info, this);
@@ -359,8 +375,23 @@ private:
     }
 
     void on_depth(const sensor_msgs::Image& img) {
-        depth_ = img;
-        have_depth_ = true;
+        if (mode_ == Mode::Multisensor) {
+            const int index = camera_index(img.header.frame_id);
+            if (index < 0) {
+                if (!cameras_.empty()) {
+                    DIMOS_LOG_THROTTLED(logging::Level::Warn, logging::from_secs(10),
+                                        "cuvslam dropping depth with a frame_id not on the rig",
+                                        logging::Field("frame_id", img.header.frame_id));
+                }
+                return;
+            }
+            depth_units(img.header.frame_id);  // fatal on a frame the config does not know
+            cameras_[index].depth = img;
+            cameras_[index].have_depth = true;
+        } else {
+            depth_ = img;
+            have_depth_ = true;
+        }
         try_track();
     }
 
@@ -429,6 +460,30 @@ private:
         return &aligned_depth_;
     }
 
+    /// Rig indices of the cameras the config marks as depth-providing.
+    std::vector<std::int32_t> depth_camera_ids() const {
+        std::vector<std::int32_t> ids;
+        for (std::size_t i = 0; i < cameras_.size(); ++i) {
+            if (cfg_.depth_units_per_meter.count(cameras_[i].frame) > 0) {
+                ids.push_back(static_cast<std::int32_t>(i));
+            }
+        }
+        return ids;
+    }
+
+    /// The shared units value when every depth camera agrees, else nullopt (mixed rig).
+    std::optional<double> uniform_depth_units() const {
+        std::optional<double> units;
+        for (const std::int32_t id : depth_camera_ids()) {
+            const double camera_units = depth_units(cameras_[id].frame);
+            if (units && *units != camera_units) {
+                return std::nullopt;
+            }
+            units = camera_units;
+        }
+        return units;
+    }
+
     cuvslam::Odometry::OdometryMode odometry_mode() const {
         using OdometryMode = cuvslam::Odometry::OdometryMode;
         if (mode_ == Mode::Rgbd) {
@@ -436,6 +491,9 @@ private:
         }
         if (mode_ == Mode::Mono) {
             return OdometryMode::Mono;
+        }
+        if (mode_ == Mode::Multisensor) {
+            return OdometryMode::Multisensor;
         }
         // Inertial is the stereo pair plus an IMU; there is no inertial mono or rgbd.
         return cfg_.enable_imu ? OdometryMode::Inertial : OdometryMode::Multicamera;
@@ -515,8 +573,33 @@ private:
             odometry_cfg.rgbd_settings.depth_camera_id =
                 std::max(camera_index(depth_.header.frame_id), 0);
         }
+        if (mode_ == Mode::Multisensor) {
+            odometry_cfg.multisensor_settings.depth_camera_ids = depth_camera_ids();
+            // The SDK has one scale for every depth camera. A rig whose cameras agree uses
+            // it directly; a mixed rig gets each depth converted to float32 metres instead.
+            const std::optional<double> units = uniform_depth_units();
+            mixed_depth_units_ =
+                !units && !odometry_cfg.multisensor_settings.depth_camera_ids.empty();
+            odometry_cfg.multisensor_settings.depth_scale_factor =
+                units ? static_cast<float>(*units) : 1.0f;
+            for (const auto& [frame, frame_units] : cfg_.depth_units_per_meter) {
+                if (camera_index(frame) < 0) {
+                    logging::warn("cuvslam: depth_units_per_meter names a frame that is not "
+                                  "on the rig; it will provide no depth",
+                                  {logging::Field("frame_id", frame)});
+                }
+            }
+        }
 
-        tracker_.emplace(rig, odometry_cfg);
+        // Multisensor construction validates the rig (pinhole only, needs a depth camera or
+        // an overlapping pair) by throwing, and the dispatch loop would swallow that.
+        try {
+            tracker_.emplace(rig, odometry_cfg);
+        } catch (const std::exception& error) {
+            logging::error("cuvslam tracker construction failed",
+                           {logging::Field("error", error.what())});
+            std::exit(1);
+        }
         if (cfg_.enable_loop_closure) {
             cuvslam::Slam::Config slam_cfg = cuvslam::Slam::GetDefaultConfig();
             slam_cfg.sync_mode = !cfg_.slam_async;
@@ -565,8 +648,48 @@ private:
     void clear_frame_set() {
         for (RigCamera& camera : cameras_) {
             camera.have_image = false;
+            camera.have_depth = false;
         }
         have_depth_ = false;
+    }
+
+    /// A rig camera's depth as cuVSLAM wants it. When the rig's units disagree the SDK's
+    /// single depth_scale_factor cannot serve them all, so each image is converted to
+    /// float32 metres instead (scale factor 1).
+    cuvslam::Image multisensor_depth(std::size_t index, std::int64_t timestamp_ns) {
+        RigCamera& camera = cameras_[index];
+        const bool source_is_float = camera.depth.encoding == "32FC1";
+        cuvslam::Image out =
+            to_cuvslam_image(camera.depth, timestamp_ns, static_cast<std::uint32_t>(index));
+        out.encoding = cuvslam::ImageData::Encoding::MONO;
+        out.data_type = source_is_float ? cuvslam::ImageData::DataType::FLOAT32
+                                        : cuvslam::ImageData::DataType::UINT16;
+        if (!mixed_depth_units_) {
+            return out;
+        }
+        const double units = depth_units(camera.frame);
+        const std::size_t width = camera.depth.width;
+        const std::size_t height = camera.depth.height;
+        camera.depth_meters.resize(width * height);
+        const std::uint8_t* row = camera.depth.data.data();
+        for (std::size_t y = 0; y < height; ++y, row += camera.depth.step) {
+            float* destination = camera.depth_meters.data() + y * width;
+            if (source_is_float) {
+                const float* source = reinterpret_cast<const float*>(row);
+                for (std::size_t x = 0; x < width; ++x) {
+                    destination[x] = static_cast<float>(source[x] / units);
+                }
+            } else {
+                const std::uint16_t* source = reinterpret_cast<const std::uint16_t*>(row);
+                for (std::size_t x = 0; x < width; ++x) {
+                    destination[x] = static_cast<float>(source[x] / units);
+                }
+            }
+        }
+        out.pixels = reinterpret_cast<const std::uint8_t*>(camera.depth_meters.data());
+        out.pitch = static_cast<std::uint32_t>(width * sizeof(float));
+        out.data_type = cuvslam::ImageData::DataType::FLOAT32;
+        return out;
     }
 
     void try_track() {
@@ -576,6 +699,13 @@ private:
         for (const RigCamera& camera : cameras_) {
             if (!camera.have_image) {
                 return;
+            }
+        }
+        if (mode_ == Mode::Multisensor) {
+            for (const std::int32_t id : depth_camera_ids()) {
+                if (!cameras_[id].have_depth) {
+                    return;
+                }
             }
         }
         ensure_tracker();
@@ -619,6 +749,11 @@ private:
             depth.encoding = cuvslam::ImageData::Encoding::MONO;
             depth.data_type = cuvslam::ImageData::DataType::UINT16;
             depths.push_back(depth);
+        }
+        if (mode_ == Mode::Multisensor) {
+            for (const std::int32_t id : depth_camera_ids()) {
+                depths.push_back(multisensor_depth(static_cast<std::size_t>(id), newest));
+            }
         }
 
         register_imu_through(newest);
@@ -832,6 +967,7 @@ private:
     sensor_msgs::CameraInfo depth_info_{};
     bool have_depth_info_{false};
     sensor_msgs::Image aligned_depth_{};
+    bool mixed_depth_units_{false};
     std::optional<Transform> camera_from_depth_;
     std::uint64_t depth_reprojected_{0};
     std::optional<std::int64_t> last_ts_ns_;
