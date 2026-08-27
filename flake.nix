@@ -341,6 +341,13 @@
                name = "sdk-${name}";
                value = sdkPackageFor name sdk;
              }) forThisSystem
+          // pkgs.lib.optionalAttrs (forThisSystem ? x86_64-cuda12) {
+               # The CPU-fallback name for x86 with no NVIDIA driver, mirroring
+               # `aarch64`. Same derivation as x86_64-cuda12: that build is
+               # ENFORCE_GPU=OFF so it runs CPU-only, and a cuda12 binary works
+               # under whichever driver gets installed later.
+               x86_64 = moduleFor "x86_64-cuda12" forThisSystem.x86_64-cuda12;
+             }
           // { default = moduleFor defaultVariant forThisSystem.${defaultVariant}; };
 
         devShells.default = pkgs.mkShell {
