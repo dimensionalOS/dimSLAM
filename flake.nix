@@ -77,8 +77,8 @@
           # Apple silicon against CuMetal, targeting macOS 13 on apple-m1. It additionally
           # carries libcumetal.dylib and share/cumetal-cache.
           metal = {
-            url = "https://github.com/jeff-hykin/cuda-metal/releases/download/cuvslam-v17.0.0-metal.1/cuvslam-cpp-17.0.0-arm64-metal-macos.tar.gz";
-            hash = "sha256-rZI7hD05mGbCQWJThzlNjsmCMITNh/fekgTYBRltCRE=";
+            url = "https://github.com/jeff-hykin/cuda-metal/releases/download/cuvslam-v17.0.0-metal.2/cuvslam-cpp-17.0.0-arm64-metal-macos.tar.gz";
+            hash = "sha256-6cSH0HpAGZRuo2ArGfrD72FkCenrPNH1CUEo/fjaPGo=";
             system = "aarch64-darwin";
           };
         };
