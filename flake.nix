@@ -68,6 +68,11 @@
             system = "aarch64-linux";
             cuda = "cudaPackages_13_0";
           };
+          # Non-Jetson ARM. NVIDIA ships no generic-arm tarball, so this variant only
+          # exists as a fork build; everything but `system` comes from forkBuilds.
+          aarch64 = {
+            system = "aarch64-linux";
+          };
           # Ours, since NVIDIA ships no macOS build: the same v17.0.0 sources compiled for
           # Apple silicon against CuMetal, targeting macOS 13 on apple-m1. It additionally
           # carries libcumetal.dylib and share/cumetal-cache.
@@ -110,6 +115,16 @@
           thor = {
             cuda = "cudaPackages_13_0";
             archs = "110";
+            cudssPlatform = "linux-sbsa";
+            cudssCuda = "cuda13";
+            cudssSha256 = "02clxpqz0b60rfyrkz763yk0n15kk8bbn6wpqp1i0bkrjrbpxzn5";
+          };
+          # Non-Jetson ARM: usually no NVIDIA GPU at all, so this is the CPU fallback
+          # (ENFORCE_GPU=OFF). Hopper and Blackwell sbsa archs compiled in case one is
+          # present.
+          aarch64 = {
+            cuda = "cudaPackages_13_3";
+            archs = "90;120";
             cudssPlatform = "linux-sbsa";
             cudssCuda = "cuda13";
             cudssSha256 = "02clxpqz0b60rfyrkz763yk0n15kk8bbn6wpqp1i0bkrjrbpxzn5";
