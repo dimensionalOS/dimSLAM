@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -117,7 +118,7 @@ struct CuvslamConfig {
     /// imu_info stream, the way camera intrinsics arrive on camera_info.
     bool enable_imu;
     /// rgbd only: raw depth units per metre, keyed by the depth image's frame_id. 1000 for
-    /// sixteen-bit millimetres. Depth from a frame with no entry is dropped.
+    /// sixteen-bit millimetres. Depth from a frame with no entry is a fatal config error.
     std::unordered_map<std::string, double> depth_units_per_meter;
 };
 
@@ -127,9 +128,21 @@ public:
 
     void build(Builder& builder, Config& config) override {
         cfg_ = config.parse<CuvslamConfig>();
-        mode_ = cfg_.camera_mode == "stereo" ? Mode::Stereo
-                : cfg_.camera_mode == "rgbd"  ? Mode::Rgbd
-                                              : Mode::Mono;
+        if (cfg_.camera_mode == "stereo") {
+            mode_ = Mode::Stereo;
+        } else if (cfg_.camera_mode == "rgbd") {
+            mode_ = Mode::Rgbd;
+        } else if (cfg_.camera_mode == "mono") {
+            mode_ = Mode::Mono;
+        } else {
+            throw std::runtime_error("config: camera_mode must be 'stereo', 'mono' or 'rgbd', "
+                                     "got '" + cfg_.camera_mode + "'");
+        }
+        if (cfg_.enable_imu && mode_ != Mode::Stereo) {
+            throw std::runtime_error(
+                "config: enable_imu requires camera_mode 'stereo'; cuVSLAM has no inertial "
+                "mono or rgbd mode");
+        }
 
         builder.input<tf2_msgs::TFMessage>("tf", &CuvslamOdometry::on_tf, this);
         builder.input<sensor_msgs::CameraInfo>("camera_info", &CuvslamOdometry::on_camera_info,
@@ -360,15 +373,17 @@ private:
         }
     }
 
-    /// The configured units for a depth frame, or nothing for one the config does not know.
-    std::optional<double> depth_units(const std::string& frame_id) const {
+    /// The configured units for a depth frame. A frame the config does not know is fatal:
+    /// dropping its depth would look like a tracking bug instead of a config typo. Exit
+    /// rather than throw — the dispatch loop swallows handler exceptions, and a static
+    /// config can never heal.
+    double depth_units(const std::string& frame_id) const {
         const auto units = cfg_.depth_units_per_meter.find(frame_id);
         if (units == cfg_.depth_units_per_meter.end()) {
-            DIMOS_LOG_THROTTLED(logging::Level::Warn, logging::from_secs(10),
-                                "cuvslam dropping depth: depth_units_per_meter has no entry "
-                                "for its frame_id",
-                                logging::Field("frame_id", frame_id));
-            return std::nullopt;
+            logging::error("config: depth_units_per_meter has no entry for the depth image's "
+                           "frame_id",
+                           {logging::Field("frame_id", frame_id)});
+            std::exit(1);
         }
         return units->second;
     }
@@ -408,12 +423,8 @@ private:
                           {logging::Field("depth_frame", depth_.header.frame_id),
                            logging::Field("camera_frame", camera.frame)});
         }
-        const std::optional<double> units = depth_units(depth_.header.frame_id);
-        if (!units) {
-            return nullptr;
-        }
-        reproject_depth(depth_, depth_info_, camera.info, *camera_from_depth_, *units,
-                        aligned_depth_);
+        reproject_depth(depth_, depth_info_, camera.info, *camera_from_depth_,
+                        depth_units(depth_.header.frame_id), aligned_depth_);
         ++depth_reprojected_;
         return &aligned_depth_;
     }
@@ -497,11 +508,8 @@ private:
         // caller-side handler can catch it, and the process aborts.
         odometry_cfg.async_sba = false;
         if (mode_ == Mode::Rgbd) {
-            const std::optional<double> units = depth_units(depth_.header.frame_id);
-            if (!units) {
-                return;  // no tracker until depth arrives from a configured frame
-            }
-            odometry_cfg.rgbd_settings.depth_scale_factor = static_cast<float>(*units);
+            odometry_cfg.rgbd_settings.depth_scale_factor =
+                static_cast<float>(depth_units(depth_.header.frame_id));
             // The default of -1 means no camera, and depth belonging to nothing is silently
             // ignored. A depth stream usually reports its own frame, so unrecognised means 0.
             odometry_cfg.rgbd_settings.depth_camera_id =
