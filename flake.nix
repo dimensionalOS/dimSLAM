@@ -78,22 +78,41 @@
           };
         };
 
-        # Variants built from the fork instead of NVIDIA's prebuilt tarball. Thor and
-        # metal stay on tarballs until the fork build is proven on that hardware.
+        # Variants built from the fork instead of NVIDIA's prebuilt tarball. Only
+        # metal stays on a tarball: there is no CUDA toolchain to fork-build with on
+        # macOS. cudssCuda picks which cuDSS 0.8.0.10 archive cuNLS links against;
+        # it must match the nvcc major.
         # cuda12_8 on x86: sm_120 (Blackwell) needs nvcc >= 12.8.
         forkBuilds = {
           x86_64-cuda12 = {
             cuda = "cudaPackages_12_8";
             archs = "89;120";
             cudssPlatform = "linux-x86_64";
+            cudssCuda = "cuda12";
             cudssSha256 = "01s7xssfjadz1zfjprwp66j82h04snfpmjxg149m6a2bqq2nlw99";
+          };
+          x86_64-cuda13 = {
+            cuda = "cudaPackages_13_3";
+            archs = "89;120";
+            cudssPlatform = "linux-x86_64";
+            cudssCuda = "cuda13";
+            cudssSha256 = "0ds9g8jv95pjnmvx9axm5d24in3161dsrjjqs42ykfywh3yza65s";
           };
           orin = {
             cuda = "cudaPackages_12_6";
             archs = "87";
             # cuDSS >= 0.8 ships aarch64 as "linux-sbsa".
             cudssPlatform = "linux-sbsa";
+            cudssCuda = "cuda12";
             cudssSha256 = "12xixcrfl9yv2gf7rc0nkn2fhh171m2mnhvpfvgrfs4qbh0jd54l";
+          };
+          # Jetson Thor, sm_110. cuda13_0 matches JetPack 7's driver.
+          thor = {
+            cuda = "cudaPackages_13_0";
+            archs = "110";
+            cudssPlatform = "linux-sbsa";
+            cudssCuda = "cuda13";
+            cudssSha256 = "02clxpqz0b60rfyrkz763yk0n15kk8bbn6wpqp1i0bkrjrbpxzn5";
           };
         };
 
@@ -163,7 +182,7 @@
             "0q4z9zvzas2pg566g889j4chy6w3m41bb82zrxs6ihl1arnral6q";
           # Downloaded by cuNLS's own cmake (AddCUDSS.cmake), also via FetchContent.
           cudss = depTarball "cudss"
-            "https://developer.download.nvidia.com/compute/cudss/redist/libcudss/${fork.cudssPlatform}/libcudss-${fork.cudssPlatform}-0.8.0.10_cuda12-archive.tar.xz"
+            "https://developer.download.nvidia.com/compute/cudss/redist/libcudss/${fork.cudssPlatform}/libcudss-${fork.cudssPlatform}-0.8.0.10_${fork.cudssCuda}-archive.tar.xz"
             fork.cudssSha256;
         };
 
