@@ -77,7 +77,7 @@ struct RigCamera {
 struct CuvslamConfig {
     /// "stereo", "mono", "rgbd" or "multisensor". Mono is accurate only up to scale.
     /// Multisensor (experimental in cuVSLAM) takes any mix of RGB and RGB-D cameras plus an
-    /// optional IMU; the depth_units_per_meter keys mark which cameras provide depth.
+    /// optional IMU; the frame_id_to_depth_units_per_meter keys mark which cameras provide depth.
     std::string camera_mode;
     /// One tf frame per camera, in cuVSLAM's index order. Empty discovers them off
     /// camera_info; multisensor cannot discover (any count is legal) so it requires this.
@@ -126,7 +126,7 @@ struct CuvslamConfig {
     /// rgbd and multisensor: raw depth units per metre, keyed by the depth image's frame_id.
     /// 1000 for sixteen-bit millimetres. Depth from a frame with no entry is a fatal config
     /// error. In multisensor mode the keys also select which rig cameras provide depth.
-    std::unordered_map<std::string, double> depth_units_per_meter;
+    std::unordered_map<std::string, double> frame_id_to_depth_units_per_meter;
 };
 
 class CuvslamOdometry : public Module {
@@ -164,7 +164,7 @@ public:
                                                this);
         builder.input<sensor_msgs::Image>("image", &CuvslamOdometry::on_image, this);
         if (mode_ == Mode::Rgbd ||
-            (mode_ == Mode::Multisensor && !cfg_.depth_units_per_meter.empty())) {
+            (mode_ == Mode::Multisensor && !cfg_.frame_id_to_depth_units_per_meter.empty())) {
             builder.input<sensor_msgs::Image>("depth_image", &CuvslamOdometry::on_depth, this);
             builder.input<sensor_msgs::CameraInfo>("depth_camera_info",
                                                    &CuvslamOdometry::on_depth_camera_info, this);
@@ -409,9 +409,9 @@ private:
     /// rather than throw — the dispatch loop swallows handler exceptions, and a static
     /// config can never heal.
     double depth_units(const std::string& frame_id) const {
-        const auto units = cfg_.depth_units_per_meter.find(frame_id);
-        if (units == cfg_.depth_units_per_meter.end()) {
-            logging::error("config: depth_units_per_meter has no entry for the depth image's "
+        const auto units = cfg_.frame_id_to_depth_units_per_meter.find(frame_id);
+        if (units == cfg_.frame_id_to_depth_units_per_meter.end()) {
+            logging::error("config: frame_id_to_depth_units_per_meter has no entry for the depth image's "
                            "frame_id",
                            {logging::Field("frame_id", frame_id)});
             std::exit(1);
@@ -464,7 +464,7 @@ private:
     std::vector<std::int32_t> depth_camera_ids() const {
         std::vector<std::int32_t> ids;
         for (std::size_t i = 0; i < cameras_.size(); ++i) {
-            if (cfg_.depth_units_per_meter.count(cameras_[i].frame) > 0) {
+            if (cfg_.frame_id_to_depth_units_per_meter.count(cameras_[i].frame) > 0) {
                 ids.push_back(static_cast<std::int32_t>(i));
             }
         }
@@ -582,9 +582,9 @@ private:
                 !units && !odometry_cfg.multisensor_settings.depth_camera_ids.empty();
             odometry_cfg.multisensor_settings.depth_scale_factor =
                 units ? static_cast<float>(*units) : 1.0f;
-            for (const auto& [frame, frame_units] : cfg_.depth_units_per_meter) {
+            for (const auto& [frame, frame_units] : cfg_.frame_id_to_depth_units_per_meter) {
                 if (camera_index(frame) < 0) {
-                    logging::warn("cuvslam: depth_units_per_meter names a frame that is not "
+                    logging::warn("cuvslam: frame_id_to_depth_units_per_meter names a frame that is not "
                                   "on the rig; it will provide no depth",
                                   {logging::Field("frame_id", frame)});
                 }
