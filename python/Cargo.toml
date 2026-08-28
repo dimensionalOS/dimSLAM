@@ -1,0 +1,22 @@
+# Copyright 2026 Dimensional Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dim_odom"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Python bindings for dimSLAM: cuVSLAM visual odometry plus error-state Kalman fusion"
+repository = "https://github.com/dimensionalOS/dimSLAM"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dim_slam = { path = "../rust" }
+pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
+pythonize = "0.23"
+serde = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace]

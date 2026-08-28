@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "dim_odom"
+description = "Visual-inertial odometry: cuVSLAM tracking plus error-state Kalman fusion"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: Apache Software License",
+]
+
+[project.urls]
+Repository = "https://github.com/dimensionalOS/dimSLAM"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "dim_odom._native"
+python-source = "."
+# _libs is gitignored (it is copied out of the SDK by prepare_libs.sh), so it needs
+# an explicit include to reach the wheel.
+include = [{ path = "dim_odom/_libs/**", format = "wheel" }]
