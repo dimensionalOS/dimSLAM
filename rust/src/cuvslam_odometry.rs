@@ -8,6 +8,7 @@ mod depth_reproject;
 mod msg_convert;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::str::FromStr;
 use std::time::Duration;
 
 use nalgebra::{Isometry3, Matrix3, Matrix6};
@@ -36,6 +37,21 @@ enum Mode {
     Rgbd,
 }
 
+impl FromStr for Mode {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "stereo" => Ok(Mode::Stereo),
+            "mono" => Ok(Mode::Mono),
+            "rgbd" => Ok(Mode::Rgbd),
+            other => Err(format!(
+                "config: camera_mode must be 'stereo', 'mono' or 'rgbd', got '{other}'"
+            )),
+        }
+    }
+}
+
 /// Exact for rotation vectors; ROS's fixed-axis rpy block matches only to first order.
 fn se3_adjoint(parent_from_child: &Isometry3<f64>) -> Matrix6<f64> {
     let rotation = parent_from_child.rotation.to_rotation_matrix().into_inner();
@@ -61,8 +77,14 @@ fn se3_adjoint(parent_from_child: &Isometry3<f64>) -> Matrix6<f64> {
 }
 
 /// cuVSLAM wants camera 0 to be the left one: its partner sits at +x (optical x is right).
-fn needs_left_swap(first_rig_from_camera: &Isometry3<f64>, second_rig_from_camera: &Isometry3<f64>) -> bool {
-    (first_rig_from_camera.inverse() * second_rig_from_camera).translation.x < 0.0
+fn needs_left_swap(
+    first_rig_from_camera: &Isometry3<f64>,
+    second_rig_from_camera: &Isometry3<f64>,
+) -> bool {
+    (first_rig_from_camera.inverse() * second_rig_from_camera)
+        .translation
+        .x
+        < 0.0
 }
 
 fn odometry_mode(mode: Mode, enable_imu: bool) -> u8 {
@@ -131,10 +153,13 @@ pub struct CuvslamOdometryConfig {
     /// Needs a libcuvslam built with ENFORCE_GPU=OFF; stock SDK binaries are GPU-only.
     pub use_gpu: bool,
     /// Frame stamped on the emitted odometry; the tracker's world, drifting freely.
-    pub odom_frame: String,
-    pub base_frame: String,
-    /// Empty means base_frame; NVIDIA's examples use the left camera's optical frame.
-    pub rig_frame: String,
+    pub odom_frame_id: String,
+    pub output_frame_id: String,
+    /// Empty means output_frame_id; NVIDIA's examples use the left camera's optical frame.
+    pub rig_frame_id: String,
+    /// Parent of the loop-closure correction. Nothing here emits map->odom yet, so it is
+    /// carried only so a caller's frame naming survives the trip.
+    pub map_frame_id: String,
     /// Meters; over this the frame's motion is dropped and later frames rebase onto the held pose. 0 disables.
     pub covariance_gate_translation_std: f64,
     /// A teleport the covariance gate believes: m/s and rad/s against the previous raw pose.
@@ -152,9 +177,10 @@ impl Default for CuvslamOdometryConfig {
             camera_frames: Vec::new(),
             cameras: BTreeMap::new(),
             use_gpu: true,
-            odom_frame: "odom".to_string(),
-            base_frame: "base_link".to_string(),
-            rig_frame: String::new(),
+            odom_frame_id: "odom".to_string(),
+            output_frame_id: "base_link".to_string(),
+            rig_frame_id: String::new(),
+            map_frame_id: "map".to_string(),
             covariance_gate_translation_std: 0.0,
             speed_gate_max_linear: 0.0,
             speed_gate_max_angular: 0.0,
@@ -177,6 +203,7 @@ enum DepthChoice {
 
 pub struct CuvslamCore {
     config: CuvslamOdometryConfig,
+    mode: Mode,
     /// The rig, in cuVSLAM's camera order.
     cameras: Vec<RigCamera>,
     camera_info_by_frame: HashMap<String, CameraModel>,
@@ -216,9 +243,20 @@ pub struct CuvslamCore {
 }
 
 impl CuvslamCore {
-    pub fn new(config: CuvslamOdometryConfig) -> Self {
-        Self {
+    /// Rejects an unusable config here rather than at the first image, where a bad
+    /// `camera_mode` used to become mono and quietly halve the accuracy.
+    pub fn new(config: CuvslamOdometryConfig) -> Result<Self, String> {
+        let mode = Mode::from_str(&config.camera_mode)?;
+        if config.enable_imu && mode != Mode::Stereo {
+            return Err(format!(
+                "config: enable_imu requires camera_mode 'stereo'; cuVSLAM has no inertial \
+                 {} mode",
+                config.camera_mode
+            ));
+        }
+        Ok(Self {
             config,
+            mode,
             cameras: Vec::new(),
             camera_info_by_frame: HashMap::new(),
             imu_model: None,
@@ -249,22 +287,14 @@ impl CuvslamCore {
             covariance_gated: 0,
             speed_gated: 0,
             unplaced_images: 0,
-        }
-    }
-
-    fn mode(&self) -> Mode {
-        match self.config.camera_mode.as_str() {
-            "stereo" => Mode::Stereo,
-            "rgbd" => Mode::Rgbd,
-            _ => Mode::Mono,
-        }
+        })
     }
 
     fn rig_frame(&self) -> &str {
-        if self.config.rig_frame.is_empty() {
-            &self.config.base_frame
+        if self.config.rig_frame_id.is_empty() {
+            &self.config.output_frame_id
         } else {
-            &self.config.rig_frame
+            &self.config.rig_frame_id
         }
     }
 
@@ -272,7 +302,8 @@ impl CuvslamCore {
         if self.vslam.is_some() {
             return; // rig is fixed once the tracker exists
         }
-        self.camera_info_by_frame.insert(info.frame_id.clone(), info);
+        self.camera_info_by_frame
+            .insert(info.frame_id.clone(), info);
         self.resolve_rig(tf);
     }
 
@@ -287,7 +318,7 @@ impl CuvslamCore {
             frames.extend(self.camera_info_by_frame.keys().cloned());
             // camera_info has no order of its own, and the rig is indexed.
             frames.sort();
-            let expected = if self.mode() == Mode::Stereo { 2 } else { 1 };
+            let expected = if self.mode == Mode::Stereo { 2 } else { 1 };
             if frames.len() != expected {
                 if frames.len() > expected {
                     error_throttled!(
@@ -327,7 +358,9 @@ impl CuvslamCore {
     }
 
     fn camera_index(&self, frame_id: &str) -> Option<usize> {
-        self.cameras.iter().position(|camera| camera.frame == frame_id)
+        self.cameras
+            .iter()
+            .position(|camera| camera.frame == frame_id)
     }
 
     fn camera_config(&self, frame_id: &str) -> CameraConfig {
@@ -520,11 +553,11 @@ impl CuvslamCore {
         if self.vslam.is_some() || self.tracker_unbuildable {
             return;
         }
-        let Some(base_from_rig) = tf.latest(&self.config.base_frame, self.rig_frame()) else {
+        let Some(base_from_rig) = tf.latest(&self.config.output_frame_id, self.rig_frame()) else {
             warn_throttled!(
                 Duration::from_secs(10),
                 rig_frame = self.rig_frame(),
-                base_frame = %self.config.base_frame,
+                base_frame = %self.config.output_frame_id,
                 "cuvslam: tf does not place the rig frame against base_frame",
             );
             return;
@@ -579,7 +612,7 @@ impl CuvslamCore {
             });
         }
 
-        let mode = self.mode();
+        let mode = self.mode;
         let mut tracker_config = ffi::CuvConfig {
             odometry_mode: odometry_mode(mode, self.config.enable_imu),
             use_gpu: self.config.use_gpu,
@@ -653,7 +686,7 @@ impl CuvslamCore {
     }
 
     fn try_track(&mut self, tf: &dyn TfLookup) -> Option<OdometryEstimate> {
-        let mode = self.mode();
+        let mode = self.mode;
         if self.cameras.is_empty() || (mode == Mode::Rgbd && self.depth.is_none()) {
             return None;
         }
@@ -695,7 +728,11 @@ impl CuvslamCore {
 
         let vslam = self.vslam.as_mut().expect("checked above");
         // A late sample can leave the deque unsorted, so drain from the front.
-        while self.pending_imu.front().is_some_and(|m| m.timestamp_ns <= newest) {
+        while self
+            .pending_imu
+            .front()
+            .is_some_and(|m| m.timestamp_ns <= newest)
+        {
             let measurement = self.pending_imu.pop_front().expect("checked above");
             if let Err(message) = vslam.register_imu(&measurement) {
                 warn_throttled!(Duration::from_secs(10), error = %message, "cuvslam rejected an IMU sample");
@@ -781,11 +818,14 @@ impl CuvslamCore {
             .fold(f64::NEG_INFINITY, |a, b| a.max(*b))
             .sqrt();
         // f64::max skips NaN, so unconstrained frames need the explicit finiteness check.
-        let translation_finite = translation_variances.iter().all(|variance| variance.is_finite());
+        let translation_finite = translation_variances
+            .iter()
+            .all(|variance| variance.is_finite());
         let mut gate_frame = false;
         if self.config.covariance_gate_translation_std > 0.0
             && self.was_tracking
-            && (!translation_finite || translation_std > self.config.covariance_gate_translation_std)
+            && (!translation_finite
+                || translation_std > self.config.covariance_gate_translation_std)
         {
             gate_frame = true;
             self.covariance_gated += 1;
@@ -801,9 +841,11 @@ impl CuvslamCore {
             if let Some(previous_raw) = &self.previous_raw {
                 // Track() rejects non-increasing stamps, so dt is strictly positive here.
                 let dt = (estimate.timestamp_ns - self.previous_raw_ns) as f64 / 1.0e9;
-                let linear_speed = (raw_pose.translation.vector - previous_raw.translation.vector).norm() / dt;
+                let linear_speed =
+                    (raw_pose.translation.vector - previous_raw.translation.vector).norm() / dt;
                 let angular_speed = previous_raw.rotation.angle_to(&raw_pose.rotation) / dt;
-                if (self.config.speed_gate_max_linear > 0.0 && linear_speed > self.config.speed_gate_max_linear)
+                if (self.config.speed_gate_max_linear > 0.0
+                    && linear_speed > self.config.speed_gate_max_linear)
                     || (self.config.speed_gate_max_angular > 0.0
                         && angular_speed > self.config.speed_gate_max_angular)
                 {
@@ -837,8 +879,8 @@ impl CuvslamCore {
     fn output(&self, timestamp_ns: i64) -> OdometryEstimate {
         OdometryEstimate {
             timestamp_ns,
-            frame_id: self.config.odom_frame.clone(),
-            child_frame_id: self.config.base_frame.clone(),
+            frame_id: self.config.odom_frame_id.clone(),
+            child_frame_id: self.config.output_frame_id.clone(),
             pose: self.world_from_base.unwrap_or_else(Isometry3::identity),
             pose_covariance: self.covariance,
             ..Default::default()
@@ -885,7 +927,8 @@ mod tests {
 
     #[test]
     fn adjoint_translation_couples_rotation_into_translation() {
-        let lever_arm = Isometry3::from_parts(Translation3::new(2.0, 0.0, 0.0), UnitQuaternion::identity());
+        let lever_arm =
+            Isometry3::from_parts(Translation3::new(2.0, 0.0, 0.0), UnitQuaternion::identity());
         let adjoint = se3_adjoint(&lever_arm);
         assert!((adjoint[(1, 5)] + 2.0).abs() < 1.0e-12); // y <- yaw
         assert!((adjoint[(2, 4)] - 2.0).abs() < 1.0e-12); // z <- pitch
@@ -895,7 +938,8 @@ mod tests {
     #[test]
     fn adjoint_moves_covariance_between_frames() {
         // A 2 m lever arm turns rig yaw variance into base y variance: var_y = arm^2 * var_yaw.
-        let lever_arm = Isometry3::from_parts(Translation3::new(2.0, 0.0, 0.0), UnitQuaternion::identity());
+        let lever_arm =
+            Isometry3::from_parts(Translation3::new(2.0, 0.0, 0.0), UnitQuaternion::identity());
         let adjoint = se3_adjoint(&lever_arm);
         let mut rig_covariance = Matrix6::zeros();
         rig_covariance[(5, 5)] = 0.01; // yaw
@@ -906,18 +950,51 @@ mod tests {
 
     #[test]
     fn left_swap_when_partner_sits_at_negative_x() {
-        let left = Isometry3::from_parts(Translation3::new(0.0, 0.0, 0.0), UnitQuaternion::identity());
-        let right = Isometry3::from_parts(Translation3::new(0.12, 0.0, 0.0), UnitQuaternion::identity());
+        let left =
+            Isometry3::from_parts(Translation3::new(0.0, 0.0, 0.0), UnitQuaternion::identity());
+        let right = Isometry3::from_parts(
+            Translation3::new(0.12, 0.0, 0.0),
+            UnitQuaternion::identity(),
+        );
         assert!(!needs_left_swap(&left, &right));
         assert!(needs_left_swap(&right, &left));
     }
 
     #[test]
     fn odometry_mode_selection() {
-        assert_eq!(odometry_mode(Mode::Rgbd, true), ffi::CUV_ODOMETRY_RGBD);
+        assert_eq!(odometry_mode(Mode::Rgbd, false), ffi::CUV_ODOMETRY_RGBD);
         assert_eq!(odometry_mode(Mode::Mono, false), ffi::CUV_ODOMETRY_MONO);
-        assert_eq!(odometry_mode(Mode::Stereo, false), ffi::CUV_ODOMETRY_MULTICAMERA);
-        assert_eq!(odometry_mode(Mode::Stereo, true), ffi::CUV_ODOMETRY_INERTIAL);
+        assert_eq!(
+            odometry_mode(Mode::Stereo, false),
+            ffi::CUV_ODOMETRY_MULTICAMERA
+        );
+        assert_eq!(
+            odometry_mode(Mode::Stereo, true),
+            ffi::CUV_ODOMETRY_INERTIAL
+        );
+    }
+
+    #[test]
+    fn an_unknown_camera_mode_is_refused_rather_than_becoming_mono() {
+        let config = CuvslamOdometryConfig {
+            camera_mode: "steREO".to_string(),
+            ..Default::default()
+        };
+        let error = CuvslamCore::new(config).err().expect("must not build");
+        assert!(error.contains("camera_mode"), "{error}");
+    }
+
+    #[test]
+    fn enable_imu_outside_stereo_is_refused_rather_than_dropped() {
+        for camera_mode in ["mono", "rgbd"] {
+            let config = CuvslamOdometryConfig {
+                camera_mode: camera_mode.to_string(),
+                enable_imu: true,
+                ..Default::default()
+            };
+            let error = CuvslamCore::new(config).err().expect("must not build");
+            assert!(error.contains("enable_imu"), "{camera_mode}: {error}");
+        }
     }
 
     #[test]
