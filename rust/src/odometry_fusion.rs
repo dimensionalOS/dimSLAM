@@ -46,17 +46,17 @@ pub struct SourceConfig {
     pub twist_variances: [f64; 6],
 }
 
-/// The transform an odometry source reports, written `"parent_frame->child_frame"` so it can be a
-/// JSON object key. Both halves are needed: two sources can share a parent.
+/// The transform an odometry source reports, written `"parent_frame_id->child_frame_id"` so it
+/// can be a JSON object key. Both halves are needed: two sources can share a parent.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SourceKey {
-    pub parent_frame: String,
-    pub child_frame: String,
+    pub parent_frame_id: String,
+    pub child_frame_id: String,
 }
 
 impl std::fmt::Display for SourceKey {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}->{}", self.parent_frame, self.child_frame)
+        write!(formatter, "{}->{}", self.parent_frame_id, self.child_frame_id)
     }
 }
 
@@ -64,15 +64,17 @@ impl std::str::FromStr for SourceKey {
     type Err = String;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let (parent_frame, child_frame) = text.split_once("->").ok_or_else(|| {
-            format!("odometry source key {text:?} must be written \"parent_frame->child_frame\"")
+        let (parent_frame_id, child_frame_id) = text.split_once("->").ok_or_else(|| {
+            format!(
+                "odometry source key {text:?} must be written \"parent_frame_id->child_frame_id\""
+            )
         })?;
-        if parent_frame.trim().is_empty() || child_frame.trim().is_empty() {
+        if parent_frame_id.trim().is_empty() || child_frame_id.trim().is_empty() {
             return Err(format!("odometry source key {text:?} has an empty frame"));
         }
         Ok(Self {
-            parent_frame: parent_frame.trim().to_string(),
-            child_frame: child_frame.trim().to_string(),
+            parent_frame_id: parent_frame_id.trim().to_string(),
+            child_frame_id: child_frame_id.trim().to_string(),
         })
     }
 }
@@ -103,8 +105,8 @@ pub struct ImuConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OdometryFusionConfig {
-    pub odom_frame: String,
-    pub base_frame: String,
+    pub odom_frame_id: String,
+    pub output_frame_id: String,
     /// Output cadence; the filter itself runs at the IMU rate.
     pub publish_rate: f64,
     /// How far back a late measurement can reach before it is dropped.
@@ -140,8 +142,8 @@ pub struct OdometryFusionConfig {
 impl Default for OdometryFusionConfig {
     fn default() -> Self {
         Self {
-            odom_frame: "odom".to_string(),
-            base_frame: "base_link".to_string(),
+            odom_frame_id: "odom".to_string(),
+            output_frame_id: "base_link".to_string(),
             publish_rate: 100.0,
             replay_buffer_seconds: 0.5,
             mahalanobis_gate: 5.0,
@@ -261,7 +263,7 @@ impl FusionCore {
         }
     }
 
-    /// The filter's body frame is base_frame, so both IMU vectors are rotated through the mount.
+    /// The filter's body frame is output_frame_id, so both IMU vectors go through the mount.
     pub fn handle_imu(&mut self, imu: &ImuSample, base_from_imu: &Isometry3<f64>) {
         let Some(imu_config) = self.config.imus.get(&imu.frame_id) else {
             warn_throttled!(
@@ -354,7 +356,9 @@ impl FusionCore {
             );
         }
         let Some((source, (_, source_config))) = self.config.sources.iter().enumerate().find(
-            |(_, (key, _))| key.parent_frame == msg.frame_id && key.child_frame == msg.child_frame_id,
+            |(_, (key, _))| {
+                key.parent_frame_id == msg.frame_id && key.child_frame_id == msg.child_frame_id
+            },
         ) else {
             warn!(
                 frame_id = %msg.frame_id,
@@ -796,8 +800,8 @@ impl FusionCore {
 
         Some(OdometryEstimate {
             timestamp_ns: ts_ns,
-            frame_id: self.config.odom_frame.clone(),
-            child_frame_id: self.config.base_frame.clone(),
+            frame_id: self.config.odom_frame_id.clone(),
+            child_frame_id: self.config.output_frame_id.clone(),
             pose: Isometry3::from_parts(state.position.into(), state.q),
             pose_covariance,
             twist: Twist {
@@ -829,8 +833,8 @@ mod tests {
 
     fn base_config(use_imu: bool) -> OdometryFusionConfig {
         OdometryFusionConfig {
-            odom_frame: "odom".to_string(),
-            base_frame: "base".to_string(),
+            odom_frame_id: "odom".to_string(),
+            output_frame_id: "base".to_string(),
             publish_rate: 1000.0,
             replay_buffer_seconds: 2.0,
             mahalanobis_gate: 3.0,
@@ -857,16 +861,16 @@ mod tests {
         }
     }
 
-    fn source_key(parent_frame: &str) -> SourceKey {
+    fn source_key(parent_frame_id: &str) -> SourceKey {
         SourceKey {
-            parent_frame: parent_frame.to_string(),
-            child_frame: "base".to_string(),
+            parent_frame_id: parent_frame_id.to_string(),
+            child_frame_id: "base".to_string(),
         }
     }
 
-    fn one_source(parent_frame: &str) -> BTreeMap<SourceKey, SourceConfig> {
+    fn one_source(parent_frame_id: &str) -> BTreeMap<SourceKey, SourceConfig> {
         BTreeMap::from([(
-            source_key(parent_frame),
+            source_key(parent_frame_id),
             SourceConfig {
                 pose_variances: [1e-4; 6],
                 twist_variances: [0.0; 6],
@@ -874,10 +878,10 @@ mod tests {
         )])
     }
 
-    fn source_message(parent_frame: &str, ts_ns: i64, x: f64) -> OdometryEstimate {
+    fn source_message(parent_frame_id: &str, ts_ns: i64, x: f64) -> OdometryEstimate {
         OdometryEstimate {
             timestamp_ns: ts_ns,
-            frame_id: parent_frame.to_string(),
+            frame_id: parent_frame_id.to_string(),
             child_frame_id: "base".to_string(),
             pose: Isometry3::translation(x, 0.0, 0.0),
             ..Default::default()
@@ -957,7 +961,7 @@ mod tests {
     fn a_source_key_without_an_arrow_is_rejected() {
         let error = serde_json::from_str::<BTreeMap<SourceKey, SourceConfig>>(r#"{"odom":{}}"#)
             .expect_err("no arrow");
-        assert!(error.to_string().contains("parent_frame->child_frame"), "{error}");
+        assert!(error.to_string().contains("parent_frame_id->child_frame_id"), "{error}");
     }
 
     #[test]

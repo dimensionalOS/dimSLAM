@@ -562,8 +562,8 @@ impl CuvslamCore {
             warn_throttled!(
                 Duration::from_secs(10),
                 rig_frame = self.rig_frame(),
-                base_frame = %self.config.output_frame_id,
-                "cuvslam: tf does not place the rig frame against base_frame",
+                output_frame_id = %self.config.output_frame_id,
+                "cuvslam: tf does not place the rig frame against output_frame_id",
             );
             return;
         };
@@ -811,7 +811,7 @@ impl CuvslamCore {
             }
             return None;
         };
-        // cuVSLAM tracks rig_frame(); the published pose is base_frame.
+        // cuVSLAM tracks rig_frame(); the published pose is output_frame_id.
         let base_from_rig = self.base_from_rig.expect("set with the tracker");
         let rig_from_base = self.rig_from_base.expect("set with the tracker");
         let raw_pose = base_from_rig * cuv_pose_to_isometry(&pose) * rig_from_base;
