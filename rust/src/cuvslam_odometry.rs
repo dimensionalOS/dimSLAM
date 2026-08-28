@@ -167,6 +167,10 @@ pub struct CuvslamOdometryConfig {
     pub speed_gate_max_angular: f64,
     /// cuVSLAM's Inertial mode: stereo plus one IMU, whose noise model `handle_imu_info` supplies.
     pub enable_imu: bool,
+    /// Stamp spread one frame set may span, milliseconds; 0 keeps cuVSLAM's 1 ms contract.
+    /// A software-triggered rig needs this widened: Spot's images land within ~15 ms of each
+    /// other and its depth trails its camera by up to ~90 ms, so every set is dropped at 1 ms.
+    pub max_skew_ms: f64,
 }
 
 /// A zeroed default would silently pick mono.
@@ -185,6 +189,7 @@ impl Default for CuvslamOdometryConfig {
             speed_gate_max_linear: 0.0,
             speed_gate_max_angular: 0.0,
             enable_imu: false,
+            max_skew_ms: 0.0,
         }
     }
 }
@@ -703,13 +708,19 @@ impl CuvslamCore {
             .collect();
         let oldest = *stamps.iter().min().expect("nonempty");
         let newest = *stamps.iter().max().expect("nonempty");
-        if newest - oldest > MAX_PAIR_SKEW_NS {
+        let skew_limit_ns = if self.config.max_skew_ms > 0.0 {
+            (self.config.max_skew_ms * 1.0e6).round() as i64
+        } else {
+            MAX_PAIR_SKEW_NS
+        };
+        if newest - oldest > skew_limit_ns {
             self.skew_rejects += 1;
             warn_throttled!(
                 Duration::from_secs(10),
                 rejected = self.skew_rejects,
                 skew_ms = (newest - oldest) as f64 / 1.0e6,
-                "cuvslam frame sets exceed the 1 ms skew limit",
+                limit_ms = skew_limit_ns as f64 / 1.0e6,
+                "cuvslam frame sets exceed the skew limit",
             );
             return None;
         }
