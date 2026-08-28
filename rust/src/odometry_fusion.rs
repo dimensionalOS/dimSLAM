@@ -18,9 +18,6 @@ use eskf::{Filter, Jacobian, Mat15, State, Vec15};
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 
-/// Bias calibration restarts above this rate: above the gyro's own bias, below real rotation.
-const STATIONARY_GYRO_LIMIT: f64 = 0.05;
-
 /// Raw gyro differences are too noisy for the tangential lever-arm term. A time constant, not
 /// a per-sample weight, so the cutoff does not move with IMU rate.
 const ANGULAR_ACCEL_TIME_CONSTANT: f64 = 0.025;
@@ -124,6 +121,9 @@ pub struct OdometryFusionConfig {
     pub gravity: f64,
     /// Samples averaged while stationary to level the filter and take the IMU biases.
     pub imu_init_samples: i64,
+    /// rad/s. Bias calibration restarts above this rate, so it belongs above the gyro's own
+    /// bias and below any real rotation. A noisier gyro needs it raised or it never inits.
+    pub imu_init_gyro_limit: f64,
     pub initial_position_std: f64,
     pub initial_velocity_std: f64,
     pub initial_rotation_std: f64,
@@ -150,6 +150,7 @@ impl Default for OdometryFusionConfig {
             imus: BTreeMap::new(),
             gravity: 9.80665,
             imu_init_samples: 200,
+            imu_init_gyro_limit: 0.05,
             initial_position_std: 0.1,
             initial_velocity_std: 0.1,
             initial_rotation_std: 0.05,
@@ -295,7 +296,7 @@ impl FusionCore {
         accel -= gyro.cross(&gyro.cross(&lever)) + self.lever_alpha.cross(&lever);
         if !self.initialized {
             self.check_config();
-            if gyro.norm() > STATIONARY_GYRO_LIMIT {
+            if gyro.norm() > self.config.imu_init_gyro_limit {
                 warn_throttled!(
                     std::time::Duration::from_secs(5),
                     gyro_norm = gyro.norm(),
@@ -426,6 +427,10 @@ impl FusionCore {
                 && imu.accel_noise_density > 0.0
                 && imu.accel_random_walk > 0.0,
             "imu {frame_id:?} needs all four noise figures set"
+        );
+        assert!(
+            self.config.imu_init_gyro_limit > 0.0,
+            "imu_init_gyro_limit must be above zero or the filter never leaves init"
         );
     }
 
@@ -842,6 +847,7 @@ mod tests {
             )]),
             gravity: GRAVITY,
             imu_init_samples: 5,
+            imu_init_gyro_limit: 0.05,
             initial_position_std: 0.1,
             initial_velocity_std: 0.1,
             initial_rotation_std: 0.05,
