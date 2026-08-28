@@ -9,6 +9,15 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 dynamic = ["version"]
+# The Linux libcuvslam builds link CUDA's cudart/cublas/cusolver/cusparse, which
+# are far past PyPI's 100 MB file cap, so the wheels depend on NVIDIA's own
+# wheels instead of bundling (see the preload in dim_odom/__init__.py).
+dependencies = [
+    'nvidia-cuda-runtime >=13,<14 ; sys_platform == "linux"',
+    'nvidia-cublas >=13,<14 ; sys_platform == "linux"',
+    'nvidia-cusparse >=12,<13 ; sys_platform == "linux"',
+    'nvidia-cusolver >=12,<13 ; sys_platform == "linux"',
+]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
@@ -22,6 +31,6 @@ Repository = "https://github.com/dimensionalOS/dimSLAM"
 features = ["pyo3/extension-module"]
 module-name = "dim_odom._native"
 python-source = "."
-# _libs is gitignored (it is copied out of the SDK by prepare_libs.sh), so it needs
-# an explicit include to reach the wheel.
+# _libs only exists while build_wheel.sh runs, so it needs an explicit include to
+# reach the wheel.
 include = [{ path = "dim_odom/_libs/**", format = "wheel" }]

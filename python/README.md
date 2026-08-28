@@ -26,5 +26,9 @@ Transforms cross the boundary as `((x, y, z), (qx, qy, qz, qw))`; the `tf` calla
 answers rigid-mount lookups (`parent`, `child`) with such a tuple or `None`.
 
 The wheels bundle `libcuvslam` ([open source](https://github.com/nvidia-isaac/cuVSLAM))
-for each platform. Configs are dicts mirroring the Rust `CuvslamOdometryConfig` and
+for each platform: macOS arm64 (CuMetal build; CPU tracking works with
+`use_gpu: false`), manylinux x86_64 (CUDA 13; tracking needs a GPU), and manylinux
+aarch64 (CUDA 13 Thor/JetPack 7 build). The Linux CUDA runtime comes from NVIDIA's
+`nvidia-*` wheels, declared as dependencies, since those libraries exceed PyPI's
+size limits. Configs are dicts mirroring the Rust `CuvslamOdometryConfig` and
 `OdometryFusionConfig`; absent keys take the defaults.
