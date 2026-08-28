@@ -625,6 +625,9 @@ impl CuvslamCore {
             rectified_stereo_camera: self.rig_rectified() && mode == Mode::Stereo,
             rgbd_depth_scale_factor: 1.0,
             rgbd_depth_camera_id: -1,
+            // Multisensor mode only; this module never selects it.
+            multisensor_depth_scale_factor: 1.0,
+            multisensor_depth_stereo_tracking: false,
         };
         if mode == Mode::Rgbd {
             // try_track only reaches here with a depth image in hand, so its own frame_id picks the
@@ -636,14 +639,14 @@ impl CuvslamCore {
             tracker_config.rgbd_depth_camera_id = 0;
         }
 
-        let vslam = match Tracker::new(&cameras, imu_calibration.as_ref(), &tracker_config) {
+        let vslam = match Tracker::new(&cameras, imu_calibration.as_ref(), &[], &tracker_config) {
             Ok(vslam) => vslam,
             Err(message) => {
                 let fallback_config = ffi::CuvConfig {
                     use_gpu: !tracker_config.use_gpu,
                     ..tracker_config
                 };
-                match Tracker::new(&cameras, imu_calibration.as_ref(), &fallback_config) {
+                match Tracker::new(&cameras, imu_calibration.as_ref(), &[], &fallback_config) {
                     Ok(vslam) => {
                         warn!(
                             configured_use_gpu = tracker_config.use_gpu,
