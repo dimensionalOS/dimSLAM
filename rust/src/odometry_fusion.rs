@@ -140,7 +140,8 @@ pub struct OdometryFusionConfig {
     /// Keyed by the frame_id an IMU's samples carry. Exactly one entry is required when use_imu is
     /// on: the filter propagates on a single IMU. Its four noise figures must all be above zero.
     pub imus: BTreeMap<String, ImuConfig>,
-    pub gravity: f64,
+    /// m/s^2. Seeds `filter.gravity` at init; a future ZUPT is meant to refine it from there.
+    pub initial_gravity_estimate: f64,
     pub initial_position_std: f64,
     pub initial_velocity_std: f64,
     pub initial_rotation_std: f64,
@@ -153,7 +154,7 @@ pub struct OdometryFusionConfig {
     pub constraint_twist_variances: [f64; 6],
 }
 
-/// The derived default would be all zeros, which `check_config` rejects and gravity needs.
+/// The derived default would be all zeros, which `check_config` rejects and the filter needs.
 impl Default for OdometryFusionConfig {
     fn default() -> Self {
         Self {
@@ -165,7 +166,7 @@ impl Default for OdometryFusionConfig {
             max_position_m: 0.0,
             use_imu: false,
             imus: BTreeMap::new(),
-            gravity: 9.80665,
+            initial_gravity_estimate: 9.8,
             initial_position_std: 0.1,
             initial_velocity_std: 0.1,
             initial_rotation_std: 0.05,
@@ -336,7 +337,7 @@ impl FusionCore {
                     - world_from_body.inverse_transform_vector(&Vector3::new(
                         0.0,
                         0.0,
-                        self.config.gravity,
+                        self.config.initial_gravity_estimate,
                     ));
                 self.initialize(ts_ns, world_from_body, mean_gyro, accel_bias);
             }
@@ -459,7 +460,7 @@ impl FusionCore {
         accel_bias: Vector3<f64>,
     ) {
         self.filter.noise = self.imu_noise;
-        self.filter.gravity = self.config.gravity;
+        self.filter.gravity = self.config.initial_gravity_estimate;
         self.filter.init(
             world_from_body,
             gyro_bias,
@@ -864,7 +865,7 @@ mod tests {
                     init_gyro_limit: 0.05,
                 },
             )]),
-            gravity: GRAVITY,
+            initial_gravity_estimate: GRAVITY,
             initial_position_std: 0.1,
             initial_velocity_std: 0.1,
             initial_rotation_std: 0.05,
