@@ -91,15 +91,35 @@ impl<'de> Deserialize<'de> for SourceKey {
     }
 }
 
-/// Noise figures belong to the physical IMU, so they are keyed by the frame_id its samples carry
+/// These all describe the physical IMU, so they are keyed by the frame_id its samples carry
 /// rather than baked into the filter's own config.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImuConfig {
     pub gyro_noise_density: f64,
     pub gyro_random_walk: f64,
     pub accel_noise_density: f64,
     pub accel_random_walk: f64,
+    /// Samples averaged while stationary to level the filter and take the biases.
+    pub init_samples: i64,
+    /// rad/s. Bias calibration restarts above this rate, so it belongs above this gyro's own
+    /// bias and below any real rotation. A noisier gyro needs it raised or it never inits.
+    pub init_gyro_limit: f64,
+}
+
+/// The derived default would zero the init figures, which `check_config` rejects. The noise
+/// figures stay zero: there is no sane guess, so an unset one has to fail loudly.
+impl Default for ImuConfig {
+    fn default() -> Self {
+        Self {
+            gyro_noise_density: 0.0,
+            gyro_random_walk: 0.0,
+            accel_noise_density: 0.0,
+            accel_random_walk: 0.0,
+            init_samples: 200,
+            init_gyro_limit: 0.05,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,11 +141,6 @@ pub struct OdometryFusionConfig {
     /// on: the filter propagates on a single IMU. Its four noise figures must all be above zero.
     pub imus: BTreeMap<String, ImuConfig>,
     pub gravity: f64,
-    /// Samples averaged while stationary to level the filter and take the IMU biases.
-    pub imu_init_samples: i64,
-    /// rad/s. Bias calibration restarts above this rate, so it belongs above the gyro's own
-    /// bias and below any real rotation. A noisier gyro needs it raised or it never inits.
-    pub imu_init_gyro_limit: f64,
     pub initial_position_std: f64,
     pub initial_velocity_std: f64,
     pub initial_rotation_std: f64,
@@ -151,8 +166,6 @@ impl Default for OdometryFusionConfig {
             use_imu: false,
             imus: BTreeMap::new(),
             gravity: 9.80665,
-            imu_init_samples: 200,
-            imu_init_gyro_limit: 0.05,
             initial_position_std: 0.1,
             initial_velocity_std: 0.1,
             initial_rotation_std: 0.05,
@@ -265,7 +278,7 @@ impl FusionCore {
 
     /// The filter's body frame is output_frame_id, so both IMU vectors go through the mount.
     pub fn handle_imu(&mut self, imu: &ImuSample, base_from_imu: &Isometry3<f64>) {
-        let Some(imu_config) = self.config.imus.get(&imu.frame_id) else {
+        let Some(&imu_config) = self.config.imus.get(&imu.frame_id) else {
             warn_throttled!(
                 std::time::Duration::from_secs(5),
                 frame_id = %imu.frame_id,
@@ -298,7 +311,7 @@ impl FusionCore {
         accel -= gyro.cross(&gyro.cross(&lever)) + self.lever_alpha.cross(&lever);
         if !self.initialized {
             self.check_config();
-            if gyro.norm() > self.config.imu_init_gyro_limit {
+            if gyro.norm() > imu_config.init_gyro_limit {
                 warn_throttled!(
                     std::time::Duration::from_secs(5),
                     gyro_norm = gyro.norm(),
@@ -312,7 +325,7 @@ impl FusionCore {
             self.init_gyro_sum += gyro;
             self.init_accel_sum += accel;
             self.init_samples += 1;
-            if self.init_samples >= self.config.imu_init_samples.max(1) as u64 {
+            if self.init_samples >= imu_config.init_samples.max(1) as u64 {
                 let mean_accel = self.init_accel_sum / self.init_samples as f64;
                 let mean_gyro = self.init_gyro_sum / self.init_samples as f64;
                 // Stationary accel reads the specific force R^T (0,0,g): level so it maps to +z.
@@ -433,8 +446,8 @@ impl FusionCore {
             "imu {frame_id:?} needs all four noise figures set"
         );
         assert!(
-            self.config.imu_init_gyro_limit > 0.0,
-            "imu_init_gyro_limit must be above zero or the filter never leaves init"
+            imu.init_gyro_limit > 0.0,
+            "imu {frame_id:?} needs init_gyro_limit above zero or the filter never leaves init"
         );
     }
 
@@ -847,11 +860,11 @@ mod tests {
                     gyro_random_walk: 0.001,
                     accel_noise_density: 0.1,
                     accel_random_walk: 0.01,
+                    init_samples: 5,
+                    init_gyro_limit: 0.05,
                 },
             )]),
             gravity: GRAVITY,
-            imu_init_samples: 5,
-            imu_init_gyro_limit: 0.05,
             initial_position_std: 0.1,
             initial_velocity_std: 0.1,
             initial_rotation_std: 0.05,
