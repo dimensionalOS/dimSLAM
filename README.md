@@ -1,6 +1,6 @@
 # dimSLAM
 
-SLAM stack for dimos.
+VSLAM stack for dimos.
 
 - `cuvslam/` — our cuVSLAM lineage (NVIDIA cuVSLAM v17 + odometry state
   serialization). Licensed under the NVIDIA Community License (`cuvslam/LICENSE`).
