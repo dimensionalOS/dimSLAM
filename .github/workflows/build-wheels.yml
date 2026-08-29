@@ -1,0 +1,83 @@
+name: build-wheels
+
+# Builds the dim_odom wheels against a prebuilt cuVSLAM SDK.
+#
+# The SDK itself is built and released by cu_vslam_rs; this workflow only
+# downloads a release tarball and links against it. There is one wheel slot per
+# (platform, arch) on PyPI, so of the five SDK variants only three are reachable
+# here: the x86_64 wheel takes cuda13 because pyproject.toml pins nvidia-* >=13,
+# the aarch64 wheel takes the multi-arch build that carries Hopper/Thor/Blackwell
+# cubins, and macOS takes metal. The cuda12 and orin variants stay flake-only.
+#
+# Native runners, no qemu: cross-linking is what the zig attempt got wrong, since
+# it pulled in LLVM libc++ while libcuvslam is built against libstdc++.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sdk_release:
+        description: "cu_vslam_rs release tag holding the linux fork SDK tarballs."
+        default: "cuvslam-v17.0.0-fork.1"
+
+env:
+  SDK_REPO: jeff-hykin/cu_vslam_rs
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+            asset: cuvslam-cpp-17.0.0-x86_64-cuda13-fork.tar.gz
+            maturin_args: --compatibility manylinux_2_39 --skip-auditwheel
+          - name: linux-aarch64
+            runner: ubuntu-24.04-arm
+            asset: cuvslam-cpp-17.0.0-aarch64-fork.tar.gz
+            maturin_args: --compatibility manylinux_2_39 --skip-auditwheel
+          - name: macos-arm64
+            runner: macos-14
+            release: cuvslam-v17.0.0-metal.5
+            asset: cuvslam-cpp-17.0.0-arm64-metal-macos.tar.gz
+            maturin_args: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the SDK
+        run: |
+          tag="${{ matrix.release || inputs.sdk_release }}"
+          curl -fsSL -o sdk.tar.gz \
+            "https://github.com/$SDK_REPO/releases/download/$tag/${{ matrix.asset }}"
+          mkdir sdk && tar xzf sdk.tar.gz -C sdk --strip-components=1
+          # The metal tarball ships its dylib under bin/; the fork tarballs use lib/.
+          if [ ! -d sdk/lib ]; then mkdir sdk/lib && cp sdk/bin/lib* sdk/lib/; fi
+          ls -lR sdk | head -40
+
+      # The published wheels were built from stock NVIDIA tarballs, which reject
+      # use_gpu=false. Rebuilding them against a fork SDK is the entire point of
+      # this workflow, so a wheel that fails this check is worse than no wheel.
+      - name: Verify the GPU enforcement is off
+        if: runner.os == 'Linux'
+        run: |
+          if strings sdk/lib/libcuvslam.so | grep -q 'use_gpu must be enabled'; then
+            echo "ERROR: ${{ matrix.asset }} was built with ENFORCE_GPU=ON" >&2
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: pipx install maturin
+
+      - name: Build the wheel
+        run: CUVSLAM_SDK_DIR="$PWD/sdk" python/build_wheel.sh ${{ matrix.maturin_args }}
+
+      - run: ls -lh python/target/wheels
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.name }}
+          path: python/target/wheels/*.whl
+          if-no-files-found: error
