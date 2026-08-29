@@ -23,7 +23,7 @@ on:
         default: "cuvslam-v17.0.0-fork.1"
   push:
     branches: [fused_odom]
-    paths: [".github/workflows/build-wheels.yml"]
+    paths: [".github/workflows/build-wheels.yml", "python/**", "rust/**"]
 
 env:
   SDK_REPO: jeff-hykin/cu_vslam_rs
