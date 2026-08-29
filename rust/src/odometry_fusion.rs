@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use nalgebra::{DVector, Isometry3, Matrix6, Translation3, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::types::{ImuSample, OdometryEstimate, Twist};
 use crate::warn_throttled;
@@ -283,7 +283,7 @@ impl FusionCore {
             warn_throttled!(
                 std::time::Duration::from_secs(5),
                 frame_id = %imu.frame_id,
-                "imu from unconfigured frame_id dropped",
+                "imu from unconfigured frame_id dropped. Add an `imus` entry keyed by it.",
             );
             return;
         };
@@ -316,7 +316,9 @@ impl FusionCore {
                 warn_throttled!(
                     std::time::Duration::from_secs(5),
                     gyro_norm = gyro.norm(),
-                    "imu init deferred: waiting for the robot to hold still",
+                    init_gyro_limit = imu_config.init_gyro_limit,
+                    "imu init deferred: waiting for the robot to hold still. Hold it \
+                     still, or raise init_gyro_limit past the rate above.",
                 );
                 self.init_gyro_sum = Vector3::zeros();
                 self.init_accel_sum = Vector3::zeros();
@@ -374,10 +376,12 @@ impl FusionCore {
                 key.parent_frame_id == msg.frame_id && key.child_frame_id == msg.child_frame_id
             },
         ) else {
-            warn!(
+            warn_throttled!(
+                std::time::Duration::from_secs(5),
                 frame_id = %msg.frame_id,
                 child_frame_id = %msg.child_frame_id,
-                "odometry from an unconfigured transform dropped",
+                "odometry from an unconfigured transform dropped. Add \
+                 \"<frame_id>-><child_frame_id>\" to `sources`.",
             );
             return;
         };
@@ -504,7 +508,9 @@ impl FusionCore {
             warn_throttled!(
                 std::time::Duration::from_secs(10),
                 dropped = self.too_late,
-                "measurement older than the replay buffer dropped",
+                replay_buffer_seconds = self.config.replay_buffer_seconds,
+                "measurement older than the replay buffer dropped. Raise \
+                 replay_buffer_seconds, or cut the source's latency.",
             );
             return;
         } else {
@@ -740,6 +746,14 @@ impl FusionCore {
         );
         if !accepted {
             self.gated += 1;
+            // A filter rejecting everything looks exactly like a dead filter otherwise.
+            warn_throttled!(
+                std::time::Duration::from_secs(10),
+                gated = self.gated,
+                mahalanobis_gate = self.config.mahalanobis_gate,
+                "measurement rejected by the outlier gate. Raise mahalanobis_gate, or \
+                 correct the source's pose_variances / twist_variances.",
+            );
         }
         accepted
     }
@@ -771,7 +785,9 @@ impl FusionCore {
                 std::time::Duration::from_secs(10),
                 distance,
                 max_position_m = self.config.max_position_m,
-                "filter state is not publishable; holding the last pose",
+                "filter state is not publishable; holding the last pose. The filter \
+                 diverged: check max_position_m and each source's pose_variances / \
+                 twist_variances.",
             );
         }
         finite && capped

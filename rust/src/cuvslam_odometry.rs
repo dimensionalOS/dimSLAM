@@ -380,7 +380,9 @@ impl CuvslamCore {
                 Duration::from_secs(30),
                 frame_id = %frame_id,
                 depth_units_per_meter = CameraConfig::default().depth_units_per_meter,
-                "cuvslam has no config for this depth frame_id, using defaults",
+                "cuvslam has no config for this depth frame_id, using defaults. Add a \
+                 `cameras` entry for it with that sensor's depth_units_per_meter; the \
+                 wrong scale rescales the whole map.",
             );
         }
         self.camera_config(frame_id)
@@ -394,10 +396,11 @@ impl CuvslamCore {
             .map(|camera| self.camera_config(&camera.frame).rectified)
             .unwrap_or(true);
         if self.cameras.iter().any(|camera| self.camera_config(&camera.frame).rectified != rectified) {
-            error_throttled!(
-                Duration::from_secs(10),
+            // Only reachable while building the tracker, which happens once.
+            error!(
                 using = rectified,
-                "cuvslam rig cameras disagree on `rectified`; it applies to the whole rig",
+                "cuvslam rig cameras disagree on `rectified`; it applies to the whole rig. \
+                 Make every cameras[*].rectified match.",
             );
         }
         rectified
@@ -446,7 +449,8 @@ impl CuvslamCore {
                 frame_id = %img.frame_id,
                 dropped = self.unplaced_images,
                 rig_cameras = self.cameras.len(),
-                "cuvslam dropping image with a frame_id not on the rig",
+                "cuvslam dropping image with a frame_id not on the rig. Add the frame to \
+                 camera_frames, or stop publishing that image.",
             );
             return None;
         };
@@ -517,8 +521,8 @@ impl CuvslamCore {
                 Duration::from_secs(10),
                 depth_frame = %depth.frame_id,
                 camera_frame = %camera.frame,
-                "cuvslam: depth is in another frame than the camera and needs \
-                 depth_camera_info to reproject",
+                "cuvslam: depth is in another frame than the camera. Publish \
+                 depth_camera_info so it can be reprojected.",
             );
             return None;
         };
@@ -528,7 +532,8 @@ impl CuvslamCore {
                     Duration::from_secs(10),
                     depth_frame = %depth.frame_id,
                     camera_frame = %camera.frame,
-                    "cuvslam: tf does not connect the depth frame to the camera",
+                    "cuvslam: tf does not connect the depth frame to the camera. Publish \
+                     that transform, or fix the URDF that should be producing it.",
                 );
                 return None;
             };
@@ -563,7 +568,8 @@ impl CuvslamCore {
                 Duration::from_secs(10),
                 rig_frame = self.rig_frame(),
                 output_frame_id = %self.config.output_frame_id,
-                "cuvslam: tf does not place the rig frame against output_frame_id",
+                "cuvslam: tf does not place the rig frame against output_frame_id. Publish \
+                 that transform; no odometry comes out until it exists.",
             );
             return;
         };
@@ -594,7 +600,8 @@ impl CuvslamCore {
             let Some(imu_model) = &self.imu_model else {
                 warn_throttled!(
                     Duration::from_secs(10),
-                    "cuvslam: enable_imu is on but no imu_info has arrived",
+                    "cuvslam: enable_imu is on but no imu_info has arrived. Publish \
+                     imu_info, or turn enable_imu off.",
                 );
                 return;
             };
@@ -603,7 +610,8 @@ impl CuvslamCore {
                 warn_throttled!(
                     Duration::from_secs(10),
                     imu_frame = %imu_frame,
-                    "cuvslam: enable_imu is on but tf does not place the IMU",
+                    "cuvslam: enable_imu is on but tf does not place the IMU. Publish the \
+                     transform from the rig frame to it, or turn enable_imu off.",
                 );
                 return;
             };
@@ -723,7 +731,8 @@ impl CuvslamCore {
                 rejected = self.skew_rejects,
                 skew_ms = (newest - oldest) as f64 / 1.0e6,
                 limit_ms = skew_limit_ns as f64 / 1.0e6,
-                "cuvslam frame sets exceed the skew limit",
+                "cuvslam frame sets exceed the skew limit. Sync the cameras, or raise \
+                 max_skew_ms past the skew above.",
             );
             return None;
         }
@@ -847,7 +856,9 @@ impl CuvslamCore {
                 Duration::from_secs(5),
                 translation_std,
                 gated = self.covariance_gated,
-                "cuvslam covariance gate holding pose",
+                limit = self.config.covariance_gate_translation_std,
+                "cuvslam covariance gate holding pose. Raise \
+                 covariance_gate_translation_std to accept poses this uncertain.",
             );
         }
         // previous_raw advances even on gated frames: after a teleport only the jump frame trips.
@@ -870,7 +881,10 @@ impl CuvslamCore {
                         linear_mps = linear_speed,
                         angular_rps = angular_speed,
                         gated = self.speed_gated,
-                        "cuvslam speed gate holding pose",
+                        max_linear = self.config.speed_gate_max_linear,
+                        max_angular = self.config.speed_gate_max_angular,
+                        "cuvslam speed gate holding pose. Raise speed_gate_max_linear / \
+                         speed_gate_max_angular to accept motion this fast.",
                     );
                 }
             }
