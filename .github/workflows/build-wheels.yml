@@ -12,12 +12,18 @@ name: build-wheels
 # Native runners, no qemu: cross-linking is what the zig attempt got wrong, since
 # it pulled in LLVM libc++ while libcuvslam is built against libstdc++.
 
+# The push trigger exists because the repo's default branch is a stale stray named
+# "HEAD", and workflow_dispatch only registers off the default branch. Until that is
+# fixed, touching this file on fused_odom is the way to start a build.
 on:
   workflow_dispatch:
     inputs:
       sdk_release:
         description: "cu_vslam_rs release tag holding the linux fork SDK tarballs."
         default: "cuvslam-v17.0.0-fork.1"
+  push:
+    branches: [fused_odom]
+    paths: [".github/workflows/build-wheels.yml"]
 
 env:
   SDK_REPO: jeff-hykin/cu_vslam_rs
@@ -48,7 +54,8 @@ jobs:
 
       - name: Fetch the SDK
         run: |
-          tag="${{ matrix.release || inputs.sdk_release }}"
+          # inputs is empty on push events, hence the literal fallback.
+          tag="${{ matrix.release || inputs.sdk_release || 'cuvslam-v17.0.0-fork.1' }}"
           curl -fsSL -o sdk.tar.gz \
             "https://github.com/$SDK_REPO/releases/download/$tag/${{ matrix.asset }}"
           mkdir sdk && tar xzf sdk.tar.gz -C sdk --strip-components=1
