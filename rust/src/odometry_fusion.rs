@@ -131,15 +131,16 @@ pub struct OdometryFusionConfig {
     pub publish_rate: f64,
     /// How far back a late measurement can reach before it is dropped.
     pub replay_buffer_seconds: f64,
-    /// Reject a measurement whose residual exceeds this many standard deviations of the expected
-    /// noise (a Mahalanobis distance, normalized per measurement dimension); 0 disables.
-    pub max_measurement_stddevs: f64,
+    /// Outlier gate in variance units: reject a measurement whose squared Mahalanobis distance
+    /// per measurement dimension exceeds this multiple of the expected noise variance.
+    /// Smaller is more aggressive, 0 is no gate.
+    pub outlier_rejection_allowed_variance: f64,
     /// Gate on the filter's own state, which can run away with no bad measurement; 0 disables.
     pub max_position_m: f64,
-    /// Off bypasses the Kalman machinery and seeds level from the first source message; see `blend`.
-    pub use_imu: bool,
-    /// Keyed by the frame_id an IMU's samples carry. Exactly one entry is required when use_imu is
-    /// on: the filter propagates on a single IMU. Its four noise figures must all be above zero.
+    /// Keyed by the frame_id an IMU's samples carry. Empty disables the IMU: the filter bypasses
+    /// the Kalman machinery and seeds level from the first source message (see `blend`). Otherwise
+    /// exactly one entry, since the filter propagates on a single IMU, and its four noise figures
+    /// must all be above zero.
     pub imus: BTreeMap<String, ImuConfig>,
     /// m/s^2. Seeds `filter.gravity` at init; a future ZUPT is meant to refine it from there.
     pub initial_gravity_estimate: f64,
@@ -150,9 +151,15 @@ pub struct OdometryFusionConfig {
     /// Keyed by the transform a source's estimates carry. Ordered, not hashed: the blend sums in
     /// iteration order and floating-point addition is not associative.
     pub sources: BTreeMap<SourceKey, SourceConfig>,
-    /// Virtual zero-twist [vx vy vz wx wy wz] fused after each source update (use_imu only):
+    /// Virtual zero-twist [vx vy vz wx wy wz] fused after each source update (needs an IMU):
     /// >0 pins that dimension to zero with this variance (e.g. non-holonomic vy, vz), 0 frees it.
     pub constraint_twist_variances: [f64; 6],
+}
+
+impl OdometryFusionConfig {
+    pub fn use_imu(&self) -> bool {
+        !self.imus.is_empty()
+    }
 }
 
 /// The derived default would be all zeros, which `check_config` rejects and the filter needs.
@@ -163,9 +170,8 @@ impl Default for OdometryFusionConfig {
             output_frame_id: "base_link".to_string(),
             publish_rate: 100.0,
             replay_buffer_seconds: 0.5,
-            max_measurement_stddevs: 5.0,
+            outlier_rejection_allowed_variance: 25.0,
             max_position_m: 0.0,
-            use_imu: false,
             imus: BTreeMap::new(),
             initial_gravity_estimate: 9.8,
             initial_position_std: 0.1,
@@ -361,7 +367,7 @@ impl FusionCore {
 
     pub fn handle_source(&mut self, msg: &OdometryEstimate) {
         if !self.initialized {
-            if self.config.use_imu {
+            if self.config.use_imu() {
                 return;
             }
             self.check_config();
@@ -435,13 +441,13 @@ impl FusionCore {
     }
 
     fn check_config(&self) {
-        if !self.config.use_imu {
+        if self.config.imus.is_empty() {
             return;
         }
         assert_eq!(
             self.config.imus.len(),
             1,
-            "use_imu needs exactly one configured imu: the filter propagates on a single imu"
+            "the filter propagates on a single imu: configure exactly one, or none to disable"
         );
         let (frame_id, imu) = self.config.imus.iter().next().expect("length checked above");
         assert!(
@@ -493,7 +499,7 @@ impl FusionCore {
         self.events.push_back(seed);
         info!(
             gyro_bias = gyro_bias.norm(),
-            use_imu = self.config.use_imu,
+            use_imu = self.config.use_imu(),
             "odometry_fusion initialized"
         );
     }
@@ -552,7 +558,7 @@ impl FusionCore {
                 self.last_gyro = gyro;
             }
             EventKind::Measurement(measurement) => {
-                if self.config.use_imu {
+                if self.config.use_imu() {
                     self.apply(&measurement);
                 } else {
                     self.blend(&measurement, ts_ns);
@@ -743,7 +749,8 @@ impl FusionCore {
             &residual,
             &jacobian,
             &variance,
-            self.config.max_measurement_stddevs,
+            // The filter gates in standard deviations; the config speaks variance.
+            self.config.outlier_rejection_allowed_variance.sqrt(),
         );
         if !accepted {
             self.gated += 1;
@@ -751,8 +758,9 @@ impl FusionCore {
             warn_throttled!(
                 std::time::Duration::from_secs(10),
                 gated = self.gated,
-                max_measurement_stddevs = self.config.max_measurement_stddevs,
-                "measurement rejected by the outlier gate. Raise max_measurement_stddevs, or \
+                outlier_rejection_allowed_variance = self.config.outlier_rejection_allowed_variance,
+                "measurement rejected by the outlier gate. Raise outlier_rejection_allowed_variance, \
+                 or \
                  correct the source's pose_variances / twist_variances.",
             );
         }
@@ -868,20 +876,23 @@ mod tests {
             output_frame_id: "base".to_string(),
             publish_rate: 1000.0,
             replay_buffer_seconds: 2.0,
-            max_measurement_stddevs: 3.0,
+            outlier_rejection_allowed_variance: 9.0,
             max_position_m: 10000.0,
-            use_imu,
-            imus: BTreeMap::from([(
-                "imu".to_string(),
-                ImuConfig {
-                    gyro_noise_density: 0.01,
-                    gyro_random_walk: 0.001,
-                    accel_noise_density: 0.1,
-                    accel_random_walk: 0.01,
-                    init_samples: 5,
-                    init_gyro_limit: 0.05,
-                },
-            )]),
+            imus: if use_imu {
+                BTreeMap::from([(
+                    "imu".to_string(),
+                    ImuConfig {
+                        gyro_noise_density: 0.01,
+                        gyro_random_walk: 0.001,
+                        accel_noise_density: 0.1,
+                        accel_random_walk: 0.01,
+                        init_samples: 5,
+                        init_gyro_limit: 0.05,
+                    },
+                )])
+            } else {
+                BTreeMap::new()
+            },
             initial_gravity_estimate: GRAVITY,
             initial_position_std: 0.1,
             initial_velocity_std: 0.1,
