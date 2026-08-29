@@ -131,8 +131,9 @@ pub struct OdometryFusionConfig {
     pub publish_rate: f64,
     /// How far back a late measurement can reach before it is dropped.
     pub replay_buffer_seconds: f64,
-    /// Outlier gate in standard deviations per measurement dimension; 0 disables.
-    pub mahalanobis_gate: f64,
+    /// Reject a measurement whose residual exceeds this many standard deviations of the expected
+    /// noise (a Mahalanobis distance, normalized per measurement dimension); 0 disables.
+    pub max_measurement_stddevs: f64,
     /// Gate on the filter's own state, which can run away with no bad measurement; 0 disables.
     pub max_position_m: f64,
     /// Off bypasses the Kalman machinery and seeds level from the first source message; see `blend`.
@@ -162,7 +163,7 @@ impl Default for OdometryFusionConfig {
             output_frame_id: "base_link".to_string(),
             publish_rate: 100.0,
             replay_buffer_seconds: 0.5,
-            mahalanobis_gate: 5.0,
+            max_measurement_stddevs: 5.0,
             max_position_m: 0.0,
             use_imu: false,
             imus: BTreeMap::new(),
@@ -742,7 +743,7 @@ impl FusionCore {
             &residual,
             &jacobian,
             &variance,
-            self.config.mahalanobis_gate,
+            self.config.max_measurement_stddevs,
         );
         if !accepted {
             self.gated += 1;
@@ -750,8 +751,8 @@ impl FusionCore {
             warn_throttled!(
                 std::time::Duration::from_secs(10),
                 gated = self.gated,
-                mahalanobis_gate = self.config.mahalanobis_gate,
-                "measurement rejected by the outlier gate. Raise mahalanobis_gate, or \
+                max_measurement_stddevs = self.config.max_measurement_stddevs,
+                "measurement rejected by the outlier gate. Raise max_measurement_stddevs, or \
                  correct the source's pose_variances / twist_variances.",
             );
         }
@@ -867,7 +868,7 @@ mod tests {
             output_frame_id: "base".to_string(),
             publish_rate: 1000.0,
             replay_buffer_seconds: 2.0,
-            mahalanobis_gate: 3.0,
+            max_measurement_stddevs: 3.0,
             max_position_m: 10000.0,
             use_imu,
             imus: BTreeMap::from([(
@@ -1039,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn the_mahalanobis_gate_rejects_a_wild_pose_and_accepts_a_consistent_one() {
+    fn the_outlier_gate_rejects_a_wild_pose_and_accepts_a_consistent_one() {
         let mut core = FusionCore::new(base_config(true));
         for sample in 0..5 {
             core.handle_imu(&imu_message(sample * NS_PER_SEC / 100, 0.0, 0.0), &identity_mount());
