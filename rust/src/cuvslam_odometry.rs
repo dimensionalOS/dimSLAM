@@ -35,6 +35,7 @@ enum Mode {
     Stereo,
     Mono,
     Rgbd,
+    Multisensor,
 }
 
 impl FromStr for Mode {
@@ -45,8 +46,10 @@ impl FromStr for Mode {
             "stereo" => Ok(Mode::Stereo),
             "mono" => Ok(Mode::Mono),
             "rgbd" => Ok(Mode::Rgbd),
+            "multisensor" => Ok(Mode::Multisensor),
             other => Err(format!(
-                "config: camera_mode must be 'stereo', 'mono' or 'rgbd', got '{other}'"
+                "config: camera_mode must be 'stereo', 'mono', 'rgbd' or 'multisensor', \
+                 got '{other}'"
             )),
         }
     }
@@ -87,10 +90,45 @@ fn needs_left_swap(
         < 0.0
 }
 
+/// Multisensor's rig is the whole camera list: any rig size is legal there.
+fn rig_size(mode: Mode, config: &CuvslamOdometryConfig) -> usize {
+    match mode {
+        Mode::Stereo => 2,
+        Mode::Multisensor => config.cameras.len(),
+        Mode::Mono | Mode::Rgbd => 1,
+    }
+}
+
+/// Repack a depth image as packed float32 metres. The SDK has a single depth scale
+/// factor, so a rig whose depth units disagree converts each image up front instead.
+fn depth_to_meters(depth: &ImageFrame, units: f64, out: &mut Vec<u8>) {
+    let width = depth.width as usize;
+    let height = depth.height as usize;
+    let step = depth.step as usize;
+    let source_is_float = depth.encoding == "32FC1";
+    out.clear();
+    out.reserve(width * height * 4);
+    for y in 0..height {
+        let row = &depth.data[y * step..];
+        for x in 0..width {
+            let raw = if source_is_float {
+                let bytes = &row[x * 4..x * 4 + 4];
+                f32::from_le_bytes(bytes.try_into().expect("4 bytes")) as f64
+            } else {
+                let bytes = &row[x * 2..x * 2 + 2];
+                f64::from(u16::from_le_bytes(bytes.try_into().expect("2 bytes")))
+            };
+            out.extend_from_slice(&((raw / units) as f32).to_le_bytes());
+        }
+    }
+}
+
 fn odometry_mode(mode: Mode, enable_imu: bool) -> u8 {
     match mode {
         Mode::Rgbd => ffi::CUV_ODOMETRY_RGBD,
         Mode::Mono => ffi::CUV_ODOMETRY_MONO,
+        // Multisensor reads the IMU calibration itself; it has no separate inertial variant.
+        Mode::Multisensor => ffi::CUV_ODOMETRY_MULTISENSOR,
         // There is no inertial mono or rgbd.
         Mode::Stereo => {
             if enable_imu {
@@ -127,6 +165,9 @@ pub struct CameraConfig {
     pub depth_cloud_max_range: f64,
     /// One median point per k x k depth block; <= 1 is off.
     pub depth_cloud_decimation: i64,
+    /// Multisensor only: this rig camera also receives depth images, already aligned to it.
+    /// Any depth-providing camera anchors the rig's metric scale.
+    pub provides_depth: bool,
 }
 
 /// A zeroed default would divide depth by nothing.
@@ -139,6 +180,7 @@ impl Default for CameraConfig {
             depth_cloud_min_range: 0.0,
             depth_cloud_max_range: 0.0,
             depth_cloud_decimation: 0,
+            provides_depth: false,
         }
     }
 }
@@ -146,10 +188,13 @@ impl Default for CameraConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CuvslamOdometryConfig {
-    /// "stereo", "mono" or "rgbd". Mono is accurate only up to scale.
+    /// "stereo", "mono", "rgbd" or "multisensor". Mono is accurate only up to scale.
+    /// Multisensor (experimental in cuVSLAM) takes any mix of RGB and RGB-D cameras plus an
+    /// optional IMU; `provides_depth` marks the cameras whose depth anchors metric scale.
     pub camera_mode: String,
-    /// In cuVSLAM's index order: the first entries are the rig (two for stereo, one otherwise)
-    /// and any later ones carry settings for non-rig streams such as an rgbd depth camera.
+    /// In cuVSLAM's index order: the first entries are the rig (two for stereo, the whole list
+    /// for multisensor, one otherwise) and any later ones carry settings for non-rig streams
+    /// such as an rgbd depth camera.
     /// Empty discovers the rig off camera_info; an unlisted camera takes `CameraConfig::default`.
     pub cameras: Vec<CameraConfig>,
     /// Needs a libcuvslam built with ENFORCE_GPU=OFF; stock SDK binaries are GPU-only.
@@ -200,6 +245,10 @@ struct RigCamera {
     rig_from_camera: Isometry3<f64>,
     info: CameraModel,
     image: Option<ImageFrame>,
+    /// Multisensor only: this camera's depth image, already aligned to it.
+    depth: Option<ImageFrame>,
+    /// Scratch for mixed-unit conversion to float32 metres.
+    depth_meters: Vec<u8>,
 }
 
 enum DepthChoice {
@@ -223,6 +272,8 @@ pub struct CuvslamCore {
     depth_info: Option<CameraModel>,
     aligned_depth: ImageFrame,
     camera_from_depth: Option<Isometry3<f64>>,
+    /// Multisensor: the rig's depth units disagree, so each depth is converted to metres.
+    mixed_depth_units: bool,
     last_ts_ns: Option<i64>,
 
     world_from_base: Option<Isometry3<f64>>,
@@ -253,7 +304,13 @@ impl CuvslamCore {
     /// `camera_mode` used to become mono and quietly halve the accuracy.
     pub fn new(config: CuvslamOdometryConfig) -> Result<Self, String> {
         let mode = Mode::from_str(&config.camera_mode)?;
-        let rig_size = if mode == Mode::Stereo { 2 } else { 1 };
+        if mode == Mode::Multisensor && config.cameras.is_empty() {
+            // Any rig size is legal, so discovery cannot know when it is done.
+            return Err(
+                "config: camera_mode 'multisensor' requires `cameras` to list the rig".to_string(),
+            );
+        }
+        let rig_size = rig_size(mode, &config);
         if !config.cameras.is_empty() && config.cameras.len() < rig_size {
             return Err(format!(
                 "config: camera_mode '{}' needs {} rig cameras but `cameras` lists {}; \
@@ -263,10 +320,10 @@ impl CuvslamCore {
                 config.cameras.len()
             ));
         }
-        if config.enable_imu && mode != Mode::Stereo {
+        if config.enable_imu && !matches!(mode, Mode::Stereo | Mode::Multisensor) {
             return Err(format!(
-                "config: enable_imu requires camera_mode 'stereo'; cuVSLAM has no inertial \
-                 {} mode",
+                "config: enable_imu requires camera_mode 'stereo' or 'multisensor'; cuVSLAM \
+                 has no inertial {} mode",
                 config.camera_mode
             ));
         }
@@ -283,6 +340,7 @@ impl CuvslamCore {
             depth_info: None,
             aligned_depth: ImageFrame::default(),
             camera_from_depth: None,
+            mixed_depth_units: false,
             last_ts_ns: None,
             world_from_base: None,
             base_from_rig: None,
@@ -329,7 +387,7 @@ impl CuvslamCore {
             return;
         }
         let discovered = self.config.cameras.is_empty();
-        let rig_size = if self.mode == Mode::Stereo { 2 } else { 1 };
+        let rig_size = rig_size(self.mode, &self.config);
         let mut frames: Vec<String> = self
             .config
             .cameras
@@ -368,6 +426,8 @@ impl CuvslamCore {
                 rig_from_camera,
                 info: info.clone(),
                 image: None,
+                depth: None,
+                depth_meters: Vec::new(),
             });
         }
         if discovered
@@ -495,8 +555,9 @@ impl CuvslamCore {
         tf: &dyn TfLookup,
     ) -> (Option<PointCloud>, Option<OdometryEstimate>) {
         // Downstream indexes by step and height, so an undersized buffer would panic.
+        let pixel_bytes = if img.encoding == "32FC1" { 4 } else { 2 };
         let expected_bytes = img.step as usize * img.height as usize;
-        if img.step < img.width * 2 || img.data.len() < expected_bytes {
+        if img.step < img.width * pixel_bytes || img.data.len() < expected_bytes {
             warn_throttled!(
                 Duration::from_secs(10),
                 width = img.width,
@@ -508,8 +569,57 @@ impl CuvslamCore {
             return (None, None);
         }
         let cloud = self.depth_cloud_msg(&img);
-        self.depth = Some(img);
+        if self.mode == Mode::Multisensor {
+            let Some(index) = self.camera_index(&img.frame_id) else {
+                if !self.cameras.is_empty() {
+                    warn_throttled!(
+                        Duration::from_secs(10),
+                        frame_id = %img.frame_id,
+                        "cuvslam dropping depth with a frame_id not on the rig. Multisensor \
+                         depth must arrive aligned to its rig camera.",
+                    );
+                }
+                return (cloud, None);
+            };
+            if !self.camera_config(&img.frame_id).provides_depth {
+                warn_throttled!(
+                    Duration::from_secs(10),
+                    frame_id = %img.frame_id,
+                    "cuvslam ignoring depth for a rig camera whose config does not set \
+                     provides_depth. Mark it, or stop publishing that depth.",
+                );
+                return (cloud, None);
+            }
+            self.cameras[index].depth = Some(img);
+        } else {
+            self.depth = Some(img);
+        }
         (cloud, self.try_track(tf))
+    }
+
+    /// Rig indices of the cameras the config marks as depth-providing. Multisensor only.
+    fn depth_camera_ids(&self) -> Vec<i32> {
+        self.cameras
+            .iter()
+            .enumerate()
+            .filter(|(_, camera)| self.camera_config(&camera.frame).provides_depth)
+            .map(|(index, _)| index as i32)
+            .collect()
+    }
+
+    /// The shared units value when every depth camera agrees; None marks a mixed rig.
+    fn uniform_depth_units(&self) -> Option<f64> {
+        let mut units = None;
+        for id in self.depth_camera_ids() {
+            let camera_units = self
+                .camera_config(&self.cameras[id as usize].frame)
+                .depth_units_per_meter;
+            match units {
+                Some(previous) if previous != camera_units => return None,
+                _ => units = Some(camera_units),
+            }
+        }
+        units
     }
 
     /// A driver's own cloud carries every far, noisy pixel; this one is range-gated.
@@ -682,15 +792,34 @@ impl CuvslamCore {
             // align_depth delivers in cameras[0]'s frame; the -1 default silently ignores depth.
             tracker_config.rgbd_depth_camera_id = 0;
         }
+        let mut depth_ids = Vec::new();
+        if mode == Mode::Multisensor {
+            depth_ids = self.depth_camera_ids();
+            // The SDK has one scale for every depth camera. A rig whose cameras agree uses
+            // it directly; a mixed rig gets each depth converted to float32 metres instead.
+            let units = self.uniform_depth_units();
+            self.mixed_depth_units = units.is_none() && !depth_ids.is_empty();
+            tracker_config.multisensor_depth_scale_factor = units.unwrap_or(1.0) as f32;
+        }
 
-        let vslam = match Tracker::new(&cameras, imu_calibration.as_ref(), &[], &tracker_config) {
+        let vslam = match Tracker::new(
+            &cameras,
+            imu_calibration.as_ref(),
+            &depth_ids,
+            &tracker_config,
+        ) {
             Ok(vslam) => vslam,
             Err(message) => {
                 let fallback_config = ffi::CuvConfig {
                     use_gpu: !tracker_config.use_gpu,
                     ..tracker_config
                 };
-                match Tracker::new(&cameras, imu_calibration.as_ref(), &[], &fallback_config) {
+                match Tracker::new(
+                    &cameras,
+                    imu_calibration.as_ref(),
+                    &depth_ids,
+                    &fallback_config,
+                ) {
                     Ok(vslam) => {
                         warn!(
                             configured_use_gpu = tracker_config.use_gpu,
@@ -733,6 +862,7 @@ impl CuvslamCore {
     fn clear_frame_set(&mut self) {
         for camera in &mut self.cameras {
             camera.image = None;
+            camera.depth = None;
         }
         self.depth = None;
     }
@@ -743,6 +873,15 @@ impl CuvslamCore {
             return None;
         }
         if self.cameras.iter().any(|camera| camera.image.is_none()) {
+            return None;
+        }
+        if mode == Mode::Multisensor
+            && (0..self.cameras.len()).any(|index| {
+                self.camera_config(&self.cameras[index].frame)
+                    .provides_depth
+                    && self.cameras[index].depth.is_none()
+            })
+        {
             return None;
         }
         self.ensure_tracker(tf);
@@ -785,6 +924,26 @@ impl CuvslamCore {
             None
         };
 
+        if mode == Mode::Multisensor && self.mixed_depth_units {
+            let conversions: Vec<(usize, f64)> = (0..self.cameras.len())
+                .filter(|&index| self.cameras[index].depth.is_some())
+                .map(|index| {
+                    let units = self
+                        .camera_config(&self.cameras[index].frame)
+                        .depth_units_per_meter;
+                    (index, units)
+                })
+                .collect();
+            for (index, units) in conversions {
+                let RigCamera {
+                    depth,
+                    depth_meters,
+                    ..
+                } = &mut self.cameras[index];
+                depth_to_meters(depth.as_ref().expect("filtered above"), units, depth_meters);
+            }
+        }
+
         let vslam = self.vslam.as_mut().expect("checked above");
         // A late sample can leave the deque unsorted, so drain from the front.
         while self
@@ -816,7 +975,7 @@ impl CuvslamCore {
                     }
                 })
                 .collect();
-            let depths: Vec<ImageRef> = depth_choice
+            let mut depths: Vec<ImageRef> = depth_choice
                 .iter()
                 .map(|choice| {
                     let depth = match choice {
@@ -834,6 +993,38 @@ impl CuvslamCore {
                     }
                 })
                 .collect();
+            if mode == Mode::Multisensor {
+                for (index, camera) in self.cameras.iter().enumerate() {
+                    let Some(depth) = camera.depth.as_ref() else {
+                        continue;
+                    };
+                    depths.push(if self.mixed_depth_units {
+                        ImageRef {
+                            pixels: &camera.depth_meters,
+                            width: depth.width,
+                            height: depth.height,
+                            encoding: ffi::CUV_ENCODING_MONO,
+                            data_type: ffi::CUV_DATA_FLOAT32,
+                            timestamp_ns: newest,
+                            camera_index: index as u32,
+                        }
+                    } else {
+                        ImageRef {
+                            pixels: &depth.data,
+                            width: depth.width,
+                            height: depth.height,
+                            encoding: ffi::CUV_ENCODING_MONO,
+                            data_type: if depth.encoding == "32FC1" {
+                                ffi::CUV_DATA_FLOAT32
+                            } else {
+                                ffi::CUV_DATA_UINT16
+                            },
+                            timestamp_ns: newest,
+                            camera_index: index as u32,
+                        }
+                    });
+                }
+            }
             vslam.track(&images, &depths)
         };
         self.frames += 1;
@@ -1036,6 +1227,70 @@ mod tests {
             odometry_mode(Mode::Stereo, true),
             ffi::CUV_ODOMETRY_INERTIAL
         );
+        // Multisensor reads the IMU calibration itself; there is no separate inertial variant.
+        assert_eq!(
+            odometry_mode(Mode::Multisensor, false),
+            ffi::CUV_ODOMETRY_MULTISENSOR
+        );
+        assert_eq!(
+            odometry_mode(Mode::Multisensor, true),
+            ffi::CUV_ODOMETRY_MULTISENSOR
+        );
+    }
+
+    #[test]
+    fn multisensor_without_cameras_is_refused_rather_than_discovering_forever() {
+        let config = CuvslamOdometryConfig {
+            camera_mode: "multisensor".to_string(),
+            ..Default::default()
+        };
+        let error = CuvslamCore::new(config).err().expect("must not build");
+        assert!(error.contains("cameras"), "{error}");
+    }
+
+    #[test]
+    fn depth_to_meters_converts_uint16_with_padded_rows() {
+        let depth = ImageFrame {
+            width: 2,
+            height: 2,
+            encoding: "16UC1".to_string(),
+            step: 6, // two padding bytes per row
+            data: vec![
+                0x88, 0x13, 0xd0, 0x07, 0, 0, // 5000, 2000, pad
+                0xe8, 0x03, 0x00, 0x00, 0, 0, // 1000, 0, pad
+            ],
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        depth_to_meters(&depth, 1000.0, &mut out);
+        let values: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+            .collect();
+        assert_eq!(values, vec![5.0, 2.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn depth_to_meters_rescales_float_sources() {
+        let mut data = Vec::new();
+        for value in [1500.0f32, 250.0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let depth = ImageFrame {
+            width: 2,
+            height: 1,
+            encoding: "32FC1".to_string(),
+            step: 8,
+            data,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        depth_to_meters(&depth, 500.0, &mut out);
+        let values: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+            .collect();
+        assert_eq!(values, vec![3.0, 0.5]);
     }
 
     #[test]
