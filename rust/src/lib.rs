@@ -43,7 +43,7 @@ pub mod odometry_fusion;
 pub mod types;
 
 pub use cuvslam_odometry::{CameraConfig, CuvslamCore, CuvslamOdometryConfig};
-pub use odometry_fusion::{FusionCore, ImuConfig, OdometryFusionConfig, SourceConfig};
+pub use odometry_fusion::{FusionCore, ImuConfig, InitialStds, OdometryFusionConfig, SourceConfig};
 pub use types::{
     CameraModel, ImageFrame, ImuNoiseModel, ImuSample, OdometryEstimate, PointCloud, TfLookup,
     Twist,

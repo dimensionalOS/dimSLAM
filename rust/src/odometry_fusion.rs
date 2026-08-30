@@ -14,7 +14,7 @@ use tracing::info;
 
 use crate::types::{ImuSample, OdometryEstimate, Twist};
 use crate::warn_throttled;
-use eskf::{Filter, Jacobian, Mat15, State, Vec15};
+use eskf::{gyro_bias_col, Cov, Filter, ImuBias, Jacobian, State};
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 
@@ -99,16 +99,15 @@ pub struct OdometryFusionConfig {
     pub outlier_rejection_allowed_variance: f64,
     /// Gate on the filter's own state, which can run away with no bad measurement; 0 disables.
     pub max_position_m: f64,
-    /// None disables the IMU: the filter bypasses the Kalman machinery and seeds level from the
-    /// first source message (see `blend`). The filter propagates on a single IMU, and a
-    /// configured one needs its frame_id and all four noise figures set.
-    pub imu: Option<ImuConfig>,
+    /// One entry per IMU, told apart by the frame_id its samples carry. Each keeps its own
+    /// bias states in the filter; interleaved samples each integrate the slice of time since
+    /// the previous sample of any IMU. Empty disables the Kalman machinery entirely: the
+    /// filter seeds level from the first source message and holds pose between them (see
+    /// `blend`).
+    pub imus: Vec<ImuConfig>,
     /// m/s^2. Seeds `filter.gravity` at init; a future ZUPT is meant to refine it from there.
     pub initial_gravity_estimate: f64,
-    pub initial_position_std: f64,
-    pub initial_velocity_std: f64,
-    pub initial_rotation_std: f64,
-    pub initial_bias_std: f64,
+    pub initial_stds: InitialStds,
     /// One entry per external odometry stream, told apart by the transform its estimates carry.
     /// The no-IMU blend sums in list order, so the order is part of the config.
     pub odom_sources: Vec<SourceConfig>,
@@ -117,9 +116,31 @@ pub struct OdometryFusionConfig {
     pub constraint_twist_variances: [f64; 6],
 }
 
+/// 1-sigma uncertainty the filter starts with, per state block. The bias std applies to
+/// every IMU's gyro and accel bias blocks.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InitialStds {
+    pub position: f64,
+    pub velocity: f64,
+    pub rotation: f64,
+    pub bias: f64,
+}
+
+impl Default for InitialStds {
+    fn default() -> Self {
+        Self {
+            position: 0.1,
+            velocity: 0.1,
+            rotation: 0.05,
+            bias: 0.01,
+        }
+    }
+}
+
 impl OdometryFusionConfig {
     pub fn use_imu(&self) -> bool {
-        self.imu.is_some()
+        !self.imus.is_empty()
     }
 }
 
@@ -133,12 +154,9 @@ impl Default for OdometryFusionConfig {
             replay_buffer_seconds: 0.5,
             outlier_rejection_allowed_variance: 25.0,
             max_position_m: 0.0,
-            imu: None,
+            imus: Vec::new(),
             initial_gravity_estimate: 9.8,
-            initial_position_std: 0.1,
-            initial_velocity_std: 0.1,
-            initial_rotation_std: 0.05,
-            initial_bias_std: 0.01,
+            initial_stds: InitialStds::default(),
             odom_sources: Vec::new(),
             constraint_twist_variances: [0.0; 6],
         }
@@ -170,6 +188,7 @@ const SOURCE_ACTIVITY_TIMEOUT_SECONDS: f64 = 0.5;
 enum EventKind {
     Seed,
     Imu {
+        imu: usize,
         gyro: Vector3<f64>,
         accel: Vector3<f64>,
     },
@@ -182,31 +201,54 @@ struct Event {
     ts_ns: i64,
     kind: EventKind,
     state: State,
-    covariance: Mat15,
+    covariance: Cov,
     anchors: Vec<Option<Isometry3<f64>>>,
     activity: Vec<SourceActivity>,
     last_imu_ns: i64,
     last_gyro: Vector3<f64>,
+    /// Which IMU `last_gyro` came from, so its bias is the one subtracted.
+    last_gyro_imu: usize,
+}
+
+impl Event {
+    fn empty(ts_ns: i64, kind: EventKind) -> Self {
+        Self {
+            ts_ns,
+            kind,
+            state: State::default(),
+            covariance: Cov::identity(9, 9),
+            anchors: Vec::new(),
+            activity: Vec::new(),
+            last_imu_ns: 0,
+            last_gyro: Vector3::zeros(),
+            last_gyro_imu: 0,
+        }
+    }
+}
+
+/// Per-IMU accumulators: stationary init averaging and the lever-arm angular-acceleration
+/// estimate, both meaningless across IMUs.
+#[derive(Clone, Debug, Default)]
+struct ImuRuntime {
+    init_gyro_sum: Vector3<f64>,
+    init_accel_sum: Vector3<f64>,
+    init_samples: u64,
+    lever_gyro: Vector3<f64>,
+    lever_gyro_ns: i64,
+    lever_alpha: Vector3<f64>,
 }
 
 pub struct FusionCore {
     config: OdometryFusionConfig,
     filter: Filter,
-    /// Taken from `config.imu` at the first accepted sample, so `initialize` need not look
-    /// it up again.
-    imu_noise: eskf::Noise,
     initialized: bool,
-    init_gyro_sum: Vector3<f64>,
-    init_accel_sum: Vector3<f64>,
-    init_samples: u64,
+    imu_runtime: Vec<ImuRuntime>,
     events: VecDeque<Event>,
     anchors: Vec<Option<Isometry3<f64>>>,
     activity: Vec<SourceActivity>,
     last_imu_ns: i64,
     last_gyro: Vector3<f64>,
-    lever_gyro: Vector3<f64>,
-    lever_gyro_ns: i64,
-    lever_alpha: Vector3<f64>,
+    last_gyro_imu: usize,
     /// Per-source last raw pose. A delta belongs to the message stream, so replay never redoes it.
     previous_source_pose: HashMap<usize, Isometry3<f64>>,
     last_publish_ns: i64,
@@ -219,22 +261,18 @@ pub struct FusionCore {
 
 impl FusionCore {
     pub fn new(config: OdometryFusionConfig) -> Self {
+        let imu_runtime = vec![ImuRuntime::default(); config.imus.len()];
         Self {
             config,
             filter: Filter::default(),
-            imu_noise: eskf::Noise::default(),
             initialized: false,
-            init_gyro_sum: Vector3::zeros(),
-            init_accel_sum: Vector3::zeros(),
-            init_samples: 0,
+            imu_runtime,
             events: VecDeque::new(),
             anchors: Vec::new(),
             activity: Vec::new(),
             last_imu_ns: 0,
             last_gyro: Vector3::zeros(),
-            lever_gyro: Vector3::zeros(),
-            lever_gyro_ns: 0,
-            lever_alpha: Vector3::zeros(),
+            last_gyro_imu: 0,
             previous_source_pose: HashMap::new(),
             last_publish_ns: 0,
             imu_samples: 0,
@@ -247,87 +285,109 @@ impl FusionCore {
 
     /// The filter's body frame is output_frame_id, so both IMU vectors go through the mount.
     pub fn handle_imu(&mut self, imu: &ImuSample, base_from_imu: &Isometry3<f64>) {
-        let Some(imu_config) = self
+        let Some(index) = self
             .config
-            .imu
-            .clone()
-            .filter(|configured| configured.frame_id == imu.frame_id)
+            .imus
+            .iter()
+            .position(|configured| configured.frame_id == imu.frame_id)
         else {
             warn_throttled!(
                 std::time::Duration::from_secs(5),
                 frame_id = %imu.frame_id,
-                "imu from an unconfigured frame_id dropped. Set `imu.frame_id` to it.",
+                "imu from an unconfigured frame_id dropped. Add an `imus` entry with it.",
             );
             return;
-        };
-        self.imu_noise = eskf::Noise {
-            gyro_noise_density: imu_config.gyro_noise_density,
-            gyro_random_walk: imu_config.gyro_random_walk,
-            accel_noise_density: imu_config.accel_noise_density,
-            accel_random_walk: imu_config.accel_random_walk,
         };
         let lever = base_from_imu.translation.vector;
         let base_from_imu = base_from_imu.rotation;
         let gyro = base_from_imu * imu.angular_velocity;
         let mut accel = base_from_imu * imu.linear_acceleration;
         let ts_ns = imu.timestamp_ns;
-        if self.lever_gyro_ns != 0 {
-            let dt = (ts_ns - self.lever_gyro_ns) as f64 / NS_PER_SEC as f64;
-            if dt > 0.0 {
-                let raw_alpha = (gyro - self.lever_gyro) / dt;
-                let blend = 1.0 - (-dt / ANGULAR_ACCEL_TIME_CONSTANT).exp();
-                self.lever_alpha += (raw_alpha - self.lever_alpha) * blend;
+        {
+            let runtime = &mut self.imu_runtime[index];
+            if runtime.lever_gyro_ns != 0 {
+                let dt = (ts_ns - runtime.lever_gyro_ns) as f64 / NS_PER_SEC as f64;
+                if dt > 0.0 {
+                    let raw_alpha = (gyro - runtime.lever_gyro) / dt;
+                    let blend = 1.0 - (-dt / ANGULAR_ACCEL_TIME_CONSTANT).exp();
+                    runtime.lever_alpha += (raw_alpha - runtime.lever_alpha) * blend;
+                }
             }
+            runtime.lever_gyro = gyro;
+            runtime.lever_gyro_ns = ts_ns;
+            // The lever arm adds centripetal and tangential terms: mount kinematics, not base motion.
+            accel -= gyro.cross(&gyro.cross(&lever)) + runtime.lever_alpha.cross(&lever);
         }
-        self.lever_gyro = gyro;
-        self.lever_gyro_ns = ts_ns;
-        // The lever arm adds centripetal and tangential terms: mount kinematics, not base motion.
-        accel -= gyro.cross(&gyro.cross(&lever)) + self.lever_alpha.cross(&lever);
         if !self.initialized {
             self.check_config();
-            if gyro.norm() > imu_config.init_gyro_limit {
+            if gyro.norm() > self.config.imus[index].init_gyro_limit {
                 warn_throttled!(
                     std::time::Duration::from_secs(5),
+                    frame_id = %imu.frame_id,
                     gyro_norm = gyro.norm(),
-                    init_gyro_limit = imu_config.init_gyro_limit,
+                    init_gyro_limit = self.config.imus[index].init_gyro_limit,
                     "imu init deferred: waiting for the robot to hold still. Hold it \
                      still, or raise init_gyro_limit past the rate above.",
                 );
-                self.init_gyro_sum = Vector3::zeros();
-                self.init_accel_sum = Vector3::zeros();
-                self.init_samples = 0;
+                // The robot moved, which voids every IMU's average, not just this one's.
+                for runtime in &mut self.imu_runtime {
+                    runtime.init_gyro_sum = Vector3::zeros();
+                    runtime.init_accel_sum = Vector3::zeros();
+                    runtime.init_samples = 0;
+                }
                 return;
             }
-            self.init_gyro_sum += gyro;
-            self.init_accel_sum += accel;
-            self.init_samples += 1;
-            if self.init_samples >= imu_config.init_samples.max(1) as u64 {
-                let mean_accel = self.init_accel_sum / self.init_samples as f64;
-                let mean_gyro = self.init_gyro_sum / self.init_samples as f64;
+            {
+                let runtime = &mut self.imu_runtime[index];
+                runtime.init_gyro_sum += gyro;
+                runtime.init_accel_sum += accel;
+                runtime.init_samples += 1;
+            }
+            let all_ready = self
+                .imu_runtime
+                .iter()
+                .zip(&self.config.imus)
+                .all(|(runtime, config)| runtime.init_samples >= config.init_samples.max(1) as u64);
+            if all_ready {
+                let mean_accels: Vec<Vector3<f64>> = self
+                    .imu_runtime
+                    .iter()
+                    .map(|runtime| runtime.init_accel_sum / runtime.init_samples as f64)
+                    .collect();
                 // Stationary accel reads the specific force R^T (0,0,g): level so it maps to +z.
-                let world_from_body = UnitQuaternion::rotation_between(&mean_accel, &Vector3::z())
+                // Averaging over IMUs halves what one sensor's bias does to the leveling.
+                let combined: Vector3<f64> =
+                    mean_accels.iter().sum::<Vector3<f64>>() / mean_accels.len() as f64;
+                let world_from_body = UnitQuaternion::rotation_between(&combined, &Vector3::z())
                     .unwrap_or_default();
-                // Any stationary reading beyond g is accel bias; left at zero it dead-reckons z away.
-                let accel_bias = mean_accel
-                    - world_from_body.inverse_transform_vector(&Vector3::new(
-                        0.0,
-                        0.0,
-                        self.config.initial_gravity_estimate,
-                    ));
-                self.initialize(ts_ns, world_from_body, mean_gyro, accel_bias);
+                // Any stationary reading beyond g is that IMU's accel bias; left at zero it
+                // dead-reckons z away.
+                let expected = world_from_body.inverse_transform_vector(&Vector3::new(
+                    0.0,
+                    0.0,
+                    self.config.initial_gravity_estimate,
+                ));
+                let biases = self
+                    .imu_runtime
+                    .iter()
+                    .zip(&mean_accels)
+                    .map(|(runtime, mean_accel)| ImuBias {
+                        gyro: runtime.init_gyro_sum / runtime.init_samples as f64,
+                        accel: mean_accel - expected,
+                    })
+                    .collect();
+                self.initialize(ts_ns, world_from_body, biases);
             }
             return;
         }
-        self.insert(Event {
+        self.insert(Event::empty(
             ts_ns,
-            kind: EventKind::Imu { gyro, accel },
-            state: State::default(),
-            covariance: Mat15::identity(),
-            anchors: Vec::new(),
-            activity: Vec::new(),
-            last_imu_ns: 0,
-            last_gyro: Vector3::zeros(),
-        });
+            EventKind::Imu {
+                imu: index,
+                gyro,
+                accel,
+            },
+        ));
         self.imu_samples += 1;
     }
 
@@ -337,12 +397,7 @@ impl FusionCore {
                 return;
             }
             self.check_config();
-            self.initialize(
-                msg.timestamp_ns,
-                UnitQuaternion::identity(),
-                Vector3::zeros(),
-                Vector3::zeros(),
-            );
+            self.initialize(msg.timestamp_ns, UnitQuaternion::identity(), Vec::new());
         }
         let Some((source, source_config)) =
             self.config
@@ -398,16 +453,10 @@ impl FusionCore {
             self.previous_source_pose.insert(source, msg.pose);
         }
 
-        self.insert(Event {
-            ts_ns: msg.timestamp_ns,
-            kind: EventKind::Measurement(measurement),
-            state: State::default(),
-            covariance: Mat15::identity(),
-            anchors: Vec::new(),
-            activity: Vec::new(),
-            last_imu_ns: 0,
-            last_gyro: Vector3::zeros(),
-        });
+        self.insert(Event::empty(
+            msg.timestamp_ns,
+            EventKind::Measurement(measurement),
+        ));
         self.measurements += 1;
     }
 
@@ -419,63 +468,68 @@ impl FusionCore {
                 "an `odom_sources` entry needs both parent_frame_id and child_frame_id set"
             );
         }
-        let Some(imu) = &self.config.imu else {
-            return;
-        };
-        let frame_id = &imu.frame_id;
-        assert!(
-            !frame_id.trim().is_empty(),
-            "the configured imu needs its frame_id set"
-        );
-        assert!(
-            imu.gyro_noise_density > 0.0
-                && imu.gyro_random_walk > 0.0
-                && imu.accel_noise_density > 0.0
-                && imu.accel_random_walk > 0.0,
-            "imu {frame_id:?} needs all four noise figures set"
-        );
-        assert!(
-            imu.init_gyro_limit > 0.0,
-            "imu {frame_id:?} needs init_gyro_limit above zero or the filter never leaves init"
-        );
+        for (index, imu) in self.config.imus.iter().enumerate() {
+            let frame_id = &imu.frame_id;
+            assert!(
+                !frame_id.trim().is_empty(),
+                "every `imus` entry needs its frame_id set"
+            );
+            assert!(
+                self.config.imus[..index]
+                    .iter()
+                    .all(|other| other.frame_id != *frame_id),
+                "two `imus` entries share frame_id {frame_id:?}"
+            );
+            assert!(
+                imu.gyro_noise_density > 0.0
+                    && imu.gyro_random_walk > 0.0
+                    && imu.accel_noise_density > 0.0
+                    && imu.accel_random_walk > 0.0,
+                "imu {frame_id:?} needs all four noise figures set"
+            );
+            assert!(
+                imu.init_gyro_limit > 0.0,
+                "imu {frame_id:?} needs init_gyro_limit above zero or the filter never leaves init"
+            );
+        }
     }
 
     fn initialize(
         &mut self,
         timestamp_ns: i64,
         world_from_body: UnitQuaternion<f64>,
-        gyro_bias: Vector3<f64>,
-        accel_bias: Vector3<f64>,
+        biases: Vec<ImuBias>,
     ) {
-        self.filter.noise = self.imu_noise;
+        self.filter.noise = self
+            .config
+            .imus
+            .iter()
+            .map(|imu| eskf::Noise {
+                gyro_noise_density: imu.gyro_noise_density,
+                gyro_random_walk: imu.gyro_random_walk,
+                accel_noise_density: imu.accel_noise_density,
+                accel_random_walk: imu.accel_random_walk,
+            })
+            .collect();
         self.filter.gravity = self.config.initial_gravity_estimate;
+        let gyro_bias_norms: Vec<f64> = biases.iter().map(|bias| bias.gyro.norm()).collect();
         self.filter.init(
             world_from_body,
-            gyro_bias,
-            accel_bias,
-            self.config.initial_position_std,
-            self.config.initial_velocity_std,
-            self.config.initial_rotation_std,
-            self.config.initial_bias_std,
+            biases,
+            self.config.initial_stds.position,
+            self.config.initial_stds.velocity,
+            self.config.initial_stds.rotation,
+            self.config.initial_stds.bias,
         );
         self.anchors = vec![None; self.config.odom_sources.len()];
         self.activity = vec![SourceActivity::default(); self.config.odom_sources.len()];
         self.initialized = true;
         self.last_publish_ns = timestamp_ns;
-        let mut seed = Event {
-            ts_ns: timestamp_ns,
-            kind: EventKind::Seed,
-            state: State::default(),
-            covariance: Mat15::identity(),
-            anchors: Vec::new(),
-            activity: Vec::new(),
-            last_imu_ns: 0,
-            last_gyro: Vector3::zeros(),
-        };
+        let mut seed = Event::empty(timestamp_ns, EventKind::Seed);
         self.snapshot(&mut seed);
         self.events.push_back(seed);
         info!(
-            gyro_bias = gyro_bias.norm(),
+            gyro_biases = ?gyro_bias_norms,
             use_imu = self.config.use_imu(),
             "odometry_fusion initialized"
         );
@@ -516,23 +570,25 @@ impl FusionCore {
         {
             let previous = &self.events[index - 1];
             self.filter.x = previous.state.clone();
-            self.filter.p_cov = previous.covariance;
+            self.filter.p_cov = previous.covariance.clone();
             self.anchors = previous.anchors.clone();
             self.activity = previous.activity.clone();
             self.last_imu_ns = previous.last_imu_ns;
             self.last_gyro = previous.last_gyro;
+            self.last_gyro_imu = previous.last_gyro_imu;
         }
         let ts_ns = self.events[index].ts_ns;
         let kind = self.events[index].kind.clone();
         match kind {
             EventKind::Seed => {}
-            EventKind::Imu { gyro, accel } => {
+            EventKind::Imu { imu, gyro, accel } => {
                 let dt = (ts_ns - self.last_imu_ns) as f64 / 1.0e9;
                 if dt > 0.0 && dt < 1.0 {
-                    self.filter.propagate(dt, &gyro, &accel);
+                    self.filter.propagate(dt, imu, &gyro, &accel);
                 }
                 self.last_imu_ns = ts_ns;
                 self.last_gyro = gyro;
+                self.last_gyro_imu = imu;
             }
             EventKind::Measurement(measurement) => {
                 if self.config.use_imu() {
@@ -542,25 +598,13 @@ impl FusionCore {
                 }
             }
         }
-        let mut event = std::mem::replace(
-            &mut self.events[index],
-            Event {
-                ts_ns,
-                kind: EventKind::Seed,
-                state: State::default(),
-                covariance: Mat15::identity(),
-                anchors: Vec::new(),
-                activity: Vec::new(),
-                last_imu_ns: 0,
-                last_gyro: Vector3::zeros(),
-            },
-        );
+        let mut event = std::mem::replace(&mut self.events[index], Event::empty(ts_ns, EventKind::Seed));
         self.snapshot(&mut event);
         self.events[index] = event;
     }
 
     fn apply(&mut self, measurement: &Measurement) {
-        let mut rows: Vec<Vec15> = Vec::new();
+        let mut rows: Vec<DVector<f64>> = Vec::new();
         let mut residuals: Vec<f64> = Vec::new();
         let mut variances: Vec<f64> = Vec::new();
 
@@ -581,7 +625,7 @@ impl FusionCore {
             let rotation_residual = (self.filter.x.q.inverse() * target.rotation).scaled_axis();
             for dim in 0..3 {
                 if measurement.pose_variance[dim] > 0.0 {
-                    let mut row = Vec15::zeros();
+                    let mut row = DVector::zeros(self.filter.dim());
                     row[dim] = 1.0;
                     rows.push(row);
                     residuals.push(position_residual[dim]);
@@ -590,7 +634,7 @@ impl FusionCore {
             }
             for dim in 0..3 {
                 if measurement.pose_variance[3 + dim] > 0.0 {
-                    let mut row = Vec15::zeros();
+                    let mut row = DVector::zeros(self.filter.dim());
                     row[6 + dim] = 1.0;
                     rows.push(row);
                     residuals.push(rotation_residual[dim]);
@@ -677,13 +721,14 @@ impl FusionCore {
         ));
     }
 
-    /// Body-frame twist rows. Angular rate is not a state: it is predicted from the last gyro sample.
+    /// Body-frame twist rows. Angular rate is not a state: it is predicted from the last gyro
+    /// sample, so the gyro-bias row belongs to the IMU that sample came from.
     fn add_twist_rows(
         &self,
         linear: &Vector3<f64>,
         angular: &Vector3<f64>,
         variance: &[f64; 6],
-        rows: &mut Vec<Vec15>,
+        rows: &mut Vec<DVector<f64>>,
         residuals: &mut Vec<f64>,
         variances: &mut Vec<f64>,
     ) {
@@ -692,7 +737,7 @@ impl FusionCore {
         let velocity_skew = eskf::skew(&body_velocity);
         for dim in 0..3 {
             if variance[dim] > 0.0 {
-                let mut row = Vec15::zeros();
+                let mut row = DVector::zeros(self.filter.dim());
                 for col in 0..3 {
                     row[3 + col] = body_from_world.matrix()[(dim, col)];
                     row[6 + col] = velocity_skew[(dim, col)];
@@ -702,11 +747,12 @@ impl FusionCore {
                 variances.push(variance[dim]);
             }
         }
-        let predicted_angular = self.last_gyro - self.filter.x.gyro_bias;
+        let gyro_bias = self.filter.x.biases[self.last_gyro_imu].gyro;
+        let predicted_angular = self.last_gyro - gyro_bias;
         for dim in 0..3 {
             if variance[3 + dim] > 0.0 {
-                let mut row = Vec15::zeros();
-                row[9 + dim] = -1.0;
+                let mut row = DVector::zeros(self.filter.dim());
+                row[gyro_bias_col(self.last_gyro_imu) + dim] = -1.0;
                 rows.push(row);
                 residuals.push(angular[dim] - predicted_angular[dim]);
                 variances.push(variance[3 + dim]);
@@ -714,13 +760,13 @@ impl FusionCore {
         }
     }
 
-    fn update(&mut self, rows: &[Vec15], residuals: &[f64], variances: &[f64]) -> bool {
+    fn update(&mut self, rows: &[DVector<f64>], residuals: &[f64], variances: &[f64]) -> bool {
         if rows.is_empty() {
             return false;
         }
         let residual = DVector::from_row_slice(residuals);
         let variance = DVector::from_row_slice(variances);
-        let mut jacobian = Jacobian::zeros(rows.len());
+        let mut jacobian = Jacobian::zeros(rows.len(), self.filter.dim());
         for (index, row) in rows.iter().enumerate() {
             jacobian.row_mut(index).copy_from(&row.transpose());
         }
@@ -755,11 +801,12 @@ impl FusionCore {
 
     fn snapshot(&self, event: &mut Event) {
         event.state = self.filter.x.clone();
-        event.covariance = self.filter.p_cov;
+        event.covariance = self.filter.p_cov.clone();
         event.anchors = self.anchors.clone();
         event.activity = self.activity.clone();
         event.last_imu_ns = self.last_imu_ns;
         event.last_gyro = self.last_gyro;
+        event.last_gyro_imu = self.last_gyro_imu;
     }
 
     fn state_is_publishable(&self, state: &State) -> bool {
@@ -792,19 +839,28 @@ impl FusionCore {
         if !self.state_is_publishable(&state) {
             return None;
         }
-        let covariance = latest.covariance;
+        let covariance = latest.covariance.clone();
         let last_gyro = latest.last_gyro;
+        let last_gyro_imu = latest.last_gyro_imu;
         let ts_ns = latest.ts_ns;
 
         let body_from_world = state.q.inverse().to_rotation_matrix();
         let body_velocity = body_from_world * state.velocity;
-        let body_angular = last_gyro - state.gyro_bias;
+        // The predicted rate is the last gyro sample minus that IMU's own bias; without an
+        // IMU there is no rate estimate at all.
+        let gyro_bias = state
+            .biases
+            .get(last_gyro_imu)
+            .map(|bias| bias.gyro)
+            .unwrap_or_default();
+        let body_angular = last_gyro - gyro_bias;
 
-        let velocity_world = covariance.fixed_view::<3, 3>(3, 3).into_owned();
+        let velocity_world = covariance.view((3, 3), (3, 3)).into_owned();
         let velocity_body =
             body_from_world.matrix() * velocity_world * body_from_world.matrix().transpose();
         let mut pose_covariance = Matrix6::zeros();
         let mut twist_covariance = Matrix6::zeros();
+        let angular_block = (!state.biases.is_empty()).then(|| gyro_bias_col(last_gyro_imu));
         for row in 0..3 {
             for col in 0..3 {
                 pose_covariance[(row, col)] = covariance[(row, col)];
@@ -812,7 +868,9 @@ impl FusionCore {
                 pose_covariance[(row + 3, col)] = covariance[(row + 6, col)];
                 pose_covariance[(row + 3, col + 3)] = covariance[(row + 6, col + 6)];
                 twist_covariance[(row, col)] = velocity_body[(row, col)];
-                twist_covariance[(row + 3, col + 3)] = covariance[(row + 9, col + 9)];
+                if let Some(block) = angular_block {
+                    twist_covariance[(row + 3, col + 3)] = covariance[(block + row, block + col)];
+                }
             }
         }
 
@@ -857,22 +915,27 @@ mod tests {
             replay_buffer_seconds: 2.0,
             outlier_rejection_allowed_variance: 9.0,
             max_position_m: 10000.0,
-            imu: use_imu.then(|| ImuConfig {
-                frame_id: "imu".to_string(),
-                gyro_noise_density: 0.01,
-                gyro_random_walk: 0.001,
-                accel_noise_density: 0.1,
-                accel_random_walk: 0.01,
-                init_samples: 5,
-                init_gyro_limit: 0.05,
-            }),
+            imus: if use_imu {
+                vec![test_imu("imu")]
+            } else {
+                Vec::new()
+            },
             initial_gravity_estimate: GRAVITY,
-            initial_position_std: 0.1,
-            initial_velocity_std: 0.1,
-            initial_rotation_std: 0.05,
-            initial_bias_std: 0.01,
+            initial_stds: InitialStds::default(),
             odom_sources: one_source("odom"),
             constraint_twist_variances: [0.0; 6],
+        }
+    }
+
+    fn test_imu(frame_id: &str) -> ImuConfig {
+        ImuConfig {
+            frame_id: frame_id.to_string(),
+            gyro_noise_density: 0.01,
+            gyro_random_walk: 0.001,
+            accel_noise_density: 0.1,
+            accel_random_walk: 0.01,
+            init_samples: 5,
+            init_gyro_limit: 0.05,
         }
     }
 
@@ -974,6 +1037,39 @@ mod tests {
             core.handle_imu(&stray, &identity_mount());
         }
         assert!(!core.initialized);
+    }
+
+    #[test]
+    fn init_waits_until_every_imu_has_its_samples() {
+        let mut config = base_config(true);
+        config.imus.push(test_imu("imu2"));
+        let mut core = FusionCore::new(config);
+        for sample in 0..20 {
+            core.handle_imu(
+                &imu_message(sample * NS_PER_SEC / 100, 0.0, 0.0),
+                &identity_mount(),
+            );
+        }
+        assert!(!core.initialized, "the second imu has produced nothing yet");
+    }
+
+    #[test]
+    fn two_imus_calibrate_their_own_biases_at_init() {
+        let mut config = base_config(true);
+        config.imus.push(test_imu("imu2"));
+        let mut core = FusionCore::new(config);
+        for sample in 0..5_i64 {
+            let ts_ns = sample * NS_PER_SEC / 100;
+            core.handle_imu(&imu_message(ts_ns, 0.0, 0.0), &identity_mount());
+            let mut second = imu_message(ts_ns + NS_PER_SEC / 200, 0.0, 0.0);
+            second.frame_id = "imu2".to_string();
+            second.angular_velocity = Vector3::new(0.02, 0.0, 0.0); // this gyro alone is biased
+            core.handle_imu(&second, &identity_mount());
+        }
+        assert!(core.initialized);
+        assert_eq!(core.filter.x.biases.len(), 2);
+        assert!(core.filter.x.biases[0].gyro.norm() < 1e-9);
+        assert!((core.filter.x.biases[1].gyro.x - 0.02).abs() < 1e-9);
     }
 
     #[test]

@@ -16,12 +16,15 @@ the per-platform SDK packaging live in
   set to this machine's default.
 
 ```rust
-use dim_slam::{FusionCore, OdometryFusionConfig};
+use dim_slam::{FusionCore, OdometryFusionConfig, SourceConfig};
 
 let mut fusion = FusionCore::new(OdometryFusionConfig {
-    source_frames: vec!["visual_odom".into()],
-    source_pose_variances: vec![1e-4; 6],
-    source_twist_variances: vec![0.0; 6],
+    odom_sources: vec![SourceConfig {
+        parent_frame_id: "visual_odom".into(),
+        child_frame_id: "base_link".into(),
+        pose_variances: [1e-4; 6],
+        ..Default::default()
+    }],
     ..Default::default()
 });
 fusion.handle_source(&visual_odometry);
