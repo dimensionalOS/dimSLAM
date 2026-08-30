@@ -290,7 +290,12 @@ mod tests {
         filter.propagate(0.01, 0, &Vector3::zeros(), &static_accel());
         let residual = DVector::from_vec(vec![1.0, 0.0, 0.0]);
         let variance = DVector::from_element(3, 1e-4);
-        assert!(filter.update(&residual, &position_jacobian(3, filter.dim()), &variance, 0.0));
+        assert!(filter.update(
+            &residual,
+            &position_jacobian(3, filter.dim()),
+            &variance,
+            0.0
+        ));
         assert!(filter.x.position.x > 0.9);
         assert!(filter.p_cov.trace() < 15.0);
     }
@@ -308,7 +313,12 @@ mod tests {
                 -filter.x.position.z,
             ]);
             let variance = DVector::from_element(3, 1e-6);
-            filter.update(&residual, &position_jacobian(3, filter.dim()), &variance, 0.0);
+            filter.update(
+                &residual,
+                &position_jacobian(3, filter.dim()),
+                &variance,
+                0.0,
+            );
         }
         assert!(filter.x.velocity.x.abs() < 0.1);
     }
@@ -319,7 +329,12 @@ mod tests {
         filter.propagate(0.01, 0, &Vector3::zeros(), &static_accel());
         let variance = DVector::from_element(3, 1e-4);
         let outlier = DVector::from_vec(vec![100.0, 0.0, 0.0]);
-        assert!(!filter.update(&outlier, &position_jacobian(3, filter.dim()), &variance, 3.0));
+        assert!(!filter.update(
+            &outlier,
+            &position_jacobian(3, filter.dim()),
+            &variance,
+            3.0
+        ));
         let inlier = DVector::from_vec(vec![0.01, 0.0, 0.0]);
         assert!(filter.update(&inlier, &position_jacobian(3, filter.dim()), &variance, 3.0));
     }
@@ -329,7 +344,12 @@ mod tests {
         let mut filter = level_filter();
         let variance = DVector::from_element(3, 1e-4);
         let outlier = DVector::from_vec(vec![100.0, 0.0, 0.0]);
-        assert!(filter.update(&outlier, &position_jacobian(3, filter.dim()), &variance, 0.0));
+        assert!(filter.update(
+            &outlier,
+            &position_jacobian(3, filter.dim()),
+            &variance,
+            0.0
+        ));
     }
 
     #[test]
