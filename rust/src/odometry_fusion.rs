@@ -113,7 +113,7 @@ pub struct OdometryFusionConfig {
     pub odom_sources: Vec<SourceConfig>,
     /// Virtual zero-twist [vx vy vz wx wy wz] fused after each source update (needs an IMU):
     /// >0 pins that dimension to zero with this variance (e.g. non-holonomic vy, vz), 0 frees it.
-    pub constraint_twist_variances: [f64; 6],
+    pub per_dimension_error_variance: [f64; 6],
 }
 
 /// 1-sigma uncertainty the filter starts with, per state block. The bias std applies to
@@ -158,7 +158,7 @@ impl Default for OdometryFusionConfig {
             initial_gravity_estimate: 9.8,
             initial_stds: InitialStds::default(),
             odom_sources: Vec::new(),
-            constraint_twist_variances: [0.0; 6],
+            per_dimension_error_variance: [0.0; 6],
         }
     }
 }
@@ -358,8 +358,8 @@ impl FusionCore {
                 // Averaging over IMUs halves what one sensor's bias does to the leveling.
                 let combined: Vector3<f64> =
                     mean_accels.iter().sum::<Vector3<f64>>() / mean_accels.len() as f64;
-                let world_from_body = UnitQuaternion::rotation_between(&combined, &Vector3::z())
-                    .unwrap_or_default();
+                let world_from_body =
+                    UnitQuaternion::rotation_between(&combined, &Vector3::z()).unwrap_or_default();
                 // Any stationary reading beyond g is that IMU's accel bias; left at zero it
                 // dead-reckons z away.
                 let expected = world_from_body.inverse_transform_vector(&Vector3::new(
@@ -598,7 +598,10 @@ impl FusionCore {
                 }
             }
         }
-        let mut event = std::mem::replace(&mut self.events[index], Event::empty(ts_ns, EventKind::Seed));
+        let mut event = std::mem::replace(
+            &mut self.events[index],
+            Event::empty(ts_ns, EventKind::Seed),
+        );
         self.snapshot(&mut event);
         self.events[index] = event;
     }
@@ -657,7 +660,7 @@ impl FusionCore {
             self.anchor(measurement.source);
         }
 
-        let constraint_variance = self.config.constraint_twist_variances;
+        let constraint_variance = self.config.per_dimension_error_variance;
         let mut constraint_rows = Vec::new();
         let mut constraint_residuals = Vec::new();
         let mut constraint_variances = Vec::new();
@@ -923,7 +926,7 @@ mod tests {
             initial_gravity_estimate: GRAVITY,
             initial_stds: InitialStds::default(),
             odom_sources: one_source("odom"),
-            constraint_twist_variances: [0.0; 6],
+            per_dimension_error_variance: [0.0; 6],
         }
     }
 
