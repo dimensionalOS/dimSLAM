@@ -113,7 +113,14 @@ mod tests {
         let mut depth = make_depth(8, 6);
         set_pixel(&mut depth, 3, 2, 1500);
         let mut out = ImageFrame::default();
-        reproject_depth(&depth, &info, &info, &Isometry3::identity(), UNITS_PER_METER, &mut out);
+        reproject_depth(
+            &depth,
+            &info,
+            &info,
+            &Isometry3::identity(),
+            UNITS_PER_METER,
+            &mut out,
+        );
         assert_eq!(get_pixel(&out, 3, 2), 1500);
         let total: u64 = (0..6)
             .flat_map(|v| (0..8).map(move |u| (u, v)))
@@ -128,10 +135,19 @@ mod tests {
         let info = make_info(32, 32, 100.0);
         let mut depth = make_depth(32, 32);
         set_pixel(&mut depth, 16, 16, 1000);
-        let camera_from_depth =
-            Isometry3::from_parts(Translation3::new(-0.1, 0.0, 0.0), UnitQuaternion::identity());
+        let camera_from_depth = Isometry3::from_parts(
+            Translation3::new(-0.1, 0.0, 0.0),
+            UnitQuaternion::identity(),
+        );
         let mut out = ImageFrame::default();
-        reproject_depth(&depth, &info, &info, &camera_from_depth, UNITS_PER_METER, &mut out);
+        reproject_depth(
+            &depth,
+            &info,
+            &info,
+            &camera_from_depth,
+            UNITS_PER_METER,
+            &mut out,
+        );
         assert_eq!(get_pixel(&out, 6, 16), 1000);
     }
 
@@ -162,10 +178,19 @@ mod tests {
         let info = make_info(8, 8, 100.0);
         let mut depth = make_depth(8, 8);
         set_pixel(&mut depth, 4, 4, 500);
-        let camera_from_depth =
-            Isometry3::from_parts(Translation3::new(0.0, 0.0, -1.0), UnitQuaternion::identity());
+        let camera_from_depth = Isometry3::from_parts(
+            Translation3::new(0.0, 0.0, -1.0),
+            UnitQuaternion::identity(),
+        );
         let mut out = ImageFrame::default();
-        reproject_depth(&depth, &info, &info, &camera_from_depth, UNITS_PER_METER, &mut out);
+        reproject_depth(
+            &depth,
+            &info,
+            &info,
+            &camera_from_depth,
+            UNITS_PER_METER,
+            &mut out,
+        );
         assert!(out.data.iter().all(|byte| *byte == 0));
     }
 }

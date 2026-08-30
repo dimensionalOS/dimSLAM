@@ -46,7 +46,13 @@ pub fn to_distortion(info: &CameraModel) -> (u8, Vec<f32>) {
     }
     (
         CUV_DISTORTION_BROWN,
-        vec![d[0] as f32, d[1] as f32, d[4] as f32, d[2] as f32, d[3] as f32],
+        vec![
+            d[0] as f32,
+            d[1] as f32,
+            d[4] as f32,
+            d[2] as f32,
+            d[3] as f32,
+        ],
     )
 }
 

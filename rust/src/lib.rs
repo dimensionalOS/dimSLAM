@@ -10,15 +10,17 @@
 //!
 //! ```
 //! use dim_slam::nalgebra::Isometry3;
-//! use dim_slam::{FusionCore, OdometryEstimate, OdometryFusionConfig, SourceConfig, SourceKey};
+//! use dim_slam::{FusionCore, OdometryEstimate, OdometryFusionConfig, SourceConfig};
 //!
-//! // Per-source, per-camera and per-IMU settings are keyed by the frames they belong to. A
-//! // source's key is the transform its estimates carry, written "parent_frame->child_frame".
+//! // An odometry source is identified by the transform its estimates carry:
+//! // the message's frame_id -> child_frame_id.
 //! let mut fusion = FusionCore::new(OdometryFusionConfig {
-//!     sources: [("visual_odom->base_link".parse::<SourceKey>().unwrap(), SourceConfig {
+//!     odom_sources: vec![SourceConfig {
+//!         parent_frame_id: "visual_odom".into(),
+//!         child_frame_id: "base_link".into(),
 //!         pose_variances: [1e-4; 6],
 //!         twist_variances: [0.0; 6],
-//!     })].into(),
+//!     }],
 //!     ..Default::default()
 //! });
 //! for (step, timestamp_ns) in [0, 20_000_000, 40_000_000].into_iter().enumerate() {
@@ -41,7 +43,7 @@ pub mod odometry_fusion;
 pub mod types;
 
 pub use cuvslam_odometry::{CameraConfig, CuvslamCore, CuvslamOdometryConfig};
-pub use odometry_fusion::{FusionCore, ImuConfig, OdometryFusionConfig, SourceConfig, SourceKey};
+pub use odometry_fusion::{FusionCore, ImuConfig, OdometryFusionConfig, SourceConfig};
 pub use types::{
     CameraModel, ImageFrame, ImuNoiseModel, ImuSample, OdometryEstimate, PointCloud, TfLookup,
     Twist,

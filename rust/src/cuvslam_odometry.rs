@@ -7,7 +7,7 @@ mod depth_cloud;
 mod depth_reproject;
 mod msg_convert;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -111,11 +111,13 @@ fn image_encoding(encoding: &str) -> u8 {
     }
 }
 
-/// Per-camera settings, keyed by the frame_id its images carry. A depth stream is a camera of its
-/// own here: it is looked up under the depth image's frame_id, which need not be a rig camera.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+/// Per-camera settings. A depth stream is a camera of its own here: it is looked up under the
+/// depth image's frame_id, which need not be a rig camera.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CameraConfig {
+    /// The frame_id this camera's images carry.
+    pub frame_id: String,
     /// cuVSLAM takes one rectified flag for the whole rig, so the rig cameras must agree.
     pub rectified: bool,
     /// Raw depth units per metre. 1000 for sixteen-bit millimetres. Depth streams only.
@@ -131,6 +133,7 @@ pub struct CameraConfig {
 impl Default for CameraConfig {
     fn default() -> Self {
         Self {
+            frame_id: String::new(),
             rectified: true,
             depth_units_per_meter: 1000.0,
             depth_cloud_min_range: 0.0,
@@ -145,11 +148,10 @@ impl Default for CameraConfig {
 pub struct CuvslamOdometryConfig {
     /// "stereo", "mono" or "rgbd". Mono is accurate only up to scale.
     pub camera_mode: String,
-    /// One tf frame per camera in cuVSLAM's index order; empty discovers them off camera_info.
-    /// Separate from `cameras` because a JSON object's key order does not survive deserialization.
-    pub camera_frames: Vec<String>,
-    /// Keyed by image frame_id; an absent camera falls back to `CameraConfig::default`.
-    pub cameras: BTreeMap<String, CameraConfig>,
+    /// In cuVSLAM's index order: the first entries are the rig (two for stereo, one otherwise)
+    /// and any later ones carry settings for non-rig streams such as an rgbd depth camera.
+    /// Empty discovers the rig off camera_info; an unlisted camera takes `CameraConfig::default`.
+    pub cameras: Vec<CameraConfig>,
     /// Needs a libcuvslam built with ENFORCE_GPU=OFF; stock SDK binaries are GPU-only.
     pub use_gpu: bool,
     /// Frame stamped on the emitted odometry; the tracker's world, drifting freely.
@@ -178,8 +180,7 @@ impl Default for CuvslamOdometryConfig {
     fn default() -> Self {
         Self {
             camera_mode: "stereo".to_string(),
-            camera_frames: Vec::new(),
-            cameras: BTreeMap::new(),
+            cameras: Vec::new(),
             use_gpu: true,
             odom_frame_id: "odom".to_string(),
             output_frame_id: "base_link".to_string(),
@@ -252,6 +253,16 @@ impl CuvslamCore {
     /// `camera_mode` used to become mono and quietly halve the accuracy.
     pub fn new(config: CuvslamOdometryConfig) -> Result<Self, String> {
         let mode = Mode::from_str(&config.camera_mode)?;
+        let rig_size = if mode == Mode::Stereo { 2 } else { 1 };
+        if !config.cameras.is_empty() && config.cameras.len() < rig_size {
+            return Err(format!(
+                "config: camera_mode '{}' needs {} rig cameras but `cameras` lists {}; \
+                 the rig comes first in the list",
+                config.camera_mode,
+                rig_size,
+                config.cameras.len()
+            ));
+        }
         if config.enable_imu && mode != Mode::Stereo {
             return Err(format!(
                 "config: enable_imu requires camera_mode 'stereo'; cuVSLAM has no inertial \
@@ -317,21 +328,27 @@ impl CuvslamCore {
         if !self.cameras.is_empty() {
             return;
         }
-        let discovered = self.config.camera_frames.is_empty();
-        let mut frames = self.config.camera_frames.clone();
+        let discovered = self.config.cameras.is_empty();
+        let rig_size = if self.mode == Mode::Stereo { 2 } else { 1 };
+        let mut frames: Vec<String> = self
+            .config
+            .cameras
+            .iter()
+            .take(rig_size)
+            .map(|camera| camera.frame_id.clone())
+            .collect();
         if discovered {
             frames.extend(self.camera_info_by_frame.keys().cloned());
             // camera_info has no order of its own, and the rig is indexed.
             frames.sort();
-            let expected = if self.mode == Mode::Stereo { 2 } else { 1 };
-            if frames.len() != expected {
-                if frames.len() > expected {
+            if frames.len() != rig_size {
+                if frames.len() > rig_size {
                     error_throttled!(
                         Duration::from_secs(10),
                         found = frames.join(", "),
                         mode = %self.config.camera_mode,
                         "cuvslam found more cameras on camera_info than camera_mode uses, \
-                         and they have no discoverable order. Set camera_frames.",
+                         and they have no discoverable order. List them in `cameras`.",
                     );
                 }
                 return;
@@ -369,13 +386,23 @@ impl CuvslamCore {
     }
 
     fn camera_config(&self, frame_id: &str) -> CameraConfig {
-        self.config.cameras.get(frame_id).copied().unwrap_or_default()
+        self.config
+            .cameras
+            .iter()
+            .find(|camera| camera.frame_id == frame_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Worth a warning where the plain lookup is not: the default scale is right for the common
     /// sixteen-bit-millimetre sensor and silently ruins every reading from anything else.
     fn depth_config(&self, frame_id: &str) -> CameraConfig {
-        if !self.config.cameras.contains_key(frame_id) {
+        if !self
+            .config
+            .cameras
+            .iter()
+            .any(|camera| camera.frame_id == frame_id)
+        {
             warn_throttled!(
                 Duration::from_secs(30),
                 frame_id = %frame_id,
@@ -395,7 +422,11 @@ impl CuvslamCore {
             .first()
             .map(|camera| self.camera_config(&camera.frame).rectified)
             .unwrap_or(true);
-        if self.cameras.iter().any(|camera| self.camera_config(&camera.frame).rectified != rectified) {
+        if self
+            .cameras
+            .iter()
+            .any(|camera| self.camera_config(&camera.frame).rectified != rectified)
+        {
             // Only reachable while building the tracker, which happens once.
             error!(
                 using = rectified,
@@ -449,8 +480,8 @@ impl CuvslamCore {
                 frame_id = %img.frame_id,
                 dropped = self.unplaced_images,
                 rig_cameras = self.cameras.len(),
-                "cuvslam dropping image with a frame_id not on the rig. Add the frame to \
-                 camera_frames, or stop publishing that image.",
+                "cuvslam dropping image with a frame_id not on the rig. List the frame in \
+                 `cameras`, or stop publishing that image.",
             );
             return None;
         };
@@ -640,7 +671,12 @@ impl CuvslamCore {
         if mode == Mode::Rgbd {
             // try_track only reaches here with a depth image in hand, so its own frame_id picks the
             // scale. cuVSLAM's RGBD mode takes one scale because it takes one depth camera.
-            let depth_frame = self.depth.as_ref().expect("checked by try_track").frame_id.clone();
+            let depth_frame = self
+                .depth
+                .as_ref()
+                .expect("checked by try_track")
+                .frame_id
+                .clone();
             tracker_config.rgbd_depth_scale_factor =
                 self.depth_config(&depth_frame).depth_units_per_meter as f32;
             // align_depth delivers in cameras[0]'s frame; the -1 default silently ignores depth.

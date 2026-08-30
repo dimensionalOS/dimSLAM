@@ -34,7 +34,6 @@ pub struct CameraModel {
     pub intrinsics: [f64; 9],
 }
 
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImuSample {
     pub timestamp_ns: i64,

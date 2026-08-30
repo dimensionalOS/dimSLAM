@@ -17,7 +17,11 @@ pub fn depth_cloud(
 ) {
     let (fx, fy) = (depth_info.intrinsics[0], depth_info.intrinsics[4]);
     let (cx, cy) = (depth_info.intrinsics[2], depth_info.intrinsics[5]);
-    let far = if max_range > 0.0 { max_range } else { f64::INFINITY };
+    let far = if max_range > 0.0 {
+        max_range
+    } else {
+        f64::INFINITY
+    };
     let near_raw = (min_range * units_per_meter).ceil().max(1.0) as u16;
     let far_raw = (far * units_per_meter).min(u16::MAX as f64).floor() as u16;
     let kernel = decimation.max(1) as i32;

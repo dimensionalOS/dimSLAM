@@ -16,10 +16,10 @@ pub fn skew(v: &Vector3<f64>) -> Matrix3<f64> {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Noise {
-    pub gyro_noise_density: f64,   // rad/s/sqrt(Hz)
-    pub gyro_random_walk: f64,     // rad/s^2/sqrt(Hz)
-    pub accel_noise_density: f64,  // m/s^2/sqrt(Hz)
-    pub accel_random_walk: f64,    // m/s^3/sqrt(Hz)
+    pub gyro_noise_density: f64,  // rad/s/sqrt(Hz)
+    pub gyro_random_walk: f64,    // rad/s^2/sqrt(Hz)
+    pub accel_noise_density: f64, // m/s^2/sqrt(Hz)
+    pub accel_random_walk: f64,   // m/s^3/sqrt(Hz)
 }
 
 #[derive(Clone, Debug)]
@@ -277,7 +277,11 @@ mod tests {
         for _ in 0..50 {
             filter.propagate(0.01, &Vector3::zeros(), &static_accel());
             // The truth stays at the origin, so the residual is minus the estimate.
-            let residual = DVector::from_vec(vec![-filter.x.position.x, -filter.x.position.y, -filter.x.position.z]);
+            let residual = DVector::from_vec(vec![
+                -filter.x.position.x,
+                -filter.x.position.y,
+                -filter.x.position.z,
+            ]);
             let variance = DVector::from_element(3, 1e-6);
             filter.update(&residual, &position_jacobian(3), &variance, 0.0);
         }

@@ -448,7 +448,7 @@ impl CuvslamOdometry {
 }
 
 /// The error-state Kalman fuser. `config` mirrors the Rust `OdometryFusionConfig`
-/// as a dict; `sources` keys are "parent->child" strings.
+/// as a dict; `odom_sources` entries name their parent_frame_id and child_frame_id.
 #[pyclass]
 struct OdometryFusion {
     core: FusionCore,

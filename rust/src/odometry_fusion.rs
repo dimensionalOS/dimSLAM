@@ -6,7 +6,7 @@
 
 mod eskf;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use nalgebra::{DVector, Isometry3, Matrix6, Translation3, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,10 @@ fn resolve_variance(configured: f64, from_message: f64) -> f64 {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SourceConfig {
+    /// The transform this source's estimates carry. Both halves are needed: two sources can
+    /// share a parent.
+    pub parent_frame_id: String,
+    pub child_frame_id: String,
     /// [x y z roll pitch yaw]: <0 message covariance, 0 drop, >0 fixed.
     /// A drifting source's covariance describes accumulated drift, not the delta: prefer a fixed value.
     pub pose_variances: [f64; 6],
@@ -46,56 +50,13 @@ pub struct SourceConfig {
     pub twist_variances: [f64; 6],
 }
 
-/// The transform an odometry source reports, written `"parent_frame_id->child_frame_id"` so it
-/// can be a JSON object key. Both halves are needed: two sources can share a parent.
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SourceKey {
-    pub parent_frame_id: String,
-    pub child_frame_id: String,
-}
-
-impl std::fmt::Display for SourceKey {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}->{}", self.parent_frame_id, self.child_frame_id)
-    }
-}
-
-impl std::str::FromStr for SourceKey {
-    type Err = String;
-
-    fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let (parent_frame_id, child_frame_id) = text.split_once("->").ok_or_else(|| {
-            format!(
-                "odometry source key {text:?} must be written \"parent_frame_id->child_frame_id\""
-            )
-        })?;
-        if parent_frame_id.trim().is_empty() || child_frame_id.trim().is_empty() {
-            return Err(format!("odometry source key {text:?} has an empty frame"));
-        }
-        Ok(Self {
-            parent_frame_id: parent_frame_id.trim().to_string(),
-            child_frame_id: child_frame_id.trim().to_string(),
-        })
-    }
-}
-
-impl Serialize for SourceKey {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-
-impl<'de> Deserialize<'de> for SourceKey {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        String::deserialize(deserializer)?.parse().map_err(serde::de::Error::custom)
-    }
-}
-
-/// These all describe the physical IMU, so they are keyed by the frame_id its samples carry
-/// rather than baked into the filter's own config.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+/// These all describe the physical IMU rather than the filter itself, so they live together
+/// in one object.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImuConfig {
+    /// The frame_id the IMU's samples carry; samples from any other frame are dropped.
+    pub frame_id: String,
     pub gyro_noise_density: f64,
     pub gyro_random_walk: f64,
     pub accel_noise_density: f64,
@@ -112,6 +73,7 @@ pub struct ImuConfig {
 impl Default for ImuConfig {
     fn default() -> Self {
         Self {
+            frame_id: String::new(),
             gyro_noise_density: 0.0,
             gyro_random_walk: 0.0,
             accel_noise_density: 0.0,
@@ -137,20 +99,19 @@ pub struct OdometryFusionConfig {
     pub outlier_rejection_allowed_variance: f64,
     /// Gate on the filter's own state, which can run away with no bad measurement; 0 disables.
     pub max_position_m: f64,
-    /// Keyed by the frame_id an IMU's samples carry. Empty disables the IMU: the filter bypasses
-    /// the Kalman machinery and seeds level from the first source message (see `blend`). Otherwise
-    /// exactly one entry, since the filter propagates on a single IMU, and its four noise figures
-    /// must all be above zero.
-    pub imus: BTreeMap<String, ImuConfig>,
+    /// None disables the IMU: the filter bypasses the Kalman machinery and seeds level from the
+    /// first source message (see `blend`). The filter propagates on a single IMU, and a
+    /// configured one needs its frame_id and all four noise figures set.
+    pub imu: Option<ImuConfig>,
     /// m/s^2. Seeds `filter.gravity` at init; a future ZUPT is meant to refine it from there.
     pub initial_gravity_estimate: f64,
     pub initial_position_std: f64,
     pub initial_velocity_std: f64,
     pub initial_rotation_std: f64,
     pub initial_bias_std: f64,
-    /// Keyed by the transform a source's estimates carry. Ordered, not hashed: the blend sums in
-    /// iteration order and floating-point addition is not associative.
-    pub sources: BTreeMap<SourceKey, SourceConfig>,
+    /// One entry per external odometry stream, told apart by the transform its estimates carry.
+    /// The no-IMU blend sums in list order, so the order is part of the config.
+    pub odom_sources: Vec<SourceConfig>,
     /// Virtual zero-twist [vx vy vz wx wy wz] fused after each source update (needs an IMU):
     /// >0 pins that dimension to zero with this variance (e.g. non-holonomic vy, vz), 0 frees it.
     pub constraint_twist_variances: [f64; 6],
@@ -158,7 +119,7 @@ pub struct OdometryFusionConfig {
 
 impl OdometryFusionConfig {
     pub fn use_imu(&self) -> bool {
-        !self.imus.is_empty()
+        self.imu.is_some()
     }
 }
 
@@ -172,13 +133,13 @@ impl Default for OdometryFusionConfig {
             replay_buffer_seconds: 0.5,
             outlier_rejection_allowed_variance: 25.0,
             max_position_m: 0.0,
-            imus: BTreeMap::new(),
+            imu: None,
             initial_gravity_estimate: 9.8,
             initial_position_std: 0.1,
             initial_velocity_std: 0.1,
             initial_rotation_std: 0.05,
             initial_bias_std: 0.01,
-            sources: BTreeMap::new(),
+            odom_sources: Vec::new(),
             constraint_twist_variances: [0.0; 6],
         }
     }
@@ -231,8 +192,8 @@ struct Event {
 pub struct FusionCore {
     config: OdometryFusionConfig,
     filter: Filter,
-    /// Taken from the configured IMU the samples actually come from, so `initialize` does not have
-    /// to guess which entry of `config.imus` is live.
+    /// Taken from `config.imu` at the first accepted sample, so `initialize` need not look
+    /// it up again.
     imu_noise: eskf::Noise,
     initialized: bool,
     init_gyro_sum: Vector3<f64>,
@@ -286,11 +247,16 @@ impl FusionCore {
 
     /// The filter's body frame is output_frame_id, so both IMU vectors go through the mount.
     pub fn handle_imu(&mut self, imu: &ImuSample, base_from_imu: &Isometry3<f64>) {
-        let Some(&imu_config) = self.config.imus.get(&imu.frame_id) else {
+        let Some(imu_config) = self
+            .config
+            .imu
+            .clone()
+            .filter(|configured| configured.frame_id == imu.frame_id)
+        else {
             warn_throttled!(
                 std::time::Duration::from_secs(5),
                 frame_id = %imu.frame_id,
-                "imu from unconfigured frame_id dropped. Add an `imus` entry keyed by it.",
+                "imu from an unconfigured frame_id dropped. Set `imu.frame_id` to it.",
             );
             return;
         };
@@ -378,17 +344,22 @@ impl FusionCore {
                 Vector3::zeros(),
             );
         }
-        let Some((source, (_, source_config))) = self.config.sources.iter().enumerate().find(
-            |(_, (key, _))| {
-                key.parent_frame_id == msg.frame_id && key.child_frame_id == msg.child_frame_id
-            },
-        ) else {
+        let Some((source, source_config)) =
+            self.config
+                .odom_sources
+                .iter()
+                .enumerate()
+                .find(|(_, source_config)| {
+                    source_config.parent_frame_id == msg.frame_id
+                        && source_config.child_frame_id == msg.child_frame_id
+                })
+        else {
             warn_throttled!(
                 std::time::Duration::from_secs(5),
                 frame_id = %msg.frame_id,
                 child_frame_id = %msg.child_frame_id,
-                "odometry from an unconfigured transform dropped. Add \
-                 \"<frame_id>-><child_frame_id>\" to `sources`.",
+                "odometry from an unconfigured transform dropped. Add an `odom_sources` entry \
+                 with this parent_frame_id and child_frame_id.",
             );
             return;
         };
@@ -441,15 +412,21 @@ impl FusionCore {
     }
 
     fn check_config(&self) {
-        if self.config.imus.is_empty() {
-            return;
+        for source in &self.config.odom_sources {
+            assert!(
+                !source.parent_frame_id.trim().is_empty()
+                    && !source.child_frame_id.trim().is_empty(),
+                "an `odom_sources` entry needs both parent_frame_id and child_frame_id set"
+            );
         }
-        assert_eq!(
-            self.config.imus.len(),
-            1,
-            "the filter propagates on a single imu: configure exactly one, or none to disable"
+        let Some(imu) = &self.config.imu else {
+            return;
+        };
+        let frame_id = &imu.frame_id;
+        assert!(
+            !frame_id.trim().is_empty(),
+            "the configured imu needs its frame_id set"
         );
-        let (frame_id, imu) = self.config.imus.iter().next().expect("length checked above");
         assert!(
             imu.gyro_noise_density > 0.0
                 && imu.gyro_random_walk > 0.0
@@ -481,8 +458,8 @@ impl FusionCore {
             self.config.initial_rotation_std,
             self.config.initial_bias_std,
         );
-        self.anchors = vec![None; self.config.sources.len()];
-        self.activity = vec![SourceActivity::default(); self.config.sources.len()];
+        self.anchors = vec![None; self.config.odom_sources.len()];
+        self.activity = vec![SourceActivity::default(); self.config.odom_sources.len()];
         self.initialized = true;
         self.last_publish_ns = timestamp_ns;
         let mut seed = Event {
@@ -667,7 +644,9 @@ impl FusionCore {
             };
         }
 
-        let Some(increment) = measurement.delta else { return };
+        let Some(increment) = measurement.delta else {
+            return;
+        };
 
         let horizon = ts_ns - (SOURCE_ACTIVITY_TIMEOUT_SECONDS * 1.0e9) as i64;
         let mut share = [0.0; 6];
@@ -878,46 +857,32 @@ mod tests {
             replay_buffer_seconds: 2.0,
             outlier_rejection_allowed_variance: 9.0,
             max_position_m: 10000.0,
-            imus: if use_imu {
-                BTreeMap::from([(
-                    "imu".to_string(),
-                    ImuConfig {
-                        gyro_noise_density: 0.01,
-                        gyro_random_walk: 0.001,
-                        accel_noise_density: 0.1,
-                        accel_random_walk: 0.01,
-                        init_samples: 5,
-                        init_gyro_limit: 0.05,
-                    },
-                )])
-            } else {
-                BTreeMap::new()
-            },
+            imu: use_imu.then(|| ImuConfig {
+                frame_id: "imu".to_string(),
+                gyro_noise_density: 0.01,
+                gyro_random_walk: 0.001,
+                accel_noise_density: 0.1,
+                accel_random_walk: 0.01,
+                init_samples: 5,
+                init_gyro_limit: 0.05,
+            }),
             initial_gravity_estimate: GRAVITY,
             initial_position_std: 0.1,
             initial_velocity_std: 0.1,
             initial_rotation_std: 0.05,
             initial_bias_std: 0.01,
-            sources: one_source("odom"),
+            odom_sources: one_source("odom"),
             constraint_twist_variances: [0.0; 6],
         }
     }
 
-    fn source_key(parent_frame_id: &str) -> SourceKey {
-        SourceKey {
+    fn one_source(parent_frame_id: &str) -> Vec<SourceConfig> {
+        vec![SourceConfig {
             parent_frame_id: parent_frame_id.to_string(),
             child_frame_id: "base".to_string(),
-        }
-    }
-
-    fn one_source(parent_frame_id: &str) -> BTreeMap<SourceKey, SourceConfig> {
-        BTreeMap::from([(
-            source_key(parent_frame_id),
-            SourceConfig {
-                pose_variances: [1e-4; 6],
-                twist_variances: [0.0; 6],
-            },
-        )])
+            pose_variances: [1e-4; 6],
+            twist_variances: [0.0; 6],
+        }]
     }
 
     fn source_message(parent_frame_id: &str, ts_ns: i64, x: f64) -> OdometryEstimate {
@@ -959,7 +924,7 @@ mod tests {
     #[test]
     fn a_drifting_source_contributes_only_its_delta() {
         let mut config = base_config(false);
-        config.sources = one_source("visual_odom");
+        config.odom_sources = one_source("visual_odom");
         let mut core = FusionCore::new(config);
         core.handle_source(&source_message("visual_odom", 0, 10.0));
         core.handle_source(&source_message("visual_odom", NS_PER_SEC / 10, 10.5));
@@ -990,20 +955,14 @@ mod tests {
     }
 
     #[test]
-    fn a_source_key_round_trips_through_json_as_an_object_key() {
-        let sources = one_source("visual_odom");
-        let text = serde_json::to_string(&sources).expect("serializable");
-        assert!(text.contains("\"visual_odom->base\""), "{text}");
-        let parsed: BTreeMap<SourceKey, SourceConfig> =
-            serde_json::from_str(&text).expect("deserializable");
-        assert_eq!(parsed.keys().collect::<Vec<_>>(), sources.keys().collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn a_source_key_without_an_arrow_is_rejected() {
-        let error = serde_json::from_str::<BTreeMap<SourceKey, SourceConfig>>(r#"{"odom":{}}"#)
-            .expect_err("no arrow");
-        assert!(error.to_string().contains("parent_frame_id->child_frame_id"), "{error}");
+    fn an_odom_sources_entry_deserializes_with_defaulted_variances() {
+        let parsed: Vec<SourceConfig> = serde_json::from_str(
+            r#"[{"parent_frame_id": "visual_odom", "child_frame_id": "base"}]"#,
+        )
+        .expect("deserializable");
+        assert_eq!(parsed[0].parent_frame_id, "visual_odom");
+        assert_eq!(parsed[0].child_frame_id, "base");
+        assert_eq!(parsed[0].pose_variances, [0.0; 6]);
     }
 
     #[test]
@@ -1020,7 +979,7 @@ mod tests {
     #[test]
     fn a_nan_pose_is_dropped_rather_than_wedging_the_filter() {
         let mut config = base_config(false);
-        config.sources = one_source("visual_odom");
+        config.odom_sources = one_source("visual_odom");
         let mut core = FusionCore::new(config);
         core.handle_source(&source_message("visual_odom", 0, 10.0));
 
@@ -1054,7 +1013,10 @@ mod tests {
     fn the_outlier_gate_rejects_a_wild_pose_and_accepts_a_consistent_one() {
         let mut core = FusionCore::new(base_config(true));
         for sample in 0..5 {
-            core.handle_imu(&imu_message(sample * NS_PER_SEC / 100, 0.0, 0.0), &identity_mount());
+            core.handle_imu(
+                &imu_message(sample * NS_PER_SEC / 100, 0.0, 0.0),
+                &identity_mount(),
+            );
         }
         // Two to anchor: the first delta needs a predecessor, the second adopts the filter pose.
         core.handle_source(&source_message("odom", NS_PER_SEC / 20, 0.0));
@@ -1090,8 +1052,7 @@ mod tests {
         let run = || {
             let mut config = base_config(true);
             // Position only: the source reports no rotation, so it must not argue against the yaw.
-            config.sources.get_mut(&source_key("odom")).expect("named by base_config").pose_variances =
-                [1e-4, 1e-4, 1e-4, 0.0, 0.0, 0.0];
+            config.odom_sources[0].pose_variances = [1e-4, 1e-4, 1e-4, 0.0, 0.0, 0.0];
             let mut core = FusionCore::new(config);
             let mut published = Vec::new();
             for step in 0..60_i64 {
@@ -1114,7 +1075,10 @@ mod tests {
         assert!(first.len() > 10);
         // Identical output proves nothing unless the filter actually moved and turned.
         let last = first.last().expect("published above");
-        assert!(last.0.hypot(last.1) > 0.05, "the fused pose barely moved: {last:?}");
+        assert!(
+            last.0.hypot(last.1) > 0.05,
+            "the fused pose barely moved: {last:?}"
+        );
         assert!(last.3 < 0.999, "the fused pose barely turned: {last:?}");
         assert_eq!(first, run());
     }

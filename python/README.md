@@ -16,7 +16,7 @@ tracker = dim_odom.CuvslamOdometry(
 tracker.handle_camera_info(dim_odom.CameraModel(...))
 estimate = tracker.handle_image(dim_odom.ImageFrame(...))
 
-fusion = dim_odom.OdometryFusion({"sources": {"odom->base_link": {}}})
+fusion = dim_odom.OdometryFusion({"odom_sources": [{"parent_frame_id": "odom", "child_frame_id": "base_link"}]})
 if estimate is not None:
     fusion.handle_source(estimate)
 fused = fusion.maybe_publish()
