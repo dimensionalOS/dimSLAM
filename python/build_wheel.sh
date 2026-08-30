@@ -6,13 +6,13 @@
 # Linux wheels must be built in a Linux environment with the GNU toolchain (zig
 # cross-compiling links the shim against LLVM libc++, whose std:: symbols don't
 # match the libstdc++-built libcuvslam), e.g. from a mac:
-#   docker run --rm -v <repo>:/io -v <sdk>:/sdk ubuntu:24.04 bash -c '
+#   docker run --rm -v <repo>:/io -v <sdk>:/sdk ubuntu:22.04 bash -c '
 #     apt-get update -qq && apt-get install -y -qq curl build-essential python3 python3-pip
 #     curl -sSf https://sh.rustup.rs | sh -s -- -y -q && . $HOME/.cargo/env
-#     pip install -q --break-system-packages maturin
-#     CUVSLAM_SDK_DIR=/sdk /io/python/build_wheel.sh --compatibility manylinux_2_39 --skip-auditwheel'
+#     pip install -q maturin
+#     CUVSLAM_SDK_DIR=/sdk /io/python/build_wheel.sh --compatibility manylinux_2_35 --skip-auditwheel'
 # (--skip-auditwheel because the bundled libcuvslam is not a manylinux-policy lib;
-# manylinux_2_39 matches the ubuntu24.04 the SDK binaries are built on. The SDK
+# manylinux_2_35 matches the ubuntu22.04 the SDK binaries are built on. The SDK
 # tarballs ship the .so under bin/, so symlink lib -> bin first. Use a
 # --platform linux/amd64 or linux/arm64 image to pick the wheel arch.)
 #

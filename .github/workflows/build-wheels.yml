@@ -11,6 +11,10 @@ name: build-wheels
 #
 # Native runners, no qemu: cross-linking is what the zig attempt got wrong, since
 # it pulled in LLVM libc++ while libcuvslam is built against libstdc++.
+#
+# The linux runners are ubuntu-22.04 on purpose: the shim links the runner's
+# glibc, and JetPack 6 Jetsons run Ubuntu 22.04 (glibc 2.35). The SDK tarballs
+# in fork.2+ are built on 22.04 runners too, hence the manylinux_2_35 tag.
 
 # The push trigger exists because the repo's default branch is a stale stray named
 # "HEAD", and workflow_dispatch only registers off the default branch. Until that is
@@ -20,7 +24,7 @@ on:
     inputs:
       sdk_release:
         description: "cu_vslam_rs release tag holding the linux fork SDK tarballs."
-        default: "cuvslam-v17.0.0-fork.1"
+        default: "cuvslam-v17.0.0-fork.2"
   push:
     branches: [fused_odom]
     paths: [".github/workflows/build-wheels.yml", "python/**", "rust/**"]
@@ -37,13 +41,13 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
             asset: cuvslam-cpp-17.0.0-x86_64-cuda13-fork.tar.gz
-            maturin_args: --compatibility manylinux_2_39 --skip-auditwheel
+            maturin_args: --compatibility manylinux_2_35 --skip-auditwheel
           - name: linux-aarch64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             asset: cuvslam-cpp-17.0.0-aarch64-fork.tar.gz
-            maturin_args: --compatibility manylinux_2_39 --skip-auditwheel
+            maturin_args: --compatibility manylinux_2_35 --skip-auditwheel
           - name: macos-arm64
             runner: macos-14
             release: cuvslam-v17.0.0-metal.5
@@ -55,7 +59,7 @@ jobs:
       - name: Fetch the SDK
         run: |
           # inputs is empty on push events, hence the literal fallback.
-          tag="${{ matrix.release || inputs.sdk_release || 'cuvslam-v17.0.0-fork.1' }}"
+          tag="${{ matrix.release || inputs.sdk_release || 'cuvslam-v17.0.0-fork.2' }}"
           curl -fsSL -o sdk.tar.gz \
             "https://github.com/$SDK_REPO/releases/download/$tag/${{ matrix.asset }}"
           mkdir sdk && tar xzf sdk.tar.gz -C sdk --strip-components=1
