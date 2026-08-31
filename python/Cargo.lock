@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "dim_odom"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "dim_slam",
  "pyo3",
