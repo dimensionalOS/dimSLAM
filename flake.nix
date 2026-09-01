@@ -7,9 +7,11 @@
     cu-vslam-rs.url = "github:jeff-hykin/cu_vslam_rs";
     cu-vslam-rs.inputs.nixpkgs.follows = "nixpkgs";
     cu-vslam-rs.inputs.flake-utils.follows = "flake-utils";
+    crate2nix.url = "github:nix-community/crate2nix";
+    crate2nix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs = { self, nixpkgs, flake-utils, cu-vslam-rs, ... }:
+  outputs = { self, nixpkgs, flake-utils, cu-vslam-rs, crate2nix, ... }:
     # Not eachDefaultSystem: nixpkgs 26.11 dropped x86_64-darwin, and merely naming
     # it is an eval error.
     flake-utils.lib.eachSystem [ "aarch64-darwin" "aarch64-linux" "x86_64-linux" ] (system:
@@ -34,18 +36,24 @@
           aarch64-linux = "orin";
         }.${system} or "x86_64-cuda12";
 
+        # One derivation per crate rather than one vendored blob, so a dependency
+        # bump only rebuilds what changed and the SDK variants share the rest.
+        generatedCargoNix = crate2nix.tools.${system}.generatedCargoNix {
+          name = "dim_slam";
+          src = ./rust;
+        };
+
         checkFor = variant: let sdkPackage = sdkPackages."sdk-${variant}"; in
-          pkgs.rustPlatform.buildRustPackage {
-            pname = "dim_slam";
-            version = "0.1.0";
-            src = ./rust;
-            cargoLock.lockFile = ./rust/Cargo.lock;
-            # cu_vslam_rs's build.rs compiles its shim against this SDK.
-            env.CUVSLAM_SDK_DIR = sdkPackage;
-            # The test binary links libcuvslam, whose CUDA runtime wants a GPU
-            # driver the build sandbox lacks; unit tests run via plain cargo test.
-            doCheck = false;
-          };
+          (import generatedCargoNix {
+            inherit pkgs;
+            buildRustCrateForPkgs = cratePkgs: cratePkgs.buildRustCrate.override {
+              defaultCrateOverrides = cratePkgs.defaultCrateOverrides // {
+                # cu_vslam_rs's build.rs compiles its shim against this SDK.
+                cu_vslam_rs = _: { CUVSLAM_SDK_DIR = sdkPackage; };
+              };
+            };
+          # The rlib, not the empty default output a lib crate leaves behind.
+          }).rootCrate.build.lib;
       in {
         # The library is consumed from cargo; what nix is for here is the SDK it builds against.
         packages = sdkPackages // { default = sdkPackages."sdk-${defaultVariant}"; };
