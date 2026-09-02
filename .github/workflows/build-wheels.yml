@@ -8,6 +8,7 @@ name: build-wheels
 # here: the x86_64 wheel takes cuda13 because pyproject.toml pins nvidia-* >=13,
 # the aarch64 wheel takes the multi-arch build that carries Hopper/Thor/Blackwell
 # cubins, and macOS takes metal. The cuda12 and orin variants stay flake-only.
+# A fourth job builds the py3-none-any placeholder that covers everything else.
 #
 # Native runners, no qemu: cross-linking is what the zig attempt got wrong, since
 # it pulled in LLVM libc++ while libcuvslam is built against libstdc++.
@@ -90,5 +91,20 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.name }}
+          path: python/target/wheels/*.whl
+          if-no-files-found: error
+
+  # Every release needs this alongside the three real wheels, or a plain
+  # `dim-odom` dependency stops resolving on the platforms they miss.
+  fallback:
+    name: fallback-any
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python/build_fallback_wheel.sh
+      - run: ls -lh python/target/wheels
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-fallback
           path: python/target/wheels/*.whl
           if-no-files-found: error
