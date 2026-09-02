@@ -50,3 +50,7 @@ EOF
 
 mkdir -p "$output"
 python3 -m pip wheel --no-deps --wheel-dir "$output" "$build"
+
+# A setuptools older than 61 ignores the [project] table and silently emits a
+# UNKNOWN-0.0.0 wheel, which uploads to PyPI just as happily as a real one.
+test -f "$output/dim_odom-$version-py3-none-any.whl"

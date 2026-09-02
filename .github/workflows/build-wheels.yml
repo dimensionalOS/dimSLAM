@@ -101,6 +101,11 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      # Not cosmetic: jammy's system pip leaks its own setuptools 59 into the
+      # build isolation env, which predates PEP 621 and drops all the metadata.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - run: python/build_fallback_wheel.sh
       - run: ls -lh python/target/wheels
       - uses: actions/upload-artifact@v4
