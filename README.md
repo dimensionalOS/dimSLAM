@@ -16,12 +16,15 @@ the per-platform SDK packaging live in
   set to this machine's default.
 
 ```rust
-use dim_slam::{FusionCore, OdometryFusionConfig, SourceConfig};
+use dim_slam::{FusionCore, OdometryFusionConfig, SourceConfig, SourceKind};
 
+// Sources are `pose` (a non-drifting world frame), `twist` (body velocity) or `pose_delta`
+// (a drifting pose, fused by its motion only).
 let mut fusion = FusionCore::new(OdometryFusionConfig {
     odom_sources: vec![SourceConfig {
         parent_frame_id: "visual_odom".into(),
         child_frame_id: "base_link".into(),
+        kind: SourceKind::PoseDelta,
         pose_variances: [1e-4; 6],
         ..Default::default()
     }],

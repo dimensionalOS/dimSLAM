@@ -107,7 +107,7 @@ impl Default for DimSlamCoreConfig {
     }
 }
 
-/// Visual-inertial odometry: cuVSLAM tracking blended with any other odometry source.
+/// Visual-inertial odometry: cuVSLAM tracking fused with any other odometry source.
 ///
 /// Feed it frames, IMU samples and other sources' estimates, then ask for output. The tracker's
 /// pose is fused in-process and never leaves the struct.
