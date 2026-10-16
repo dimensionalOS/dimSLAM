@@ -73,6 +73,8 @@ pub struct DimSlamCoreConfig {
     pub odom_sources: Vec<SourceConfig>,
     /// A ground body: z, roll, pitch and their rates held at zero.
     pub planar: bool,
+    /// See [`OdometryFusionConfig::zero_velocity_variances`].
+    pub zero_velocity_variances: [f64; 6],
 }
 
 /// Defers to the two cores so a field's default cannot drift from the core that reads it.
@@ -103,6 +105,7 @@ impl Default for DimSlamCoreConfig {
             process_noise: fusion.process_noise,
             odom_sources: fusion.odom_sources,
             planar: fusion.planar,
+            zero_velocity_variances: fusion.zero_velocity_variances,
         }
     }
 }
@@ -156,6 +159,7 @@ impl DimSlamCore {
             process_noise: config.process_noise,
             odom_sources,
             planar: config.planar,
+            zero_velocity_variances: config.zero_velocity_variances,
         };
         Ok(Self {
             visual_odometry,

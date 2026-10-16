@@ -177,6 +177,10 @@ pub struct OdometryFusionConfig {
     /// A ground body: z, roll, pitch and their rates are held at zero in the state itself,
     /// and sources are fused in x, y and yaw only.
     pub planar: bool,
+    /// Body [vx vy vz wx wy wz]: >0 is a soft zero-velocity measurement of that axis with this
+    /// variance, fused with every source message, e.g. vy for a base that cannot slide sideways;
+    /// 0 leaves the axis free. Ungated: it is the model's own assumption, not a sensor.
+    pub zero_velocity_variances: [f64; 6],
 }
 
 /// 1-sigma uncertainty the filter starts with, per state block. The bias std applies to
@@ -226,6 +230,7 @@ impl Default for OdometryFusionConfig {
             process_noise: ProcessNoise::default(),
             odom_sources: Vec::new(),
             planar: false,
+            zero_velocity_variances: [0.0; 6],
         }
     }
 }
@@ -751,6 +756,14 @@ impl FusionCore {
         if let Some(twist) = &measurement.twist {
             self.fuse_twist(twist, &measurement.twist_variance);
         }
+        let constraint = self.config.zero_velocity_variances;
+        if constraint.iter().any(|variance| *variance > 0.0) {
+            let rows = self.twist_rows(&Twist::default(), &constraint);
+            if !rows.is_empty() {
+                let (residual, jacobian, variance) = rows.matrices();
+                self.filter.update(&residual, &jacobian, &variance, 0.0);
+            }
+        }
     }
 
     /// Planar mode fuses nothing in z, roll or pitch (and so vz, wx, wy: the same indices).
@@ -870,8 +883,15 @@ impl FusionCore {
         }
     }
 
-    /// Body-frame twist rows, against the rate state or the held gyro sample.
     fn fuse_twist(&mut self, twist: &Twist, variance: &[f64; 6]) {
+        let rows = self.twist_rows(twist, variance);
+        if !rows.is_empty() {
+            self.update(&rows);
+        }
+    }
+
+    /// Body-frame twist rows, against the rate state or the held gyro sample.
+    fn twist_rows(&self, twist: &Twist, variance: &[f64; 6]) -> Rows {
         let body_from_world = self.filter.x.q.inverse().to_rotation_matrix();
         let body_velocity = body_from_world * self.filter.x.velocity;
         let velocity_skew = eskf::skew(&body_velocity);
@@ -893,9 +913,7 @@ impl FusionCore {
                 row[col + axis] = sign;
             }
         }
-        if !rows.is_empty() {
-            self.update(&rows);
-        }
+        rows
     }
 
     fn within_gate(&self, rows: &Rows) -> bool {
@@ -1115,6 +1133,7 @@ mod tests {
             process_noise: ProcessNoise::default(),
             odom_sources: vec![source("odom", SourceKind::Pose)],
             planar: false,
+            zero_velocity_variances: [0.0; 6],
         }
     }
 
@@ -1243,6 +1262,32 @@ mod tests {
         assert!((msg.pose.rotation.euler_angles().2 - 0.5).abs() < 0.05);
         assert!((msg.twist.linear.x - 1.0).abs() < 0.01);
         assert!((msg.twist.angular.z - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_zero_velocity_variance_keeps_a_base_from_sliding_sideways() {
+        let lateral_after_one_second = |constraint: f64| {
+            let mut config = base_config(false);
+            let mut wheel = source("wheel", SourceKind::Twist);
+            wheel.twist_variances = [1e-2, 1.0, 0.0, 0.0, 0.0, 1e-2];
+            config.odom_sources = vec![wheel];
+            config.zero_velocity_variances = [0.0, constraint, 0.0, 0.0, 0.0, 0.0];
+            let mut core = FusionCore::new(config);
+            for step in 0..=50 {
+                let mut msg = twist_message("wheel", step * 20 * MS, 1.0, 0.0);
+                msg.twist.linear.y = 0.5;
+                core.handle_source(&msg);
+            }
+            core.maybe_publish()
+                .expect("a period has elapsed")
+                .pose
+                .translation
+                .y
+        };
+        let free = lateral_after_one_second(0.0);
+        let constrained = lateral_after_one_second(1e-4);
+        assert!(free > 0.3, "{free}");
+        assert!(constrained.abs() < 0.01, "{constrained}");
     }
 
     #[test]
@@ -1444,7 +1489,7 @@ mod tests {
         );
         assert!(parsed.is_err());
         let parsed: Result<OdometryFusionConfig, _> =
-            serde_json::from_str(r#"{"per_dimension_error_variance": [0, 0, 1, 1, 1, 0]}"#);
+            serde_json::from_str(r#"{"blend_weights": [0, 0, 1, 1, 1, 0]}"#);
         assert!(parsed.is_err());
     }
 
