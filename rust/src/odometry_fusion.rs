@@ -48,9 +48,10 @@ pub struct SourceConfig {
     pub pose_variances: [f64; 6],
     /// [vx vy vz wx wy wz], same convention, body frame.
     pub twist_variances: [f64; 6],
-    /// A source that does not drift (e.g. a lidar odometry): once its first message aligns its
-    /// frame to the fused one, its pose is fused as an absolute fix, not only as deltas, so the
-    /// fused pose cannot wander from it. With an IMU a jump is gated out unless it persists.
+    /// The long-term reference among the sources: the one that drifts least (e.g. a lidar odometry
+    /// next to wheels). Once its first message aligns its frame to the fused one, its pose is fused
+    /// as an absolute fix, not only as deltas, so the fused pose follows its drift rather than
+    /// accumulating the others'. With an IMU a jump is gated out unless it persists.
     pub absolute: bool,
 }
 
