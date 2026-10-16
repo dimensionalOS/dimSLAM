@@ -24,7 +24,7 @@
 //!         parent_frame_id: "wheel_odom".into(),
 //!         child_frame_id: "base_link".into(),
 //!         pose_variances: [1e-4; 6],
-//!         twist_variances: [0.0; 6],
+//!         ..Default::default()
 //!     }],
 //!     ..Default::default()
 //! })
