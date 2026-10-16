@@ -50,7 +50,7 @@ pub struct SourceConfig {
     pub twist_variances: [f64; 6],
     /// A source that does not drift (e.g. a lidar odometry): once its first message aligns its
     /// frame to the fused one, its pose is fused as an absolute fix, not only as deltas, so the
-    /// fused pose cannot wander from it. A jump is gated out unless it persists.
+    /// fused pose cannot wander from it. With an IMU a jump is gated out unless it persists.
     pub absolute: bool,
 }
 
@@ -193,8 +193,8 @@ struct SourceActivity {
 
 const SOURCE_ACTIVITY_TIMEOUT_SECONDS: f64 = 0.5;
 
-/// A source the gate has rejected this long without a break is fused ungated: an overconfident
-/// filter rejects everything, and only a measurement it rejects can bring it back.
+/// A source the gate has rejected this long without a break is fused ungated from a reset
+/// covariance: an overconfident filter rejects everything, and only what it rejects can fix it.
 const GATE_LOCKOUT_SECONDS: f64 = 1.0;
 
 // The snapshot alongside the kind dwarfs any variant, so boxing buys nothing.
@@ -684,6 +684,12 @@ impl FusionCore {
         let rejected_since_ns = self.activity[measurement.source].rejected_since_ns;
         let locked_out = rejected_since_ns != 0
             && ts_ns - rejected_since_ns > (GATE_LOCKOUT_SECONDS * 1.0e9) as i64;
+        if locked_out {
+            // Its overconfidence is what kept the gate shut: forget the position and velocity.
+            let stds = &self.config.initial_stds;
+            self.filter
+                .reset_motion_covariance(stds.position, stds.velocity);
+        }
         let accepted = self.update(&rows, &residuals, &variances, !locked_out);
         if !rows.is_empty() {
             self.activity[measurement.source].rejected_since_ns =
@@ -782,9 +788,13 @@ impl FusionCore {
         // Another source's step moves the fused pose off every absolute source by its own noise.
         for (other, activity) in self.activity.iter_mut().enumerate() {
             if other != measurement.source && self.config.odom_sources[other].absolute {
-                for dim in 0..6 {
-                    activity.drift_variance[dim] +=
-                        share[dim] * share[dim] * measurement.pose_variance[dim];
+                for ((drift, share), variance) in activity
+                    .drift_variance
+                    .iter_mut()
+                    .zip(share)
+                    .zip(measurement.pose_variance)
+                {
+                    *drift += share * share * variance;
                 }
             }
         }
@@ -805,12 +815,14 @@ impl FusionCore {
         let target = offset * pose;
         let mut gain = [0.0; 6];
         let activity = &mut self.activity[measurement.source];
-        for dim in 0..6 {
-            let variance = measurement.pose_variance[dim];
+        for ((gain, drift), variance) in gain
+            .iter_mut()
+            .zip(activity.drift_variance.iter_mut())
+            .zip(measurement.pose_variance)
+        {
             if variance > 0.0 {
-                gain[dim] =
-                    activity.drift_variance[dim] / (activity.drift_variance[dim] + variance);
-                activity.drift_variance[dim] *= 1.0 - gain[dim];
+                *gain = *drift / (*drift + variance);
+                *drift *= 1.0 - *gain;
             }
         }
         let translation = target.translation.vector - self.filter.x.position;
@@ -1167,13 +1179,13 @@ mod tests {
     #[test]
     fn an_absolute_source_bounds_imu_dead_reckoning() {
         let mut config = base_config(true);
-        config.odom_sources[0].pose_variances = [1e-4, 1e-4, 1e-4, 0.0, 0.0, 0.0];
+        config.odom_sources[0].pose_variances = [1e-2, 1e-2, 1e-2, 0.0, 0.0, 0.0];
         config.odom_sources[0].absolute = true;
         let mut core = FusionCore::new(config);
         for step in 0..1000_i64 {
             let ts_ns = step * NS_PER_SEC / 100;
             // An accel bias the stationary init never saw, so the IMU alone runs away.
-            let accel_x = if step >= 10 { 0.2 } else { 0.0 };
+            let accel_x = if step >= 10 { 0.5 } else { 0.0 };
             core.handle_imu(&imu_message(ts_ns, 0.0, accel_x), &identity_mount());
             if step % 10 == 5 {
                 core.handle_source(&source_message("odom", ts_ns, 3.0));
@@ -1184,24 +1196,26 @@ mod tests {
     }
 
     #[test]
-    fn a_source_the_gate_keeps_rejecting_is_taken_ungated() {
+    fn a_jump_the_source_keeps_is_followed_after_the_gate_lockout() {
         let mut config = base_config(true);
-        config.odom_sources[0].pose_variances = [1e-6, 1e-6, 1e-6, 0.0, 0.0, 0.0];
-        // An IMU far more confident than it should be: the gate would reject the source forever.
-        config.imus[0].accel_noise_density = 1e-6;
-        config.imus[0].accel_random_walk = 1e-7;
-        config.initial_stds.velocity = 1e-6;
+        config.odom_sources[0].pose_variances = [1e-4, 1e-4, 1e-4, 0.0, 0.0, 0.0];
+        config.odom_sources[0].absolute = true;
         let mut core = FusionCore::new(config);
-        for step in 0..500_i64 {
+        for step in 0..300_i64 {
             let ts_ns = step * NS_PER_SEC / 100;
             core.handle_imu(&imu_message(ts_ns, 0.0, 0.0), &identity_mount());
+            // A relocalization: the source moves 1 m at 1 s and stays there.
+            let x = if step >= 100 { 1.0 } else { 0.0 };
             if step % 10 == 5 {
-                // The robot is really rolling at 0.5 m/s; the IMU missed the start.
-                core.handle_source(&source_message("odom", ts_ns, 0.5 * ts_ns as f64 / 1e9));
+                core.handle_source(&source_message("odom", ts_ns, x));
+            }
+            if step == 150 {
+                let held = core.filter.x.position.x;
+                assert!(held.abs() < 0.01, "a fresh jump should be gated: {held}");
             }
         }
         let x = core.filter.x.position.x;
-        assert!(x > 1.0, "{x}");
+        assert!((x - 1.0).abs() < 0.05, "{x}");
     }
 
     #[test]
