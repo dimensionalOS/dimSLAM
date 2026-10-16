@@ -2,8 +2,8 @@
 
 Python bindings for [dimSLAM](https://github.com/dimensionalOS/dimSLAM):
 `CuvslamOdometry` wraps the cuVSLAM visual(-inertial) odometry front end,
-`OdometryFusion` the error-state Kalman filter that fuses odometry sources with an
-IMU. Everything runs in-process and on the caller's data stamps, so replaying a
+`OdometryFusion` the error-state Kalman filter that fuses odometry sources, with or
+without an IMU. Everything runs in-process and on the caller's data stamps, so replaying a
 recording is deterministic.
 
 ```python
@@ -16,7 +16,9 @@ tracker = dim_odom.CuvslamOdometry(
 tracker.handle_camera_info(dim_odom.CameraModel(...))
 estimate = tracker.handle_image(dim_odom.ImageFrame(...))
 
-fusion = dim_odom.OdometryFusion({"odom_sources": [{"parent_frame_id": "odom", "child_frame_id": "base_link"}]})
+fusion = dim_odom.OdometryFusion({"odom_sources": [
+    {"parent_frame_id": "odom", "child_frame_id": "base_link", "kind": "pose_delta", "pose_variances": [1e-4] * 6},
+]})
 if estimate is not None:
     fusion.handle_source(estimate)
 fused = fusion.maybe_publish()

@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::cuvslam_odometry::{CameraConfig, CuvslamCore, CuvslamOdometryConfig};
 use crate::odometry_fusion::{
-    FusionCore, ImuConfig, InitialStds, OdometryFusionConfig, SourceConfig,
+    FusionCore, ImuConfig, InitialStds, OdometryFusionConfig, ProcessNoise, SourceConfig,
+    SourceKind,
 };
 use crate::types::{CameraModel, ImageFrame, ImuSample, OdometryEstimate, PointCloud, TfLookup};
 use crate::warn_throttled;
@@ -41,9 +42,10 @@ pub struct DimSlamCoreConfig {
     pub speed_gate_max_angular: f64,
     /// Stamp spread one frame set may span, milliseconds; 0 keeps cuVSLAM's 1 ms contract.
     pub max_skew_ms: f64,
-    /// Trust in the visual odometry, [x y z roll pitch yaw]. Negative takes the message
-    /// covariance, zero drops the dimension, positive is a fixed variance. It drifts, so its
-    /// covariance describes accumulated drift rather than the delta: prefer a fixed value.
+    /// Noise of the tracker's frame-to-frame motion, [x y z roll pitch yaw]: it drifts, so
+    /// it is fused as a `pose_delta` source. Negative takes the message covariance, zero drops
+    /// the dimension, positive is a fixed variance. Its covariance describes accumulated
+    /// drift rather than one frame's motion: prefer a fixed value.
     pub visual_odom_pose_variances: [f64; 6],
 
     /// Frame the fused output is stamped in.
@@ -51,25 +53,26 @@ pub struct DimSlamCoreConfig {
     /// The body frame everything is resolved into: the tracker's output and the frame the
     /// filter estimates.
     pub output_frame_id: String,
-    /// Output cadence; the filter itself runs at the IMU rate.
+    /// Output cadence; each output is the filter predicted to its own stamp.
     pub publish_rate: f64,
     /// How far back a late measurement can reach before it is dropped.
     pub replay_buffer_seconds: f64,
-    /// Outlier gate in variance units; smaller is more aggressive, 0 is no gate.
+    /// Outlier gate: squared Mahalanobis distance per measurement dimension; 0 is no gate.
     pub outlier_rejection_allowed_variance: f64,
     /// Gate on the filter's own state, which can run away with no bad measurement; 0 disables.
     pub max_position_m: f64,
-    /// Empty disables inertial propagation; each entry keeps its own noise figures and biases.
+    /// Empty predicts by constant velocity instead; each entry keeps its own noise figures
+    /// and biases.
     pub imus: Vec<ImuConfig>,
     /// m/s^2, seeding the filter's gravity estimate.
     pub initial_gravity_estimate: f64,
     pub initial_stds: InitialStds,
-    /// External sources, each identified by the transform its estimates carry. The visual
-    /// odometry is prepended to this list, so a no-IMU blend prefers it.
+    /// The constant-velocity model's noise; only used without IMUs.
+    pub process_noise: ProcessNoise,
+    /// External sources, each identified by the transform its estimates carry.
     pub odom_sources: Vec<SourceConfig>,
-    /// Virtual zero-twist [vx vy vz wx wy wz] fused after each source update (needs an IMU):
-    /// a positive entry pins that dimension to zero with this variance, 0 frees it.
-    pub per_dimension_error_variance: [f64; 6],
+    /// A ground body: z, roll, pitch and their rates held at zero.
+    pub planar: bool,
 }
 
 /// Defers to the two cores so a field's default cannot drift from the core that reads it.
@@ -97,8 +100,9 @@ impl Default for DimSlamCoreConfig {
             imus: fusion.imus,
             initial_gravity_estimate: fusion.initial_gravity_estimate,
             initial_stds: fusion.initial_stds,
+            process_noise: fusion.process_noise,
             odom_sources: fusion.odom_sources,
-            per_dimension_error_variance: fusion.per_dimension_error_variance,
+            planar: fusion.planar,
         }
     }
 }
@@ -134,8 +138,9 @@ impl DimSlamCore {
         let mut odom_sources = vec![SourceConfig {
             parent_frame_id: VISUAL_ODOM_FRAME_ID.to_string(),
             child_frame_id: config.output_frame_id.clone(),
+            kind: SourceKind::PoseDelta,
             pose_variances: config.visual_odom_pose_variances,
-            twist_variances: [0.0; 6],
+            ..Default::default()
         }];
         odom_sources.extend(config.odom_sources);
         let fusion_config = OdometryFusionConfig {
@@ -148,8 +153,9 @@ impl DimSlamCore {
             imus: config.imus,
             initial_gravity_estimate: config.initial_gravity_estimate,
             initial_stds: config.initial_stds,
+            process_noise: config.process_noise,
             odom_sources,
-            per_dimension_error_variance: config.per_dimension_error_variance,
+            planar: config.planar,
         };
         Ok(Self {
             visual_odometry,
@@ -204,6 +210,11 @@ impl DimSlamCore {
     /// The fused pose, once a publish period has elapsed.
     pub fn maybe_publish(&mut self) -> Option<OdometryEstimate> {
         self.fusion.maybe_publish()
+    }
+
+    /// The fused pose predicted to `now_ns`, once a publish period has elapsed.
+    pub fn maybe_publish_at(&mut self, now_ns: i64) -> Option<OdometryEstimate> {
+        self.fusion.maybe_publish_at(now_ns)
     }
 
     pub fn report(&self) {
