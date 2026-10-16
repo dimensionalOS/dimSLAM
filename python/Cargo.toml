@@ -5,7 +5,7 @@
 name = "dim_odom"
 # Tracks the repository's release tag, so a consumer pinning the rust crate at a
 # tag and the wheel at a version can see at a glance that they agree.
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Python bindings for dimSLAM: cuVSLAM visual odometry plus error-state Kalman fusion"

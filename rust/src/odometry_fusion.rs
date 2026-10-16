@@ -681,7 +681,9 @@ impl FusionCore {
 
     /// Not a Kalman update: inverse-variance shares sum to one, so a lone source passes through exactly.
     fn blend(&mut self, measurement: &Measurement, ts_ns: i64) {
+        let horizon = ts_ns - (SOURCE_ACTIVITY_TIMEOUT_SECONDS * 1.0e9) as i64;
         let activity = &mut self.activity[measurement.source];
+        let returning = activity.last_ns < horizon;
         activity.last_ns = ts_ns;
         for dim in 0..6 {
             activity.inverse_variance[dim] = if measurement.pose_variance[dim] > 0.0 {
@@ -692,10 +694,23 @@ impl FusionCore {
         }
 
         let Some(increment) = measurement.delta else {
+            self.anchor(measurement.source);
             return;
         };
+        let current =
+            Isometry3::from_parts(Translation3::from(self.filter.x.position), self.filter.x.q);
+        // Back from a silence the others carried, its delta spans the gap: apply it from where
+        // the fused pose stood at its last message, not on top of what the others added since.
+        let start = match (returning, self.anchors[measurement.source]) {
+            (false, _) => current,
+            (true, Some(anchor)) => anchor,
+            (true, None) => {
+                self.anchor(measurement.source);
+                return;
+            }
+        };
+        let step = current.inverse() * (start * increment);
 
-        let horizon = ts_ns - (SOURCE_ACTIVITY_TIMEOUT_SECONDS * 1.0e9) as i64;
         let mut share = [0.0; 6];
         for (dim, share_dim) in share.iter_mut().enumerate() {
             let total: f64 = self
@@ -709,8 +724,8 @@ impl FusionCore {
             }
         }
 
-        let translation = increment.translation.vector;
-        let rotation = increment.rotation.scaled_axis();
+        let translation = step.translation.vector;
+        let rotation = step.rotation.scaled_axis();
         self.filter.x.position += self.filter.x.q
             * Vector3::new(
                 share[0] * translation.x,
@@ -722,6 +737,7 @@ impl FusionCore {
             share[4] * rotation.y,
             share[5] * rotation.z,
         ));
+        self.anchor(measurement.source);
     }
 
     /// Body-frame twist rows. Angular rate is not a state: it is predicted from the last gyro
@@ -996,6 +1012,27 @@ mod tests {
         core.handle_source(&source_message("visual_odom", NS_PER_SEC / 10, 10.5));
         let position = published_position(&mut core).expect("a period has elapsed");
         assert!((position.x - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_source_back_from_a_silence_does_not_add_the_motion_the_others_carried() {
+        let mut config = base_config(false);
+        let mut wheel = one_source("wheel");
+        wheel[0].pose_variances = [1e-2; 6];
+        config.odom_sources = [one_source("lio"), wheel].concat();
+        let mut core = FusionCore::new(config);
+        for step in 0..=10 {
+            let ts_ns = step * NS_PER_SEC / 10;
+            let x = step as f64 / 10.0;
+            core.handle_source(&source_message("wheel", ts_ns, x));
+            // Silent from 0.2 s to 1.0 s, past the activity timeout.
+            if step <= 1 || step == 10 {
+                core.handle_source(&source_message("lio", ts_ns, x));
+            }
+        }
+        // Not 1.9: the 0.8 s the wheels carried is not counted twice.
+        let x = core.filter.x.position.x;
+        assert!((x - 1.0).abs() < 0.02, "{x}");
     }
 
     #[test]
