@@ -358,10 +358,42 @@ impl Filter {
         self.p_cov = &selector * &self.p_cov * selector.transpose();
     }
 
-    /// `gate` bounds the squared Mahalanobis distance of the innovation, under its full
-    /// covariance, per measurement dimension; 0 disables.
+    /// The innovation covariance's inverse, or None when `gate` rejects the measurement: its
+    /// squared Mahalanobis distance under the full innovation covariance, per measurement
+    /// dimension, at or past `gate`. 0 disables the gate.
     // The negated comparison is deliberate: a NaN distance must reject.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    fn gated_innovation_inverse(
+        &self,
+        residual: &DVector<f64>,
+        jacobian: &Jacobian,
+        variance: &DVector<f64>,
+        gate: f64,
+    ) -> Option<Cov> {
+        let innovation =
+            jacobian * &self.p_cov * jacobian.transpose() + Cov::from_diagonal(variance);
+        let innovation_inverse = innovation.try_inverse()?;
+        if gate > 0.0 {
+            let mahalanobis_sq = (residual.transpose() * &innovation_inverse * residual)[(0, 0)];
+            if !(mahalanobis_sq < gate * residual.len() as f64) {
+                return None;
+            }
+        }
+        Some(innovation_inverse)
+    }
+
+    pub fn within_gate(
+        &self,
+        residual: &DVector<f64>,
+        jacobian: &Jacobian,
+        variance: &DVector<f64>,
+        gate: f64,
+    ) -> bool {
+        self.gated_innovation_inverse(residual, jacobian, variance, gate)
+            .is_some()
+    }
+
+    /// False, leaving the state untouched, when the gate rejects the measurement.
     pub fn update(
         &mut self,
         residual: &DVector<f64>,
@@ -369,17 +401,12 @@ impl Filter {
         variance: &DVector<f64>,
         gate: f64,
     ) -> bool {
-        let noise = Cov::from_diagonal(variance);
-        let innovation = jacobian * &self.p_cov * jacobian.transpose() + &noise;
-        let Some(innovation_inverse) = innovation.try_inverse() else {
+        let Some(innovation_inverse) =
+            self.gated_innovation_inverse(residual, jacobian, variance, gate)
+        else {
             return false;
         };
-        if gate > 0.0 {
-            let mahalanobis_sq = (residual.transpose() * &innovation_inverse * residual)[(0, 0)];
-            if !(mahalanobis_sq < gate * residual.len() as f64) {
-                return false;
-            }
-        }
+        let noise = Cov::from_diagonal(variance);
         let kalman_gain = &self.p_cov * jacobian.transpose() * &innovation_inverse;
         let dx: DVector<f64> = &kalman_gain * residual;
         let identity_minus_kh = Cov::identity(self.dim(), self.dim()) - &kalman_gain * jacobian;

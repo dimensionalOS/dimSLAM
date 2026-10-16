@@ -212,7 +212,7 @@ impl DimSlamCore {
         self.fusion.maybe_publish()
     }
 
-    /// The fused pose predicted to `now_ns`, once a publish period has elapsed.
+    /// The fused pose predicted to `now_ns`, for a caller publishing on its own timer.
     pub fn maybe_publish_at(&mut self, now_ns: i64) -> Option<OdometryEstimate> {
         self.fusion.maybe_publish_at(now_ns)
     }

@@ -778,30 +778,40 @@ impl FusionCore {
         let position_residual = target.translation.vector - self.filter.x.position;
         let rotation_residual = (self.filter.x.q.inverse() * target.rotation).scaled_axis();
         let mut rows = Rows::new(self.filter.dim());
+        let mut rotation_rows = Rows::new(self.filter.dim());
         for dim in 0..6 {
             if variance[dim] <= 0.0 || self.pinned(dim) {
                 continue;
             }
-            let (col, residual) = if dim < 3 {
-                (dim, position_residual[dim])
+            if dim < 3 {
+                rows.push(position_residual[dim], variance[dim])[dim] = 1.0;
             } else {
-                (6 + dim - 3, rotation_residual[dim - 3])
-            };
-            let row = rows.push(residual, variance[dim]);
-            row[col] = 1.0;
+                let axis = dim - 3;
+                rotation_rows.push(rotation_residual[axis], variance[dim])[6 + axis] = 1.0;
+            }
         }
+        let rotation_agrees = rotation_rows.is_empty() || self.within_gate(&rotation_rows);
+        rows.append(rotation_rows);
         if rows.is_empty() {
             return;
         }
-        if self.update(rows) {
+        if self.update(&rows) {
             self.sources[source].rejected_since_ns = None;
             return;
         }
         let realign_after = self.config.odom_sources[source].realign_after_seconds;
         let since = *self.sources[source].rejected_since_ns.get_or_insert(ts_ns);
         if realign_after > 0.0 && (ts_ns - since) as f64 >= realign_after * 1.0e9 {
-            // The fused pose stays put and the source's frame moves: odometry must not jump.
-            self.sources[source].alignment = Some(self.current_pose() * pose.inverse());
+            // The fused pose stays put and the source's frame moves: odometry must not jump. Only
+            // what disagrees moves, or the heading error of the moment would be locked in.
+            let rotation = if rotation_agrees {
+                alignment.rotation
+            } else {
+                self.filter.x.q * pose.rotation.inverse()
+            };
+            let translation = self.filter.x.position - rotation * pose.translation.vector;
+            self.sources[source].alignment =
+                Some(Isometry3::from_parts(translation.into(), rotation));
             self.sources[source].rejected_since_ns = None;
             self.realigned += 1;
             if !replaying {
@@ -809,6 +819,7 @@ impl FusionCore {
                     source = %self.config.odom_sources[source].parent_frame_id,
                     jump_m = position_residual.norm(),
                     jump_rad = rotation_residual.norm(),
+                    rotation_realigned = !rotation_agrees,
                     realign_after_seconds = realign_after,
                     "pose source rejected for too long: re-aligned its frame to the fused pose",
                 );
@@ -855,7 +866,7 @@ impl FusionCore {
             }
         }
         if !rows.is_empty() {
-            self.update(rows);
+            self.update(&rows);
         }
     }
 
@@ -883,17 +894,22 @@ impl FusionCore {
             }
         }
         if !rows.is_empty() {
-            self.update(rows);
+            self.update(&rows);
         }
     }
 
-    fn update(&mut self, rows: Rows) -> bool {
-        let residual = DVector::from_vec(rows.residuals);
-        let variance = DVector::from_vec(rows.variances);
-        let mut jacobian = Jacobian::zeros(rows.rows.len(), self.filter.dim());
-        for (index, row) in rows.rows.iter().enumerate() {
-            jacobian.row_mut(index).copy_from(&row.transpose());
-        }
+    fn within_gate(&self, rows: &Rows) -> bool {
+        let (residual, jacobian, variance) = rows.matrices();
+        self.filter.within_gate(
+            &residual,
+            &jacobian,
+            &variance,
+            self.config.outlier_rejection_allowed_variance,
+        )
+    }
+
+    fn update(&mut self, rows: &Rows) -> bool {
+        let (residual, jacobian, variance) = rows.matrices();
         let accepted = self.filter.update(
             &residual,
             &jacobian,
@@ -943,21 +959,28 @@ impl FusionCore {
     /// the data clock.
     pub fn maybe_publish(&mut self) -> Option<OdometryEstimate> {
         let latest_ns = self.events.back()?.ts_ns;
-        self.maybe_publish_at(latest_ns)
-    }
-
-    /// The fused estimate predicted to `now_ns`, once a publish period has elapsed: a caller
-    /// on a timer gets output at publish_rate however sparse its sources. Nothing past the
-    /// replay buffer, where every source has gone quiet for longer than it may lag.
-    pub fn maybe_publish_at(&mut self, now_ns: i64) -> Option<OdometryEstimate> {
-        let latest = self.events.back()?;
-        let ts_ns = now_ns.max(latest.ts_ns);
         let period = (1.0e9 / self.config.publish_rate.max(1.0)) as i64;
-        if ts_ns - self.last_publish_ns < period
-            || (ts_ns - latest.ts_ns) as f64 > self.config.replay_buffer_seconds * 1.0e9
-        {
+        if latest_ns - self.last_publish_ns < period {
             return None;
         }
+        self.publish(latest_ns)
+    }
+
+    /// The fused estimate predicted to `now_ns`, for a caller on a timer: the timer sets the
+    /// cadence, so output is steady however sparse the sources. None if `now_ns` is not past
+    /// the last output, or past the replay buffer, where every source has gone quiet for
+    /// longer than it may lag.
+    pub fn maybe_publish_at(&mut self, now_ns: i64) -> Option<OdometryEstimate> {
+        let latest_ns = self.events.back()?.ts_ns;
+        let stale = (now_ns - latest_ns) as f64 > self.config.replay_buffer_seconds * 1.0e9;
+        if now_ns <= self.last_publish_ns || stale {
+            return None;
+        }
+        self.publish(now_ns.max(latest_ns))
+    }
+
+    fn publish(&mut self, ts_ns: i64) -> Option<OdometryEstimate> {
+        let latest = self.events.back()?;
         self.last_publish_ns = ts_ns;
         let mut filter = self.filter.clone();
         filter.x = latest.state.clone();
@@ -1043,8 +1066,26 @@ impl Rows {
         self.rows.last_mut().expect("just pushed")
     }
 
+    fn append(&mut self, mut other: Rows) {
+        self.rows.append(&mut other.rows);
+        self.residuals.append(&mut other.residuals);
+        self.variances.append(&mut other.variances);
+    }
+
     fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    fn matrices(&self) -> (DVector<f64>, Jacobian, DVector<f64>) {
+        let mut jacobian = Jacobian::zeros(self.rows.len(), self.dim);
+        for (index, row) in self.rows.iter().enumerate() {
+            jacobian.row_mut(index).copy_from(&row.transpose());
+        }
+        (
+            DVector::from_column_slice(&self.residuals),
+            jacobian,
+            DVector::from_column_slice(&self.variances),
+        )
     }
 }
 
@@ -1259,7 +1300,7 @@ mod tests {
     }
 
     /// Wheels at 50 Hz carry the pose through a silence of the pose source.
-    fn wheels_and_pose(pose_at: impl Fn(i64) -> Option<f64>) -> FusionCore {
+    fn wheels_and_pose(pose_at: impl Fn(i64) -> Option<Isometry3<f64>>) -> FusionCore {
         let mut config = base_config(false);
         let mut pose = source("lio", SourceKind::Pose);
         pose.pose_variances = [1e-3; 6];
@@ -1269,8 +1310,11 @@ mod tests {
             let ts_ns = step * 20 * MS;
             core.handle_source(&twist_message("wheel", ts_ns, 0.5, 0.0));
             if step % 5 == 0 {
-                if let Some(x) = pose_at(ts_ns) {
-                    core.handle_source(&pose_message("lio", ts_ns, x));
+                if let Some(pose) = pose_at(ts_ns) {
+                    core.handle_source(&OdometryEstimate {
+                        pose,
+                        ..pose_message("lio", ts_ns, 0.0)
+                    });
                 }
             }
         }
@@ -1281,7 +1325,9 @@ mod tests {
     fn the_twist_carries_a_dropout_of_the_pose_source_which_is_taken_back_after() {
         let truth = |ts_ns: i64| 0.5 * ts_ns as f64 / 1.0e9;
         let silent = |ts_ns: i64| (2_000 * MS..4_000 * MS).contains(&ts_ns);
-        let core = wheels_and_pose(|ts_ns| (!silent(ts_ns)).then(|| truth(ts_ns)));
+        let core = wheels_and_pose(|ts_ns| {
+            (!silent(ts_ns)).then(|| Isometry3::translation(truth(ts_ns), 0.0, 0.0))
+        });
         assert_eq!(core.realigned, 0);
         assert_eq!(core.gated, 0);
         assert!((core.filter.x.position.x - truth(6_000 * MS)).abs() < 0.01);
@@ -1289,21 +1335,29 @@ mod tests {
 
     #[test]
     fn a_pose_source_that_jumps_is_gated_then_realigned_without_moving_the_output() {
+        // A 5 m jump in position at 3 s, then one of half a radian in heading at 4.5 s.
         let jumped = |ts_ns: i64| {
             let x = 0.5 * ts_ns as f64 / 1.0e9;
-            if ts_ns >= 3_000 * MS {
-                x + 5.0
-            } else {
-                x
-            }
+            let shift = if ts_ns >= 3_000 * MS { 5.0 } else { 0.0 };
+            let turn = if ts_ns >= 4_500 * MS { 0.5 } else { 0.0 };
+            Isometry3::from_parts(
+                Translation3::new(x + shift, 0.0, 0.0),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, turn),
+            )
         };
         let core = wheels_and_pose(|ts_ns| Some(jumped(ts_ns)));
-        assert_eq!(core.realigned, 1);
+        assert_eq!(core.realigned, 2);
         // The wheels agree with the motion before and after, so the output never jumps.
         assert!(
             (core.filter.x.position.x - 3.0).abs() < 0.01,
             "{}",
             core.filter.x.position.x
+        );
+        // Not the half radian: only the wheels' own heading drift through the rejected second.
+        assert!(
+            core.filter.x.q.angle() < 0.02,
+            "{}",
+            core.filter.x.q.angle()
         );
         let reaccepted = core.sources[0].rejected_since_ns.is_none();
         assert!(reaccepted, "the source is fused again after the re-align");

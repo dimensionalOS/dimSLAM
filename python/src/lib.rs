@@ -475,9 +475,9 @@ impl OdometryFusion {
         self.core.handle_source(&estimate.inner);
     }
 
-    /// The fused estimate once the publish period has elapsed, else None. Without
-    /// `now_ns` it is stamped at the newest input (call after each one); with it, it is
-    /// predicted to that time (call on a timer).
+    /// The fused estimate, else None. Without `now_ns`: at the newest input's stamp once
+    /// the publish period has elapsed (call after each input). With it: predicted to that
+    /// time, whenever it is past the last output (call on a timer).
     #[pyo3(signature = (now_ns=None))]
     fn maybe_publish(&mut self, now_ns: Option<i64>) -> Option<OdometryEstimate> {
         match now_ns {
