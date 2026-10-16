@@ -135,7 +135,7 @@ impl DimSlamCore {
             parent_frame_id: VISUAL_ODOM_FRAME_ID.to_string(),
             child_frame_id: config.output_frame_id.clone(),
             pose_variances: config.visual_odom_pose_variances,
-            ..Default::default()
+            twist_variances: [0.0; 6],
         }];
         odom_sources.extend(config.odom_sources);
         let fusion_config = OdometryFusionConfig {
