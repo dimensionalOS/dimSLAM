@@ -108,18 +108,6 @@ impl Filter {
         }
     }
 
-    /// Back to `init`'s uncertainty for position and velocity, uncorrelated with the rest.
-    pub fn reset_motion_covariance(&mut self, position_std: f64, velocity_std: f64) {
-        let dim = self.dim();
-        self.p_cov.view_mut((0, 0), (6, dim)).fill(0.0);
-        self.p_cov.view_mut((0, 0), (dim, 6)).fill(0.0);
-        for (block, std) in [(0, position_std), (3, velocity_std)] {
-            self.p_cov
-                .view_mut((block, block), (3, 3))
-                .copy_from(&(Matrix3::identity() * std * std));
-        }
-    }
-
     /// One step of dead reckoning from IMU `imu`'s sample, using that IMU's bias and noise.
     /// With interleaved IMUs each sample integrates the slice of time since the previous
     /// sample of any IMU.
