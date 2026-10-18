@@ -52,5 +52,6 @@ mkdir -p "$output"
 python3 -m pip wheel --no-deps --wheel-dir "$output" "$build"
 
 # A setuptools older than 61 ignores the [project] table and silently emits a
-# UNKNOWN-0.0.0 wheel, which uploads to PyPI just as happily as a real one.
-test -f "$output/dim_odom-$version-py3-none-any.whl"
+# UNKNOWN-0.0.0 wheel, which uploads to PyPI just as happily as a real one. The
+# wheel spells the version normalized (0.5.0-beta.1 -> 0.5.0b1), hence the glob.
+compgen -G "$output/dim_odom-[0-9]*-py3-none-any.whl" >/dev/null
