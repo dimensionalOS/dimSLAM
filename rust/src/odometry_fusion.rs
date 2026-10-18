@@ -79,6 +79,13 @@ pub struct SourceConfig {
     /// `pose` only: after rejecting this source this long without a break, the source's frame
     /// is re-aligned to the fused pose rather than kept out for good. 0 never re-aligns.
     pub realign_after_seconds: f64,
+    /// Zero-velocity update: a twist at or under `still_speed` (m/s) and `still_angular_speed`
+    /// (rad/s) says the body is still: it is fused as zero velocity with `still_variance` in
+    /// every axis and, without an IMU, the motion model adds no noise until the source reports
+    /// motion, so the pose settles instead of wandering under the other sources' noise. 0 disables.
+    pub still_variance: f64,
+    pub still_speed: f64,
+    pub still_angular_speed: f64,
 }
 
 impl SourceConfig {
@@ -755,7 +762,21 @@ impl FusionCore {
             SourceKind::Twist => {}
         }
         if let Some(twist) = &measurement.twist {
-            self.fuse_twist(twist, &measurement.twist_variance);
+            let config = &self.config.odom_sources[source];
+            let still = config.still_variance > 0.0
+                && twist.linear.norm() <= config.still_speed
+                && twist.angular.norm() <= config.still_angular_speed;
+            self.filter.x.still = still;
+            if still {
+                let mut variance = [config.still_variance; 6];
+                if self.config.use_imu() {
+                    // As below: against the gyro, a zero rate only drags its bias.
+                    variance[3..].fill(0.0);
+                }
+                self.fuse_twist(&Twist::default(), &variance);
+            } else {
+                self.fuse_twist(twist, &measurement.twist_variance);
+            }
         }
         let mut constraint = self.config.zero_velocity_variances;
         if self.config.use_imu() {
@@ -1166,6 +1187,7 @@ mod tests {
             pose_variances,
             twist_variances,
             realign_after_seconds: 1.0,
+            ..Default::default()
         }
     }
 
@@ -1311,6 +1333,44 @@ mod tests {
         }
         let gyro_bias = core.filter.x.biases[0].gyro;
         assert!(gyro_bias.x.abs() < 1e-3, "{gyro_bias:?}");
+    }
+
+    #[test]
+    fn a_still_twist_source_holds_the_pose_against_a_noisy_pose_source() {
+        let spread = |still_variance: f64| {
+            let mut config = base_config(false);
+            config.publish_rate = 50.0;
+            let mut wheel = source("wheel", SourceKind::Twist);
+            wheel.still_variance = still_variance;
+            wheel.still_speed = 1e-3;
+            wheel.still_angular_speed = 1e-3;
+            config.odom_sources = vec![source("odom", SourceKind::Pose), wheel];
+            let mut core = FusionCore::new(config);
+            let mut xs = Vec::new();
+            for step in 0..500 {
+                let ts_ns = step * 20 * MS;
+                core.handle_twist_source_still(ts_ns);
+                if step % 5 == 0 {
+                    // Point-LIO-like noise: +-2 mm, alternating.
+                    let noise = if step % 10 == 0 { 0.002 } else { -0.002 };
+                    core.handle_source(&pose_message("odom", ts_ns, noise));
+                }
+                if step >= 250 {
+                    xs.push(core.maybe_publish_at(ts_ns + MS).map(|m| m.pose.translation.x));
+                }
+            }
+            let xs: Vec<f64> = xs.into_iter().flatten().collect();
+            xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min)
+        };
+        let free = spread(0.0);
+        let held = spread(1e-6);
+        assert!(held < free / 5.0, "held {held} free {free}");
+    }
+
+    impl FusionCore {
+        fn handle_twist_source_still(&mut self, ts_ns: i64) {
+            self.handle_source(&twist_message("wheel", ts_ns, 0.0, 0.0));
+        }
     }
 
     #[test]
