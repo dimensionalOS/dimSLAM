@@ -448,7 +448,8 @@ impl CuvslamOdometry {
 }
 
 /// The error-state Kalman fuser. `config` mirrors the Rust `OdometryFusionConfig`
-/// as a dict; `odom_sources` entries name their parent_frame_id and child_frame_id.
+/// as a dict; `odom_sources` entries name their parent_frame_id, child_frame_id and
+/// kind ("pose", "twist" or "pose_delta"). Unknown keys are refused.
 #[pyclass]
 struct OdometryFusion {
     core: FusionCore,
@@ -474,12 +475,16 @@ impl OdometryFusion {
         self.core.handle_source(&estimate.inner);
     }
 
-    /// The fused estimate once the publish period has elapsed on the data clock,
-    /// else None. Call after each input.
-    fn maybe_publish(&mut self) -> Option<OdometryEstimate> {
-        self.core
-            .maybe_publish()
-            .map(|inner| OdometryEstimate { inner })
+    /// The fused estimate, else None. Without `now_ns`: at the newest input's stamp once
+    /// the publish period has elapsed (call after each input). With it: predicted to that
+    /// time, whenever it is past the last output (call on a timer).
+    #[pyo3(signature = (now_ns=None))]
+    fn maybe_publish(&mut self, now_ns: Option<i64>) -> Option<OdometryEstimate> {
+        match now_ns {
+            Some(now_ns) => self.core.maybe_publish_at(now_ns),
+            None => self.core.maybe_publish(),
+        }
+        .map(|inner| OdometryEstimate { inner })
     }
 
     fn report(&self) {
