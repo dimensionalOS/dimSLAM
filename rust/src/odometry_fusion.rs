@@ -179,7 +179,8 @@ pub struct OdometryFusionConfig {
     pub planar: bool,
     /// Body [vx vy vz wx wy wz]: >0 is a soft zero-velocity measurement of that axis with this
     /// variance, fused with every source message, e.g. vy for a base that cannot slide sideways;
-    /// 0 leaves the axis free. Ungated: it is the model's own assumption, not a sensor.
+    /// 0 leaves the axis free. Ungated: it is the model's own assumption, not a sensor. With an
+    /// IMU the angular entries are ignored: the gyro measures rate, so they could only drag its bias.
     pub zero_velocity_variances: [f64; 6],
 }
 
@@ -756,7 +757,11 @@ impl FusionCore {
         if let Some(twist) = &measurement.twist {
             self.fuse_twist(twist, &measurement.twist_variance);
         }
-        let constraint = self.config.zero_velocity_variances;
+        let mut constraint = self.config.zero_velocity_variances;
+        if self.config.use_imu() {
+            // A zero-rate row against the gyro moves only its bias, so real rocking would tilt the filter.
+            constraint[3..].fill(0.0);
+        }
         if constraint.iter().any(|variance| *variance > 0.0) {
             let rows = self.twist_rows(&Twist::default(), &constraint);
             if !rows.is_empty() {
@@ -1288,6 +1293,24 @@ mod tests {
         let constrained = lateral_after_one_second(1e-4);
         assert!(free > 0.3, "{free}");
         assert!(constrained.abs() < 0.01, "{constrained}");
+    }
+
+    #[test]
+    fn with_an_imu_a_zero_rate_constraint_leaves_the_gyro_bias_alone() {
+        let mut config = base_config(true);
+        config.odom_sources = vec![source("wheel", SourceKind::Twist)];
+        config.zero_velocity_variances = [0.0, 0.0, 0.0, 1e-6, 1e-6, 0.0];
+        let mut core = FusionCore::new(config);
+        init_imu(&mut core);
+        for step in 1..=100 {
+            let ts_ns = 40 * MS + step * 10 * MS;
+            let mut rocking = imu_message(ts_ns, 0.0, 0.0);
+            rocking.angular_velocity.x = 0.2 * if step % 20 < 10 { 1.0 } else { -1.0 };
+            core.handle_imu(&rocking, &Isometry3::identity());
+            core.handle_source(&twist_message("wheel", ts_ns, 0.0, 0.0));
+        }
+        let gyro_bias = core.filter.x.biases[0].gyro;
+        assert!(gyro_bias.x.abs() < 1e-3, "{gyro_bias:?}");
     }
 
     #[test]
