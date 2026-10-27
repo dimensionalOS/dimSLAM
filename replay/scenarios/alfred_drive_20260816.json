@@ -108,12 +108,89 @@
  },
  "variants": {
   "fixes": {},
-  "imm": {
-   "/imm": true
-  },
   "blend": {
    "/no_imu_blend": true
+  },
+  "tuned": {
+   "/visual_odom_pose_variances": [
+    1e-05,
+    1e-05,
+    0.0,
+    1e-05,
+    1e-05,
+    1e-05
+   ],
+   "/odom_sources/0/twist_variances/5": 0.0
+  },
+  "tuned_imm": {
+   "/visual_odom_pose_variances": [
+    1e-05,
+    1e-05,
+    0.0,
+    1e-05,
+    1e-05,
+    1e-05
+   ],
+   "/odom_sources/0/twist_variances/5": 0.0,
+   "/imm": true
   }
  },
- "expect": {}
+ "expect": {
+  "fixes": {
+   "error_mm_mean": {
+    "max": 1800
+   },
+   "error_mm_max": {
+    "max": 5000
+   }
+  },
+  "blend": {
+   "error_mm_mean": {
+    "max": 220
+   },
+   "error_mm_max": {
+    "max": 470
+   }
+  },
+  "tuned": {
+   "error_mm_mean": {
+    "max": 300
+   },
+   "error_mm_max": {
+    "max": 650
+   },
+   "rest_p2p_mm_mean": {
+    "max": 2.0
+   }
+  },
+  "tuned_imm": {
+   "error_mm_mean": {
+    "max": 620
+   },
+   "rest_p2p_mm_mean": {
+    "max": 0.5
+   }
+  }
+ },
+ "baseline": {
+  "note": "beta3 = 4a65da1 (scores identical to fixes); blend = the v0.4.x behavior Alfred runs on dimos main. tuned: vis_nav's variances were blend weights, not noise; as noise they say 10 cm and 13 deg per frame, so vision barely counted and wheel yaw rate drifted the heading.",
+  "beta3": {
+   "error_mm_mean": 1724.56,
+   "error_mm_max": 4829.0,
+   "rest_p2p_mm_mean": 0.18
+  },
+  "blend": {
+   "error_mm_mean": 199.71,
+   "error_mm_max": 432.0
+  },
+  "tuned": {
+   "error_mm_mean": 276.79,
+   "error_mm_max": 601.01,
+   "rest_p2p_mm_mean": 1.45
+  },
+  "tuned_imm": {
+   "error_mm_mean": 569.76,
+   "rest_p2p_mm_mean": 0.0
+  }
+ }
 }

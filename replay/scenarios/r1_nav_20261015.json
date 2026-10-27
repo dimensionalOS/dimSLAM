@@ -113,5 +113,50 @@
    "/odom_sources/1/still_variance": 0.0
   }
  },
- "expect": {}
+ "expect": {
+  "fixes": {
+   "error_mm_mean": {
+    "max": 6.5
+   },
+   "error_mm_p95": {
+    "max": 16.0
+   },
+   "moving_roughness_rms_mm": {
+    "max": 2.4
+   }
+  },
+  "imm": {
+   "rest_p2p_mm_mean": {
+    "max": 3.0
+   },
+   "error_mm_mean": {
+    "max": 6.5
+   },
+   "error_mm_p95": {
+    "max": 16.5
+   },
+   "moving_roughness_rms_mm": {
+    "max": 2.4
+   }
+  }
+ },
+ "baseline": {
+  "note": "beta3 = 4a65da1 with realign_after_seconds 1.0 and the frozen still flag",
+  "beta3": {
+   "rest_p2p_mm_mean": 2.89,
+   "error_mm_mean": 6.04,
+   "error_mm_p95": 14.82,
+   "moving_roughness_rms_mm": 2.27
+  },
+  "fixes": {
+   "rest_p2p_mm_mean": 15.82,
+   "error_mm_mean": 5.84,
+   "error_mm_p95": 14.68
+  },
+  "imm": {
+   "rest_p2p_mm_mean": 2.37,
+   "error_mm_mean": 6.07,
+   "error_mm_p95": 15.31
+  }
+ }
 }

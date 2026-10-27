@@ -348,6 +348,21 @@ struct ImuRuntime {
     lever_alpha: Vector3<f64>,
 }
 
+/// exp(-d^2 / 2), d the Mahalanobis distance of zero from the model's rates (diagonal): 1 at
+/// rest, vanishing for a body moving well past its own uncertainty.
+fn zero_velocity_likelihood(model: &ImmModel, layout: eskf::Layout) -> f64 {
+    let mut rates: Vec<(usize, f64)> = (0..3).map(|i| (3 + i, model.state.velocity[i])).collect();
+    if let Some(col) = layout.angular_velocity_col() {
+        rates.extend((0..3).map(|i| (col + i, model.state.angular_velocity[i])));
+    }
+    let distance_sq: f64 = rates
+        .iter()
+        .filter(|(col, _)| model.covariance[(*col, *col)] > 0.0)
+        .map(|(col, rate)| rate * rate / model.covariance[(*col, *col)])
+        .sum();
+    (-0.5 * distance_sq).exp()
+}
+
 fn likelier(models: &[ImmModel]) -> usize {
     (0..models.len())
         .max_by(|a, b| models[*a].probability.total_cmp(&models[*b].probability))
@@ -828,7 +843,15 @@ impl FusionCore {
         let elapsed = (ts_ns - self.imm_start_ns) as f64 / 1.0e9;
         let rate = (switches + 1) as f64 / elapsed;
         let switch = (1.0 - (-rate * dt).exp()).min(0.5);
-        let transition = |from: usize, to: usize| if from == to { 1.0 - switch } else { switch };
+        // Stopping takes being slow first: moving -> stopped is scaled by how likely the moving
+        // model finds zero velocity, else a fast body is pulled towards rest every step.
+        let stopping = switch * zero_velocity_likelihood(&models[0], self.filter.layout);
+        let transition = |from: usize, to: usize| match (from, to) {
+            (0, 1) => stopping,
+            (0, _) => 1.0 - stopping,
+            (_, 0) => switch,
+            _ => 1.0 - switch,
+        };
         // A body that starts moving starts at rates nothing has measured yet: the stopped
         // model's certain zero would hold the moving one back, so a start carries the moving
         // model's own rate uncertainty, which its process noise kept growing.
