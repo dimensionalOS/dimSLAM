@@ -191,12 +191,12 @@ pub struct OdometryFusionConfig {
     /// half second, per axis (the pre-0.5 behavior). Twist is not used, so every source needs
     /// pose_variances.
     pub no_imu_blend: bool,
-    /// Interacting multiple model: >0 runs a stopped model (pose held, no motion noise) beside
+    /// Interacting multiple model: runs a stopped model (pose held, no motion noise) beside
     /// the moving one and outputs their mixture, weighted by how well each explains the data,
     /// so a body at rest stops jittering under its sources' noise while any motion hands back
-    /// to the moving model within a few messages. The value is how often the body is expected
-    /// to switch between moving and stopped, per second; 0 runs the moving model alone.
-    pub imm_switch_rate: f64,
+    /// to the moving model within a few messages. How often the body switches between the two
+    /// is learned as it runs: the switches it has made, plus one, over the time it has run.
+    pub imm: bool,
 }
 
 /// 1-sigma uncertainty the filter starts with, per state block. The bias std applies to
@@ -248,7 +248,7 @@ impl Default for OdometryFusionConfig {
             planar: false,
             zero_velocity_variances: [0.0; 6],
             no_imu_blend: false,
-            imm_switch_rate: 0.0,
+            imm: false,
         }
     }
 }
@@ -308,8 +308,10 @@ struct Event {
     state: State,
     covariance: Cov,
     sources: Vec<SourceRuntime>,
-    /// `imm_switch_rate` > 0: the moving model, then the stopped one. `state` is their mixture.
+    /// `imm`: the moving model, then the stopped one. `state` is their mixture.
     imm: Vec<ImmModel>,
+    /// `imm`: how many times the likelier model has changed since init.
+    imm_switches: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -329,6 +331,7 @@ impl Event {
             covariance: Cov::zeros(0, 0),
             sources: Vec::new(),
             imm: Vec::new(),
+            imm_switches: 0,
         }
     }
 }
@@ -345,6 +348,12 @@ struct ImuRuntime {
     lever_alpha: Vector3<f64>,
 }
 
+fn likelier(models: &[ImmModel]) -> usize {
+    (0..models.len())
+        .max_by(|a, b| models[*a].probability.total_cmp(&models[*b].probability))
+        .unwrap_or(0)
+}
+
 pub struct FusionCore {
     config: OdometryFusionConfig,
     filter: Filter,
@@ -352,6 +361,8 @@ pub struct FusionCore {
     /// Per source, the filter's pose-clone slot: `pose_delta` sources that fuse a pose.
     clone_slots: Vec<Option<usize>>,
     initialized: bool,
+    /// When the filter initialized: the IMM's switch rate is counted from here.
+    imm_start_ns: i64,
     imu_runtime: Vec<ImuRuntime>,
     events: VecDeque<Event>,
     /// Per-source last raw pose and stamp. A delta belongs to the message stream, so replay
@@ -389,6 +400,7 @@ impl FusionCore {
             sources: vec![SourceRuntime::default(); source_count],
             clone_slots,
             initialized: false,
+            imm_start_ns: 0,
             imu_runtime,
             events: VecDeque::new(),
             previous_source_pose: vec![None; source_count],
@@ -641,21 +653,17 @@ impl FusionCore {
                 "source {name:?} fuses no pose, and no_imu_blend blends poses only"
             );
         }
-        assert!(
-            self.config.imm_switch_rate >= 0.0,
-            "imm_switch_rate is a rate: at or above zero"
-        );
         for source in &self.config.odom_sources {
             assert!(
-                self.config.imm_switch_rate == 0.0 || source.still_variance == 0.0,
+                !self.config.imm || source.still_variance == 0.0,
                 "source {:?} sets still_variance, but the imm's stopped model already is the \
                  zero-velocity hypothesis: zero one or the other",
                 source.parent_frame_id
             );
         }
         assert!(
-            !(self.config.no_imu_blend && self.config.imm_switch_rate > 0.0),
-            "no_imu_blend replaces the filter, so it has no models to mix: zero imm_switch_rate"
+            !(self.config.no_imu_blend && self.config.imm),
+            "no_imu_blend replaces the filter, so it has no models to mix: turn imm off"
         );
         assert!(
             !(self.config.no_imu_blend && self.config.use_imu()),
@@ -726,6 +734,7 @@ impl FusionCore {
             &self.config.initial_stds,
         );
         self.initialized = true;
+        self.imm_start_ns = timestamp_ns;
         self.last_publish_ns = timestamp_ns;
         let mut seed = Event::empty(timestamp_ns, EventKind::Seed);
         self.snapshot(&mut seed);
@@ -802,7 +811,7 @@ impl FusionCore {
     }
 
     fn imm(&self) -> bool {
-        self.config.imm_switch_rate > 0.0
+        self.config.imm
     }
 
     /// One IMM cycle: mix the models' priors through the switch probabilities, step each under
@@ -810,8 +819,15 @@ impl FusionCore {
     fn process_at_imm(&mut self, index: usize) {
         let ts_ns = self.events[index].ts_ns;
         let models = self.events[index - 1].imm.clone();
-        let dt = (ts_ns - self.events[index - 1].ts_ns) as f64 / 1.0e9;
-        let switch = 1.0 - (-self.config.imm_switch_rate * dt).exp();
+        let previous = &self.events[index - 1];
+        let dt = (ts_ns - previous.ts_ns) as f64 / 1.0e9;
+        let switches = previous.imm_switches;
+        let previous_likelier = likelier(&models);
+        // The switch rate's posterior mean under a flat prior: one switch more than seen, over
+        // the time run. Capped at a coin flip, which is no memory at all.
+        let elapsed = (ts_ns - self.imm_start_ns) as f64 / 1.0e9;
+        let rate = (switches + 1) as f64 / elapsed;
+        let switch = (1.0 - (-rate * dt).exp()).min(0.5);
         let transition = |from: usize, to: usize| if from == to { 1.0 - switch } else { switch };
         let mut stepped = Vec::new();
         let mut log_weights = Vec::new();
@@ -893,6 +909,7 @@ impl FusionCore {
             Event::empty(ts_ns, EventKind::Seed),
         );
         self.snapshot(&mut event);
+        event.imm_switches = switches + u64::from(likelier(&stepped) != previous_likelier);
         event.imm = stepped;
         self.events[index] = event;
     }
@@ -1499,7 +1516,7 @@ mod tests {
             planar: false,
             zero_velocity_variances: [0.0; 6],
             no_imu_blend: false,
-            imm_switch_rate: 0.0,
+            imm: false,
         }
     }
 
@@ -2174,12 +2191,12 @@ mod tests {
     /// The robot stands still for 5 s, then drives at 0.5 m/s for 5 s, wheels at 50 Hz and a
     /// pose source at 10 Hz with +-2 mm of alternating noise. Returns the published x
     /// (truth subtracted) through the still half and the moving half, and the final x.
-    fn still_then_moving(imm_switch_rate: f64) -> (Vec<f64>, Vec<f64>, f64) {
+    fn still_then_moving(imm: bool) -> (Vec<f64>, Vec<f64>, f64) {
         let mut config = base_config(false);
         config.publish_rate = 50.0;
-        config.imm_switch_rate = imm_switch_rate;
+        config.imm = imm;
         let mut wheel = source("wheel", SourceKind::Twist);
-        if imm_switch_rate == 0.0 {
+        if !imm {
             wheel.still_variance = 1e-6;
             wheel.still_speed = 1e-3;
             wheel.still_angular_speed = 1e-3;
@@ -2216,8 +2233,8 @@ mod tests {
 
     #[test]
     fn imm_removes_the_jitter_at_rest_and_keeps_the_accuracy_in_motion() {
-        let (single_still, single_moving, _) = still_then_moving(0.0);
-        let (imm_still, imm_moving, _) = still_then_moving(0.1);
+        let (single_still, single_moving, _) = still_then_moving(false);
+        let (imm_still, imm_moving, _) = still_then_moving(true);
         // At rest the stopped model's pose is the running mean of the source, so what is left
         // of the jitter shrinks as one over the messages heard.
         assert!(
@@ -2239,7 +2256,7 @@ mod tests {
     fn imm_hands_a_push_the_still_wheels_miss_to_the_moving_model() {
         let truth = |ts_ns: i64| (0.3 * (ts_ns as f64 / 1.0e9 - 4.0)).clamp(0.0, 0.6);
         let mut config = base_config(false);
-        config.imm_switch_rate = 0.1;
+        config.imm = true;
         config.odom_sources = vec![
             source("lio", SourceKind::Pose),
             source("wheel", SourceKind::Twist),
@@ -2261,7 +2278,7 @@ mod tests {
     fn imm_replays_a_late_message_to_the_same_state_as_one_in_order() {
         let run = |late: bool| {
             let mut config = base_config(false);
-            config.imm_switch_rate = 0.1;
+            config.imm = true;
             config.odom_sources = vec![
                 source("lio", SourceKind::Pose),
                 source("wheel", SourceKind::Twist),
