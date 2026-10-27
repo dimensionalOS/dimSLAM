@@ -191,6 +191,12 @@ pub struct OdometryFusionConfig {
     /// half second, per axis (the pre-0.5 behavior). Twist is not used, so every source needs
     /// pose_variances.
     pub no_imu_blend: bool,
+    /// Interacting multiple model: >0 runs a stopped model (pose held, no motion noise) beside
+    /// the moving one and outputs their mixture, weighted by how well each explains the data,
+    /// so a body at rest stops jittering under its sources' noise while any motion hands back
+    /// to the moving model within a few messages. The value is how often the body is expected
+    /// to switch between moving and stopped, per second; 0 runs the moving model alone.
+    pub imm_switch_rate: f64,
 }
 
 /// 1-sigma uncertainty the filter starts with, per state block. The bias std applies to
@@ -242,6 +248,7 @@ impl Default for OdometryFusionConfig {
             planar: false,
             zero_velocity_variances: [0.0; 6],
             no_imu_blend: false,
+            imm_switch_rate: 0.0,
         }
     }
 }
@@ -301,6 +308,16 @@ struct Event {
     state: State,
     covariance: Cov,
     sources: Vec<SourceRuntime>,
+    /// `imm_switch_rate` > 0: the moving model, then the stopped one. `state` is their mixture.
+    imm: Vec<ImmModel>,
+}
+
+#[derive(Clone, Debug)]
+struct ImmModel {
+    state: State,
+    covariance: Cov,
+    sources: Vec<SourceRuntime>,
+    probability: f64,
 }
 
 impl Event {
@@ -311,6 +328,7 @@ impl Event {
             state: State::default(),
             covariance: Cov::zeros(0, 0),
             sources: Vec::new(),
+            imm: Vec::new(),
         }
     }
 }
@@ -624,6 +642,22 @@ impl FusionCore {
             );
         }
         assert!(
+            self.config.imm_switch_rate >= 0.0,
+            "imm_switch_rate is a rate: at or above zero"
+        );
+        for source in &self.config.odom_sources {
+            assert!(
+                self.config.imm_switch_rate == 0.0 || source.still_variance == 0.0,
+                "source {:?} sets still_variance, but the imm's stopped model already is the \
+                 zero-velocity hypothesis: zero one or the other",
+                source.parent_frame_id
+            );
+        }
+        assert!(
+            !(self.config.no_imu_blend && self.config.imm_switch_rate > 0.0),
+            "no_imu_blend replaces the filter, so it has no models to mix: zero imm_switch_rate"
+        );
+        assert!(
             !(self.config.no_imu_blend && self.config.use_imu()),
             "no_imu_blend replaces the filter, so it cannot take imus: empty one or the other"
         );
@@ -695,6 +729,15 @@ impl FusionCore {
         self.last_publish_ns = timestamp_ns;
         let mut seed = Event::empty(timestamp_ns, EventKind::Seed);
         self.snapshot(&mut seed);
+        if self.imm() {
+            let model = ImmModel {
+                state: seed.state.clone(),
+                covariance: seed.covariance.clone(),
+                sources: seed.sources.clone(),
+                probability: 0.5,
+            };
+            seed.imm = vec![model.clone(), model];
+        }
         self.events.push_back(seed);
         info!(
             gyro_biases = ?gyro_bias_norms,
@@ -738,12 +781,123 @@ impl FusionCore {
     }
 
     fn process_at(&mut self, index: usize) {
+        if self.imm() {
+            self.process_at_imm(index);
+            return;
+        }
         {
             let previous = &self.events[index - 1];
             self.filter.x = previous.state.clone();
             self.filter.p_cov = previous.covariance.clone();
             self.sources = previous.sources.clone();
         }
+        self.step(index);
+        let ts_ns = self.events[index].ts_ns;
+        let mut event = std::mem::replace(
+            &mut self.events[index],
+            Event::empty(ts_ns, EventKind::Seed),
+        );
+        self.snapshot(&mut event);
+        self.events[index] = event;
+    }
+
+    fn imm(&self) -> bool {
+        self.config.imm_switch_rate > 0.0
+    }
+
+    /// One IMM cycle: mix the models' priors through the switch probabilities, step each under
+    /// its own motion model, reweight each by its measurement likelihood, output the mixture.
+    fn process_at_imm(&mut self, index: usize) {
+        let ts_ns = self.events[index].ts_ns;
+        let models = self.events[index - 1].imm.clone();
+        let dt = (ts_ns - self.events[index - 1].ts_ns) as f64 / 1.0e9;
+        let switch = 1.0 - (-self.config.imm_switch_rate * dt).exp();
+        let transition = |from: usize, to: usize| if from == to { 1.0 - switch } else { switch };
+        let mut stepped = Vec::new();
+        let mut log_weights = Vec::new();
+        let mut moving_counters = (0, 0, 0);
+        for to in 0..models.len() {
+            let predicted: f64 = (0..models.len())
+                .map(|from| transition(from, to) * models[from].probability)
+                .sum();
+            let priors: Vec<(&State, &Cov, f64)> = models
+                .iter()
+                .enumerate()
+                .map(|(from, model)| {
+                    let weight = if predicted > 0.0 {
+                        transition(from, to) * model.probability / predicted
+                    } else {
+                        f64::from(u8::from(from == to))
+                    };
+                    (&model.state, &model.covariance, weight)
+                })
+                .collect();
+            self.filter.mix(&priors);
+            let heaviest = (0..models.len())
+                .max_by(|a, b| priors[*a].2.total_cmp(&priors[*b].2))
+                .expect("two models");
+            self.sources = models[heaviest].sources.clone();
+            self.filter.stopped = to == 1;
+            self.filter.log_likelihood = 0.0;
+            self.step(index);
+            log_weights.push(predicted.ln() + self.filter.log_likelihood);
+            stepped.push(ImmModel {
+                state: self.filter.x.clone(),
+                covariance: self.filter.p_cov.clone(),
+                sources: self.sources.clone(),
+                probability: 0.0,
+            });
+            if to == 0 {
+                moving_counters = (self.gated, self.gate_overrides, self.realigned);
+            }
+        }
+        // The counters report the moving model; the stopped one would double them.
+        (self.gated, self.gate_overrides, self.realigned) = moving_counters;
+        self.filter.stopped = false;
+        // Normalized in log space: a rejected outlier's likelihood underflows f64.
+        let finite_max = log_weights
+            .iter()
+            .cloned()
+            .filter(|w| w.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+        let weights: Vec<f64> = log_weights
+            .iter()
+            .map(|w| {
+                if finite_max.is_finite() && w.is_finite() {
+                    (w - finite_max).exp()
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let total: f64 = weights.iter().sum();
+        for (model, (weight, previous)) in stepped.iter_mut().zip(weights.iter().zip(&models)) {
+            // No usable evidence either way: the switch prior alone.
+            model.probability = if total > 0.0 {
+                weight / total
+            } else {
+                previous.probability
+            };
+        }
+        let mixture: Vec<(&State, &Cov, f64)> = stepped
+            .iter()
+            .map(|model| (&model.state, &model.covariance, model.probability))
+            .collect();
+        self.filter.mix(&mixture);
+        let heaviest = (0..stepped.len())
+            .max_by(|a, b| stepped[*a].probability.total_cmp(&stepped[*b].probability))
+            .expect("two models");
+        self.sources = stepped[heaviest].sources.clone();
+        let mut event = std::mem::replace(
+            &mut self.events[index],
+            Event::empty(ts_ns, EventKind::Seed),
+        );
+        self.snapshot(&mut event);
+        event.imm = stepped;
+        self.events[index] = event;
+    }
+
+    fn step(&mut self, index: usize) {
         // Logs once per event, not again each time a late arrival replays it.
         let replaying = index + 1 < self.events.len();
         let ts_ns = self.events[index].ts_ns;
@@ -763,12 +917,6 @@ impl FusionCore {
             }
             EventKind::Measurement(measurement) => self.apply(&measurement, replaying),
         }
-        let mut event = std::mem::replace(
-            &mut self.events[index],
-            Event::empty(ts_ns, EventKind::Seed),
-        );
-        self.snapshot(&mut event);
-        self.events[index] = event;
     }
 
     fn blending(&self) -> bool {
@@ -820,7 +968,10 @@ impl FusionCore {
             let rows = self.twist_rows(&Twist::default(), &constraint);
             if !rows.is_empty() {
                 let (residual, jacobian, variance) = rows.matrices();
+                // The model's own assumption is no evidence for or against an IMM model.
+                let evidence = self.filter.log_likelihood;
                 self.filter.update(&residual, &jacobian, &variance, 0.0);
+                self.filter.log_likelihood = evidence;
             }
         }
     }
@@ -882,6 +1033,24 @@ impl FusionCore {
             .is_some_and(|previous| self.step_agrees(previous, pose, variance));
         match previous {
             Some(previous) if smooth && !previous.jumped => {
+                // The filter was overconfident: loosen each disagreeing axis just enough that
+                // its residual sits at the gate, so the correction is taken rather than crawled to.
+                let gate = self.config.outlier_rejection_allowed_variance;
+                for dim in 0..6 {
+                    if variance[dim] <= 0.0 || self.pinned(dim) {
+                        continue;
+                    }
+                    let (col, residual) = if dim < 3 {
+                        (dim, position_residual[dim])
+                    } else {
+                        (3 + dim, rotation_residual[dim - 3])
+                    };
+                    let needed = residual * residual / gate - variance[dim];
+                    let current = self.filter.p_cov[(col, col)];
+                    if needed > current {
+                        self.filter.p_cov[(col, col)] = needed;
+                    }
+                }
                 let (residual, jacobian, variance) = rows.matrices();
                 self.filter.update(&residual, &jacobian, &variance, 0.0);
                 self.gate_overrides += 1;
@@ -1330,6 +1499,7 @@ mod tests {
             planar: false,
             zero_velocity_variances: [0.0; 6],
             no_imu_blend: false,
+            imm_switch_rate: 0.0,
         }
     }
 
@@ -1999,5 +2169,131 @@ mod tests {
         );
         assert!(last.3 < 0.999, "the fused pose barely turned: {last:?}");
         assert_eq!(first, run());
+    }
+
+    /// The robot stands still for 5 s, then drives at 0.5 m/s for 5 s, wheels at 50 Hz and a
+    /// pose source at 10 Hz with +-2 mm of alternating noise. Returns the published x
+    /// (truth subtracted) through the still half and the moving half, and the final x.
+    fn still_then_moving(imm_switch_rate: f64) -> (Vec<f64>, Vec<f64>, f64) {
+        let mut config = base_config(false);
+        config.publish_rate = 50.0;
+        config.imm_switch_rate = imm_switch_rate;
+        let mut wheel = source("wheel", SourceKind::Twist);
+        if imm_switch_rate == 0.0 {
+            wheel.still_variance = 1e-6;
+            wheel.still_speed = 1e-3;
+            wheel.still_angular_speed = 1e-3;
+        }
+        config.odom_sources = vec![source("lio", SourceKind::Pose), wheel];
+        let truth = |ts_ns: i64| (0.5 * (ts_ns as f64 / 1.0e9 - 5.0)).max(0.0);
+        let mut core = FusionCore::new(config);
+        let (mut still, mut moving) = (Vec::new(), Vec::new());
+        for step in 0..500_i64 {
+            let ts_ns = step * 20 * MS;
+            let speed = if ts_ns >= 5_000 * MS { 0.5 } else { 0.0 };
+            core.handle_source(&twist_message("wheel", ts_ns, speed, 0.0));
+            if step % 5 == 0 {
+                let noise = if step % 10 == 0 { 0.002 } else { -0.002 };
+                core.handle_source(&pose_message("lio", ts_ns, truth(ts_ns) + noise));
+            }
+            let Some(msg) = core.maybe_publish_at(ts_ns + MS) else {
+                continue;
+            };
+            let error = msg.pose.translation.x - truth(ts_ns + MS);
+            if (2_500..5_000).contains(&(step * 20)) {
+                still.push(error);
+            } else if step * 20 >= 6_000 {
+                moving.push(error);
+            }
+        }
+        (still, moving, core.filter.x.position.x)
+    }
+
+    fn range(values: &[f64]) -> f64 {
+        values.iter().cloned().fold(f64::MIN, f64::max)
+            - values.iter().cloned().fold(f64::MAX, f64::min)
+    }
+
+    #[test]
+    fn imm_removes_the_jitter_at_rest_and_keeps_the_accuracy_in_motion() {
+        let (single_still, single_moving, _) = still_then_moving(0.0);
+        let (imm_still, imm_moving, _) = still_then_moving(0.1);
+        // At rest the stopped model's pose is the running mean of the source, so what is left
+        // of the jitter shrinks as one over the messages heard.
+        assert!(
+            range(&imm_still) < range(&single_still) / 4.0,
+            "imm {} single {}",
+            range(&imm_still),
+            range(&single_still)
+        );
+        let worst = |errors: &[f64]| errors.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
+        assert!(
+            worst(&imm_moving) <= worst(&single_moving) + 1e-3,
+            "imm {} single {}",
+            worst(&imm_moving),
+            worst(&single_moving)
+        );
+    }
+
+    #[test]
+    fn imm_hands_a_push_the_still_wheels_miss_to_the_moving_model() {
+        let truth = |ts_ns: i64| (0.3 * (ts_ns as f64 / 1.0e9 - 4.0)).clamp(0.0, 0.6);
+        let mut config = base_config(false);
+        config.imm_switch_rate = 0.1;
+        config.odom_sources = vec![
+            source("lio", SourceKind::Pose),
+            source("wheel", SourceKind::Twist),
+        ];
+        let mut core = FusionCore::new(config);
+        for step in 0..=600_i64 {
+            let ts_ns = step * 20 * MS;
+            core.handle_twist_source_still(ts_ns);
+            if step % 5 == 0 {
+                core.handle_source(&pose_message("lio", ts_ns, truth(ts_ns)));
+            }
+        }
+        assert_eq!(core.realigned, 0);
+        let x = core.filter.x.position.x;
+        assert!((x - 0.6).abs() < 0.05, "{x}");
+    }
+
+    #[test]
+    fn imm_replays_a_late_message_to_the_same_state_as_one_in_order() {
+        let run = |late: bool| {
+            let mut config = base_config(false);
+            config.imm_switch_rate = 0.1;
+            config.odom_sources = vec![
+                source("lio", SourceKind::Pose),
+                source("wheel", SourceKind::Twist),
+            ];
+            let mut core = FusionCore::new(config);
+            let mut held = None;
+            for step in 0..=50_i64 {
+                let ts_ns = step * 20 * MS;
+                if step % 5 == 0 {
+                    let lio = pose_message("lio", ts_ns, 0.3 * ts_ns as f64 / 1.0e9);
+                    if late && step == 25 {
+                        held = Some(lio);
+                    } else {
+                        core.handle_source(&lio);
+                    }
+                }
+                core.handle_source(&twist_message("wheel", ts_ns, 0.3, 0.0));
+                if step == 30 {
+                    if let Some(lio) = held.take() {
+                        core.handle_source(&lio);
+                    }
+                }
+            }
+            (
+                core.filter.x.position,
+                core.events.back().map(|e| e.imm[1].probability),
+            )
+        };
+        // The late lio lands after the wheel of the same stamp instead of before it.
+        let ((in_order, p_in_order), (late, p_late)) = (run(false), run(true));
+        assert!((in_order - late).norm() < 1e-9, "{in_order} {late}");
+        let (p_in_order, p_late) = (p_in_order.expect("imm"), p_late.expect("imm"));
+        assert!((p_in_order - p_late).abs() <= 1e-9 * p_in_order.max(p_late));
     }
 }

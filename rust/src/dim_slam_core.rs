@@ -77,6 +77,8 @@ pub struct DimSlamCoreConfig {
     pub zero_velocity_variances: [f64; 6],
     /// See [`OdometryFusionConfig::no_imu_blend`].
     pub no_imu_blend: bool,
+    /// See [`OdometryFusionConfig::imm_switch_rate`].
+    pub imm_switch_rate: f64,
 }
 
 /// Defers to the two cores so a field's default cannot drift from the core that reads it.
@@ -109,6 +111,7 @@ impl Default for DimSlamCoreConfig {
             planar: fusion.planar,
             zero_velocity_variances: fusion.zero_velocity_variances,
             no_imu_blend: fusion.no_imu_blend,
+            imm_switch_rate: fusion.imm_switch_rate,
         }
     }
 }
@@ -164,6 +167,7 @@ impl DimSlamCore {
             planar: config.planar,
             zero_velocity_variances: config.zero_velocity_variances,
             no_imu_blend: config.no_imu_blend,
+            imm_switch_rate: config.imm_switch_rate,
         };
         Ok(Self {
             visual_odometry,

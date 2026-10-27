@@ -147,6 +147,10 @@ pub struct Filter {
     pub process_noise: ProcessNoise,
     pub gravity: f64,
     pub planar: bool,
+    /// The IMM's stopped model: prediction holds the pose and zeroes the velocity.
+    pub stopped: bool,
+    /// Sum of each update's Gaussian log-likelihood, gated or not: the IMM's evidence.
+    pub log_likelihood: f64,
     pub x: State,
     pub p_cov: Cov,
 }
@@ -214,7 +218,10 @@ impl Filter {
             return true;
         }
         self.x.time_ns = time_ns;
-        let bridged = if self.layout.imus == 0 {
+        let bridged = if self.stopped {
+            self.predict_stopped(dt);
+            true
+        } else if self.layout.imus == 0 {
             self.predict_constant_velocity(dt);
             true
         } else if let Some(input) = self
@@ -273,6 +280,31 @@ impl Filter {
     }
 
     /// One step of dead reckoning from IMU `imu`'s sample, using that IMU's bias and noise.
+    /// The body does not move: the pose is held exactly and every rate is zero, known for
+    /// certain. Only IMU biases random-walk.
+    fn predict_stopped(&mut self, dt: f64) {
+        self.x.velocity = Vector3::zeros();
+        self.x.angular_velocity = Vector3::zeros();
+        let mut rate_cols = vec![3];
+        rate_cols.extend(self.layout.angular_velocity_col());
+        for col in rate_cols {
+            for offset in col..col + 3 {
+                self.p_cov.row_mut(offset).fill(0.0);
+                self.p_cov.column_mut(offset).fill(0.0);
+            }
+        }
+        for (imu, noise) in self.noise.iter().enumerate() {
+            for (col, density) in [
+                (self.layout.gyro_bias_col(imu), noise.gyro_random_walk),
+                (self.layout.accel_bias_col(imu), noise.accel_random_walk),
+            ] {
+                for offset in col..col + 3 {
+                    self.p_cov[(offset, offset)] += density * density * dt;
+                }
+            }
+        }
+    }
+
     fn predict_inertial(&mut self, dt: f64, imu: usize, gyro: &Vector3<f64>, accel: &Vector3<f64>) {
         let dim = self.dim();
         let layout = self.layout;
@@ -401,6 +433,15 @@ impl Filter {
         variance: &DVector<f64>,
         gate: f64,
     ) -> bool {
+        let innovation =
+            jacobian * &self.p_cov * jacobian.transpose() + Cov::from_diagonal(variance);
+        if let Some(cholesky) = innovation.clone().cholesky() {
+            let log_det: f64 = cholesky.l().diagonal().iter().map(|v| 2.0 * v.ln()).sum();
+            let mahalanobis_sq = residual.dot(&cholesky.solve(residual));
+            let dims = residual.len() as f64;
+            self.log_likelihood -=
+                0.5 * (mahalanobis_sq + log_det + dims * (2.0 * std::f64::consts::PI).ln());
+        }
         let Some(innovation_inverse) =
             self.gated_innovation_inverse(residual, jacobian, variance, gate)
         else {
@@ -414,6 +455,61 @@ impl Filter {
             + &kalman_gain * noise * kalman_gain.transpose();
         self.inject(&dx);
         true
+    }
+
+    /// The error vector that takes `self.x` to `other`: `other = self.x [+] difference`.
+    fn difference(&self, other: &State) -> DVector<f64> {
+        let layout = self.layout;
+        let mut dx = DVector::zeros(self.dim());
+        dx.fixed_rows_mut::<3>(0)
+            .copy_from(&(other.position - self.x.position));
+        dx.fixed_rows_mut::<3>(3)
+            .copy_from(&(other.velocity - self.x.velocity));
+        dx.fixed_rows_mut::<3>(6)
+            .copy_from(&(self.x.q.inverse() * other.q).scaled_axis());
+        if let Some(col) = layout.angular_velocity_col() {
+            dx.fixed_rows_mut::<3>(col)
+                .copy_from(&(other.angular_velocity - self.x.angular_velocity));
+        }
+        for (imu, (mine, theirs)) in self.x.biases.iter().zip(&other.biases).enumerate() {
+            dx.fixed_rows_mut::<3>(layout.gyro_bias_col(imu))
+                .copy_from(&(theirs.gyro - mine.gyro));
+            dx.fixed_rows_mut::<3>(layout.accel_bias_col(imu))
+                .copy_from(&(theirs.accel - mine.accel));
+        }
+        for (slot, (mine, theirs)) in self.x.clones.iter().zip(&other.clones).enumerate() {
+            if let (Some(mine), Some(theirs)) = (mine, theirs) {
+                dx.fixed_rows_mut::<3>(layout.clone_position_col(slot))
+                    .copy_from(&(theirs.position - mine.position));
+                dx.fixed_rows_mut::<3>(layout.clone_rotation_col(slot))
+                    .copy_from(&(mine.q.inverse() * theirs.q).scaled_axis());
+            }
+        }
+        dx
+    }
+
+    /// The Gaussian mixture of `models` (state, covariance, weight) moment-matched into one,
+    /// linearized about the heaviest: the IMM's mixing and its combined output.
+    pub fn mix(&mut self, models: &[(&State, &Cov, f64)]) {
+        let reference = models
+            .iter()
+            .max_by(|a, b| a.2.total_cmp(&b.2))
+            .expect("at least one model");
+        self.x = reference.0.clone();
+        let deltas: Vec<DVector<f64>> = models.iter().map(|m| self.difference(m.0)).collect();
+        let mean: DVector<f64> = deltas
+            .iter()
+            .zip(models)
+            .map(|(delta, m)| delta * m.2)
+            .fold(DVector::zeros(self.dim()), |sum, term| sum + term);
+        let mut p_cov = Cov::zeros(self.dim(), self.dim());
+        for (delta, m) in deltas.iter().zip(models) {
+            let spread = delta - &mean;
+            p_cov += (m.1 + &spread * spread.transpose()) * m.2;
+        }
+        self.p_cov = p_cov;
+        self.inject(&mean);
+        self.constrain();
     }
 
     fn inject(&mut self, dx: &DVector<f64>) {
