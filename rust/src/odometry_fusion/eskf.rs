@@ -119,8 +119,6 @@ pub struct State {
     pub biases: Vec<ImuBias>,
     pub input: Option<ImuInput>,
     pub clones: Vec<Option<PoseClone>>,
-    /// A twist source said the body is still: the constant-velocity model holds it without noise.
-    pub still: bool,
 }
 
 impl Default for State {
@@ -134,7 +132,6 @@ impl Default for State {
             biases: Vec::new(),
             input: None,
             clones: Vec::new(),
-            still: false,
         }
     }
 }
@@ -236,9 +233,6 @@ impl Filter {
     }
 
     fn predict_constant_velocity(&mut self, dt: f64) {
-        if self.x.still {
-            return;
-        }
         let dim = self.dim();
         let omega_col = self.layout.angular_velocity_col().expect("no imu");
         let rotation_step = UnitQuaternion::from_scaled_axis(self.x.angular_velocity * dt);

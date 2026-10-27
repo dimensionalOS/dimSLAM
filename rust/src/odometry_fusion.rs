@@ -76,13 +76,10 @@ pub struct SourceConfig {
     pub pose_variances: [f64; 6],
     /// [vx vy vz wx wy wz], same convention, body frame.
     pub twist_variances: [f64; 6],
-    /// `pose` only: after rejecting this source this long without a break, the source's frame
-    /// is re-aligned to the fused pose rather than kept out for good. 0 never re-aligns.
-    pub realign_after_seconds: f64,
     /// Zero-velocity update: a twist at or under `still_speed` (m/s) and `still_angular_speed`
-    /// (rad/s) says the body is still: it is fused as zero velocity with `still_variance` in
-    /// every axis and, without an IMU, the motion model adds no noise until the source reports
-    /// motion, so the pose settles instead of wandering under the other sources' noise. 0 disables.
+    /// (rad/s) is fused as zero velocity with `still_variance` in every axis, in place of the
+    /// twist itself. It holds only for that message: the motion model keeps its noise, so a
+    /// push the wheels cannot see still loosens the pose for the other sources. 0 disables.
     pub still_variance: f64,
     pub still_speed: f64,
     pub still_angular_speed: f64,
@@ -189,6 +186,11 @@ pub struct OdometryFusionConfig {
     /// 0 leaves the axis free. Ungated: it is the model's own assumption, not a sensor. With an
     /// IMU the angular entries are ignored: the gyro measures rate, so they could only drag its bias.
     pub zero_velocity_variances: [f64; 6],
+    /// Without an IMU, skip the filter: each source's motion since its previous message moves
+    /// the fused pose by its inverse-variance share among the sources heard from in the last
+    /// half second, per axis (the pre-0.5 behavior). Twist is not used, so every source needs
+    /// pose_variances.
+    pub no_imu_blend: bool,
 }
 
 /// 1-sigma uncertainty the filter starts with, per state block. The bias std applies to
@@ -239,6 +241,7 @@ impl Default for OdometryFusionConfig {
             odom_sources: Vec::new(),
             planar: false,
             zero_velocity_variances: [0.0; 6],
+            no_imu_blend: false,
         }
     }
 }
@@ -248,7 +251,7 @@ struct Measurement {
     source: usize,
     /// Planar-projected in planar mode. For `pose_delta`, marks that this message re-clones.
     pose: Option<Isometry3<f64>>,
-    /// `pose_delta`: the motion since the source's previous message.
+    /// `pose_delta`, or any source under `no_imu_blend`: the motion since its previous message.
     delta: Option<Isometry3<f64>>,
     pose_variance: [f64; 6], // 0 means dropped
     twist: Option<Twist>,
@@ -260,9 +263,26 @@ struct Measurement {
 struct SourceRuntime {
     /// `pose`: fused_from_source_world, set from its first message and by a re-align.
     alignment: Option<Isometry3<f64>>,
-    /// `pose`: when its current unbroken run of gate rejections began.
-    rejected_since_ns: Option<i64>,
+    /// `pose`: its previous message, to tell a jump in the source from drift in the filter.
+    previous: Option<PreviousPose>,
+    /// `no_imu_blend`: the fused pose at its previous message, its last stamp and its shares.
+    blend_anchor: Option<Isometry3<f64>>,
+    blend_last_ns: i64,
+    blend_inverse_variance: [f64; 6],
 }
+
+#[derive(Clone, Debug)]
+struct PreviousPose {
+    source_pose: Isometry3<f64>,
+    fused_pose: Isometry3<f64>,
+    /// The fused [position, rotation] variances then.
+    fused_variance: [f64; 6],
+    /// Gated as a jump: one more message that moves on from it confirms the jump.
+    jumped: bool,
+}
+
+/// A source keeps its share of the no-IMU blend until it has been silent this long.
+const BLEND_ACTIVITY_TIMEOUT_SECONDS: f64 = 0.5;
 
 // The snapshot alongside the kind dwarfs any variant, so boxing buys nothing.
 #[allow(clippy::large_enum_variant)]
@@ -323,6 +343,8 @@ pub struct FusionCore {
     imu_samples: u64,
     measurements: u64,
     gated: u64,
+    /// `pose` messages fused past the gate: the source moved on smoothly, so the filter drifted.
+    gate_overrides: u64,
     realigned: u64,
     replayed: u64,
     too_late: u64,
@@ -356,6 +378,7 @@ impl FusionCore {
             imu_samples: 0,
             measurements: 0,
             gated: 0,
+            gate_overrides: 0,
             realigned: 0,
             replayed: 0,
             too_late: 0,
@@ -542,7 +565,8 @@ impl FusionCore {
             }
         });
         let mut delta = None;
-        if source_config.kind == SourceKind::PoseDelta {
+        let tracks_delta = source_config.kind == SourceKind::PoseDelta || self.blending();
+        if tracks_delta {
             if let (Some(pose), Some((previous_ns, previous))) =
                 (pose, self.previous_source_pose[source])
             {
@@ -558,7 +582,6 @@ impl FusionCore {
             }
         }
 
-        let kind = source_config.kind;
         let twist = (source_config.uses_twist() && twist_finite).then_some(msg.twist);
         let inserted = self.insert(Event::empty(
             msg.timestamp_ns,
@@ -571,7 +594,7 @@ impl FusionCore {
                 twist_variance,
             }),
         ));
-        if inserted && kind == SourceKind::PoseDelta {
+        if inserted && tracks_delta {
             if let Some(pose) = pose {
                 self.previous_source_pose[source] = Some((msg.timestamp_ns, pose));
             }
@@ -596,10 +619,14 @@ impl FusionCore {
                 "source {name:?} fuses nothing: set pose_variances or twist_variances"
             );
             assert!(
-                source.realign_after_seconds >= 0.0,
-                "source {name:?} needs realign_after_seconds at or above zero"
+                !self.config.no_imu_blend || source.uses_pose(),
+                "source {name:?} fuses no pose, and no_imu_blend blends poses only"
             );
         }
+        assert!(
+            !(self.config.no_imu_blend && self.config.use_imu()),
+            "no_imu_blend replaces the filter, so it cannot take imus: empty one or the other"
+        );
         if !self.config.use_imu() {
             let noise = &self.config.process_noise;
             assert!(
@@ -731,7 +758,10 @@ impl FusionCore {
         match kind {
             EventKind::Seed => {}
             EventKind::Imu(input) => self.filter.x.input = Some(input),
-            EventKind::Measurement(measurement) => self.apply(&measurement, ts_ns, replaying),
+            EventKind::Measurement(measurement) if self.blending() => {
+                self.blend(&measurement, ts_ns)
+            }
+            EventKind::Measurement(measurement) => self.apply(&measurement, replaying),
         }
         let mut event = std::mem::replace(
             &mut self.events[index],
@@ -741,12 +771,16 @@ impl FusionCore {
         self.events[index] = event;
     }
 
-    fn apply(&mut self, measurement: &Measurement, ts_ns: i64, replaying: bool) {
+    fn blending(&self) -> bool {
+        self.config.no_imu_blend && !self.config.use_imu()
+    }
+
+    fn apply(&mut self, measurement: &Measurement, replaying: bool) {
         let source = measurement.source;
         match self.config.odom_sources[source].kind {
             SourceKind::Pose => {
                 if let Some(pose) = &measurement.pose {
-                    self.fuse_pose(source, pose, &measurement.pose_variance, ts_ns, replaying);
+                    self.fuse_pose(source, pose, &measurement.pose_variance, replaying);
                 }
             }
             SourceKind::PoseDelta => {
@@ -766,7 +800,6 @@ impl FusionCore {
             let still = config.still_variance > 0.0
                 && twist.linear.norm() <= config.still_speed
                 && twist.angular.norm() <= config.still_angular_speed;
-            self.filter.x.still = still;
             if still {
                 let mut variance = [config.still_variance; 6];
                 if self.config.use_imu() {
@@ -801,16 +834,20 @@ impl FusionCore {
         Isometry3::from_parts(Translation3::from(self.filter.x.position), self.filter.x.q)
     }
 
+    /// A rejected message is a jump in the source when its step from the previous message
+    /// disagrees with the filter's motion over that step, confirmed (and the source's frame
+    /// re-aligned) when the next message moves on from it. A rejected message that moved on
+    /// smoothly from an accepted one means the filter drifted, so it is fused past the gate.
     fn fuse_pose(
         &mut self,
         source: usize,
         pose: &Isometry3<f64>,
         variance: &[f64; 6],
-        ts_ns: i64,
         replaying: bool,
     ) {
         let Some(alignment) = self.sources[source].alignment else {
             self.sources[source].alignment = Some(self.current_pose() * pose.inverse());
+            self.remember_pose(source, pose, false);
             return;
         };
         let target = alignment * pose;
@@ -834,36 +871,167 @@ impl FusionCore {
         if rows.is_empty() {
             return;
         }
-        if self.update(&rows) {
-            self.sources[source].rejected_since_ns = None;
+        if self.within_gate(&rows) {
+            self.update(&rows);
+            self.remember_pose(source, pose, false);
             return;
         }
-        let realign_after = self.config.odom_sources[source].realign_after_seconds;
-        let since = *self.sources[source].rejected_since_ns.get_or_insert(ts_ns);
-        if realign_after > 0.0 && (ts_ns - since) as f64 >= realign_after * 1.0e9 {
-            // The fused pose stays put and the source's frame moves: odometry must not jump. Only
-            // what disagrees moves, or the heading error of the moment would be locked in.
-            let rotation = if rotation_agrees {
-                alignment.rotation
-            } else {
-                self.filter.x.q * pose.rotation.inverse()
-            };
-            let translation = self.filter.x.position - rotation * pose.translation.vector;
-            self.sources[source].alignment =
-                Some(Isometry3::from_parts(translation.into(), rotation));
-            self.sources[source].rejected_since_ns = None;
-            self.realigned += 1;
-            if !replaying {
-                warn!(
-                    source = %self.config.odom_sources[source].parent_frame_id,
-                    jump_m = position_residual.norm(),
-                    jump_rad = rotation_residual.norm(),
-                    rotation_realigned = !rotation_agrees,
-                    realign_after_seconds = realign_after,
-                    "pose source rejected for too long: re-aligned its frame to the fused pose",
-                );
+        let previous = self.sources[source].previous.clone();
+        let smooth = previous
+            .as_ref()
+            .is_some_and(|previous| self.step_agrees(previous, pose, variance));
+        match previous {
+            Some(previous) if smooth && !previous.jumped => {
+                let (residual, jacobian, variance) = rows.matrices();
+                self.filter.update(&residual, &jacobian, &variance, 0.0);
+                self.gate_overrides += 1;
+                self.remember_pose(source, pose, false);
+                if !replaying {
+                    warn_throttled!(
+                        std::time::Duration::from_secs(10),
+                        source = %self.config.odom_sources[source].parent_frame_id,
+                        jump_m = position_residual.norm(),
+                        jump_rad = rotation_residual.norm(),
+                        "pose source outside the gate but moving smoothly: the filter drifted, \
+                         so it was fused anyway",
+                    );
+                }
+            }
+            Some(_) if smooth => {
+                // The fused pose stays put and the source's frame moves: odometry must not jump.
+                // Only what disagrees moves, or the heading error of the moment would be locked in.
+                let rotation = if rotation_agrees {
+                    alignment.rotation
+                } else {
+                    self.filter.x.q * pose.rotation.inverse()
+                };
+                let translation = self.filter.x.position - rotation * pose.translation.vector;
+                self.sources[source].alignment =
+                    Some(Isometry3::from_parts(translation.into(), rotation));
+                self.realigned += 1;
+                self.remember_pose(source, pose, false);
+                if !replaying {
+                    warn!(
+                        source = %self.config.odom_sources[source].parent_frame_id,
+                        jump_m = position_residual.norm(),
+                        jump_rad = rotation_residual.norm(),
+                        rotation_realigned = !rotation_agrees,
+                        "pose source jumped and stayed: re-aligned its frame to the fused pose",
+                    );
+                }
+            }
+            _ => {
+                self.update(&rows);
+                self.remember_pose(source, pose, true);
             }
         }
+    }
+
+    fn remember_pose(&mut self, source: usize, pose: &Isometry3<f64>, jumped: bool) {
+        let mut fused_variance = [0.0; 6];
+        for (dim, value) in fused_variance.iter_mut().enumerate() {
+            let col = if dim < 3 { dim } else { 3 + dim };
+            *value = self.filter.p_cov[(col, col)];
+        }
+        self.sources[source].previous = Some(PreviousPose {
+            source_pose: *pose,
+            fused_pose: self.current_pose(),
+            fused_variance,
+            jumped,
+        });
+    }
+
+    /// The source's step since `previous` against the filter's over the same span, both in the
+    /// body frame at `previous`, gated like a measurement: two messages' noise plus whatever
+    /// the filter's own uncertainty grew by.
+    fn step_agrees(
+        &self,
+        previous: &PreviousPose,
+        pose: &Isometry3<f64>,
+        variance: &[f64; 6],
+    ) -> bool {
+        let source_step = previous.source_pose.inverse() * pose;
+        let fused_step = previous.fused_pose.inverse() * self.current_pose();
+        let translation = source_step.translation.vector - fused_step.translation.vector;
+        let rotation = (fused_step.rotation.inverse() * source_step.rotation).scaled_axis();
+        let mut distance_sq = 0.0;
+        let mut dims = 0;
+        for dim in 0..6 {
+            if variance[dim] <= 0.0 || self.pinned(dim) {
+                continue;
+            }
+            let col = if dim < 3 { dim } else { 3 + dim };
+            let growth = (self.filter.p_cov[(col, col)] - previous.fused_variance[dim]).max(0.0);
+            let residual = if dim < 3 {
+                translation[dim]
+            } else {
+                rotation[dim - 3]
+            };
+            distance_sq += residual * residual / (2.0 * variance[dim] + growth);
+            dims += 1;
+        }
+        let gate = self.config.outlier_rejection_allowed_variance;
+        gate <= 0.0 || distance_sq < gate * dims as f64
+    }
+
+    /// Not a Kalman update: inverse-variance shares sum to one, so a lone source passes through
+    /// exactly.
+    fn blend(&mut self, measurement: &Measurement, ts_ns: i64) {
+        let source = measurement.source;
+        let horizon = ts_ns - (BLEND_ACTIVITY_TIMEOUT_SECONDS * 1.0e9) as i64;
+        let returning = self.sources[source].blend_last_ns < horizon;
+        self.sources[source].blend_last_ns = ts_ns;
+        for dim in 0..6 {
+            let variance = measurement.pose_variance[dim];
+            self.sources[source].blend_inverse_variance[dim] =
+                if variance > 0.0 && !self.pinned(dim) {
+                    1.0 / variance
+                } else {
+                    0.0
+                };
+        }
+        let current = self.current_pose();
+        let Some(increment) = measurement.delta else {
+            self.sources[source].blend_anchor = Some(current);
+            return;
+        };
+        // Back from a silence the others carried, its delta spans the gap: apply it from where
+        // the fused pose stood at its last message, not on top of what the others added since.
+        let start = match (returning, self.sources[source].blend_anchor) {
+            (false, _) => current,
+            (true, Some(anchor)) => anchor,
+            (true, None) => {
+                self.sources[source].blend_anchor = Some(current);
+                return;
+            }
+        };
+        let step = current.inverse() * (start * increment);
+        let mut share = [0.0; 6];
+        for (dim, share_dim) in share.iter_mut().enumerate() {
+            let total: f64 = self
+                .sources
+                .iter()
+                .filter(|other| other.blend_last_ns >= horizon)
+                .map(|other| other.blend_inverse_variance[dim])
+                .sum();
+            if total > 0.0 {
+                *share_dim = self.sources[source].blend_inverse_variance[dim] / total;
+            }
+        }
+        let translation = step.translation.vector;
+        let rotation = step.rotation.scaled_axis();
+        self.filter.x.position += self.filter.x.q
+            * Vector3::new(
+                share[0] * translation.x,
+                share[1] * translation.y,
+                share[2] * translation.z,
+            );
+        self.filter.x.q *= UnitQuaternion::from_scaled_axis(Vector3::new(
+            share[3] * rotation.x,
+            share[4] * rotation.y,
+            share[5] * rotation.z,
+        ));
+        self.sources[source].blend_anchor = Some(self.current_pose());
     }
 
     /// Stochastic cloning: the measured motion against the filter's own, from the clone taken
@@ -1077,6 +1245,7 @@ impl FusionCore {
             imu_samples = self.imu_samples,
             measurements = self.measurements,
             gated = self.gated,
+            gate_overrides = self.gate_overrides,
             realigned = self.realigned,
             replayed = self.replayed,
             too_late = self.too_late,
@@ -1160,6 +1329,7 @@ mod tests {
             odom_sources: vec![source("odom", SourceKind::Pose)],
             planar: false,
             zero_velocity_variances: [0.0; 6],
+            no_imu_blend: false,
         }
     }
 
@@ -1186,7 +1356,6 @@ mod tests {
             kind,
             pose_variances,
             twist_variances,
-            realign_after_seconds: 1.0,
             ..Default::default()
         }
     }
@@ -1336,7 +1505,7 @@ mod tests {
     }
 
     #[test]
-    fn a_still_twist_source_holds_the_pose_against_a_noisy_pose_source() {
+    fn a_still_twist_source_pins_the_velocity_against_a_noisy_pose_source() {
         let spread = |still_variance: f64| {
             let mut config = base_config(false);
             config.publish_rate = 50.0;
@@ -1356,15 +1525,30 @@ mod tests {
                     core.handle_source(&pose_message("odom", ts_ns, noise));
                 }
                 if step >= 250 {
-                    xs.push(core.maybe_publish_at(ts_ns + MS).map(|m| m.pose.translation.x));
+                    xs.push(
+                        core.maybe_publish_at(ts_ns + MS)
+                            .map(|m| (m.pose.translation.x, m.twist.linear.x)),
+                    );
                 }
             }
-            let xs: Vec<f64> = xs.into_iter().flatten().collect();
-            xs.iter().cloned().fold(f64::MIN, f64::max) - xs.iter().cloned().fold(f64::MAX, f64::min)
+            let xs: Vec<(f64, f64)> = xs.into_iter().flatten().collect();
+            let range = |values: Vec<f64>| {
+                values.iter().cloned().fold(f64::MIN, f64::max)
+                    - values.iter().cloned().fold(f64::MAX, f64::min)
+            };
+            (
+                range(xs.iter().map(|x| x.0).collect()),
+                range(xs.iter().map(|x| x.1).collect()),
+            )
         };
-        let free = spread(0.0);
-        let held = spread(1e-6);
-        assert!(held < free / 5.0, "held {held} free {free}");
+        let (free_x, free_vx) = spread(0.0);
+        let (held_x, held_vx) = spread(1e-6);
+        assert!(held_vx < free_vx / 50.0, "held {held_vx} free {free_vx}");
+        // The motion model keeps its noise, so the pose still averages the source's 4 mm swing down.
+        assert!(
+            held_x <= free_x && held_x < 0.001,
+            "held {held_x} free {free_x}"
+        );
     }
 
     impl FusionCore {
@@ -1463,32 +1647,107 @@ mod tests {
 
     #[test]
     fn a_pose_source_that_jumps_is_gated_then_realigned_without_moving_the_output() {
-        // A 5 m jump in position at 3 s, then one of half a radian in heading at 4.5 s.
+        // The source's frame jumps 5 m at 3 s, then turns half a radian about its origin at 4.5 s.
         let jumped = |ts_ns: i64| {
-            let x = 0.5 * ts_ns as f64 / 1.0e9;
+            let truth = Isometry3::translation(0.5 * ts_ns as f64 / 1.0e9, 0.0, 0.0);
             let shift = if ts_ns >= 3_000 * MS { 5.0 } else { 0.0 };
             let turn = if ts_ns >= 4_500 * MS { 0.5 } else { 0.0 };
-            Isometry3::from_parts(
-                Translation3::new(x + shift, 0.0, 0.0),
+            let frame = Isometry3::from_parts(
+                Translation3::new(shift, 0.0, 0.0),
                 UnitQuaternion::from_euler_angles(0.0, 0.0, turn),
-            )
+            );
+            frame * truth
         };
         let core = wheels_and_pose(|ts_ns| Some(jumped(ts_ns)));
         assert_eq!(core.realigned, 2);
+        // Each jump is gated once, then the next message confirms it.
+        assert_eq!(core.gated, 2);
+        assert_eq!(core.gate_overrides, 0);
         // The wheels agree with the motion before and after, so the output never jumps.
         assert!(
             (core.filter.x.position.x - 3.0).abs() < 0.01,
             "{}",
             core.filter.x.position.x
         );
-        // Not the half radian: only the wheels' own heading drift through the rejected second.
+        // Not the half radian.
         assert!(
             core.filter.x.q.angle() < 0.02,
             "{}",
             core.filter.x.q.angle()
         );
-        let reaccepted = core.sources[0].rejected_since_ns.is_none();
-        assert!(reaccepted, "the source is fused again after the re-align");
+        let previous = core.sources[0]
+            .previous
+            .as_ref()
+            .expect("the source has spoken");
+        assert!(
+            !previous.jumped,
+            "the source is fused again after the re-align"
+        );
+    }
+
+    #[test]
+    fn a_push_the_still_wheels_miss_is_taken_from_the_pose_source() {
+        // Wheels read zero throughout; the body is pushed 0.6 m over 2 s from t = 4 s.
+        let truth = |ts_ns: i64| (0.3 * (ts_ns as f64 / 1.0e9 - 4.0)).clamp(0.0, 0.6);
+        let mut config = base_config(false);
+        let mut wheel = source("wheel", SourceKind::Twist);
+        wheel.still_variance = 1e-6;
+        wheel.still_speed = 1e-3;
+        wheel.still_angular_speed = 1e-3;
+        config.odom_sources = vec![source("lio", SourceKind::Pose), wheel];
+        let mut core = FusionCore::new(config);
+        for step in 0..=600_i64 {
+            let ts_ns = step * 20 * MS;
+            core.handle_twist_source_still(ts_ns);
+            if step % 5 == 0 {
+                core.handle_source(&pose_message("lio", ts_ns, truth(ts_ns)));
+            }
+        }
+        assert_eq!(core.realigned, 0);
+        let x = core.filter.x.position.x;
+        assert!((x - 0.6).abs() < 0.05, "{x}");
+    }
+
+    #[test]
+    fn a_one_message_spike_is_gated_without_moving_the_sources_frame() {
+        let mut config = base_config(false);
+        config.odom_sources = vec![
+            source("lio", SourceKind::Pose),
+            source("wheel", SourceKind::Twist),
+        ];
+        let mut core = FusionCore::new(config);
+        for step in 0..=100_i64 {
+            let ts_ns = step * 20 * MS;
+            core.handle_source(&twist_message("wheel", ts_ns, 0.5, 0.0));
+            if step % 5 == 0 {
+                let spike = if step == 50 { 3.0 } else { 0.0 };
+                core.handle_source(&pose_message(
+                    "lio",
+                    ts_ns,
+                    0.5 * ts_ns as f64 / 1.0e9 + spike,
+                ));
+            }
+        }
+        assert_eq!((core.gated, core.realigned, core.gate_overrides), (1, 0, 0));
+        assert!((core.filter.x.position.x - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn no_imu_blend_splits_each_axis_by_inverse_variance() {
+        let mut config = base_config(false);
+        config.no_imu_blend = true;
+        let mut wheel = source("wheel", SourceKind::PoseDelta);
+        wheel.pose_variances = [3e-4; 6];
+        config.odom_sources = vec![source("lio", SourceKind::PoseDelta), wheel];
+        let mut core = FusionCore::new(config);
+        // lio (1e-4) says 1 m, the wheels (3e-4) 2 m: shares of 3/4 and 1/4.
+        for step in 0..=10_i64 {
+            let ts_ns = step * 100 * MS;
+            core.handle_source(&pose_message("lio", ts_ns, step as f64 * 0.1));
+            core.handle_source(&pose_message("wheel", ts_ns + MS, step as f64 * 0.2));
+        }
+        let x = core.filter.x.position.x;
+        assert!((x - 1.25).abs() < 1e-9, "{x}");
     }
 
     #[test]
@@ -1671,9 +1930,7 @@ mod tests {
 
     #[test]
     fn the_outlier_gate_rejects_a_wild_pose_and_accepts_a_consistent_one() {
-        let mut config = base_config(true);
-        config.odom_sources[0].realign_after_seconds = 0.0;
-        let mut core = FusionCore::new(config);
+        let mut core = FusionCore::new(base_config(true));
         init_imu(&mut core);
         core.handle_source(&pose_message("odom", 50 * MS, 0.0));
         core.handle_source(&pose_message("odom", 100 * MS, 1000.0));
