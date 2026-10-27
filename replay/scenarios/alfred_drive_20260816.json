@@ -1,0 +1,119 @@
+{
+ "name": "alfred_drive_20260816",
+ "description": "Alfred driving 170 s on D455 stereo IR + wheels, no Point-LIO or IMU input (vis_nav); scored against Point-LIO",
+ "recording": "alfred/drive_2026-08-16_23-46-03.db",
+ "duration_seconds": 170.0,
+ "mode": "slam",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom",
+  "map",
+  "visual_odom",
+  "wheel_odom"
+ ],
+ "sources": [
+  {
+   "stream": "wheel_odometry",
+   "frame_id": "wheel_odom",
+   "child_frame_id": "base_link"
+  }
+ ],
+ "images": [
+  "infrared_left",
+  "infrared_right"
+ ],
+ "camera_infos": [
+  "infrared_left_camera_info",
+  "infrared_right_camera_info"
+ ],
+ "reference": {
+  "stream": "odometry",
+  "carry_to": "base_link"
+ },
+ "rest": {
+  "stream": "wheel_odometry",
+  "speed": 0.01,
+  "angular_speed": 0.01,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ },
+ "config": {
+  "camera_mode": "stereo",
+  "cameras": [
+   {
+    "frame_id": "camera_infra1_optical_frame"
+   },
+   {
+    "frame_id": "camera_infra2_optical_frame"
+   }
+  ],
+  "use_gpu": true,
+  "covariance_gate_translation_std": 0.0,
+  "speed_gate_max_linear": 5.0,
+  "speed_gate_max_angular": 12.0,
+  "visual_odom_pose_variances": [
+   0.01,
+   0.01,
+   0.0,
+   0.05,
+   0.05,
+   0.05
+  ],
+  "odom_frame_id": "odom",
+  "output_frame_id": "base_link",
+  "publish_rate": 50.0,
+  "replay_buffer_seconds": 2.0,
+  "outlier_rejection_allowed_variance": 25.0,
+  "max_position_m": 10000.0,
+  "imus": [],
+  "initial_stds": {
+   "position": 0.01,
+   "velocity": 0.1,
+   "rotation": 0.05,
+   "angular_velocity": 0.1,
+   "bias": 0.05
+  },
+  "odom_sources": [
+   {
+    "parent_frame_id": "wheel_odom",
+    "child_frame_id": "base_link",
+    "kind": "pose_delta",
+    "pose_variances": [
+     0.05,
+     0.05,
+     0.001,
+     0.001,
+     0.001,
+     0.0
+    ],
+    "twist_variances": [
+     0.02,
+     0.02,
+     0.0,
+     0.0,
+     0.0,
+     0.05
+    ]
+   }
+  ],
+  "planar": false,
+  "zero_velocity_variances": [
+   0.0,
+   0.0,
+   0.01,
+   0.01,
+   0.01,
+   0.0
+  ]
+ },
+ "variants": {
+  "fixes": {},
+  "imm": {
+   "/imm": true
+  },
+  "blend": {
+   "/no_imu_blend": true
+  }
+ },
+ "expect": {}
+}
