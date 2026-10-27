@@ -829,6 +829,19 @@ impl FusionCore {
         let rate = (switches + 1) as f64 / elapsed;
         let switch = (1.0 - (-rate * dt).exp()).min(0.5);
         let transition = |from: usize, to: usize| if from == to { 1.0 - switch } else { switch };
+        // A body that starts moving starts at rates nothing has measured yet: the stopped
+        // model's certain zero would hold the moving one back, so a start carries the moving
+        // model's own rate uncertainty, which its process noise kept growing.
+        let mut starting = models[1].covariance.clone();
+        let mut rate_cols: Vec<usize> = (3..6).collect();
+        if let Some(col) = self.filter.layout.angular_velocity_col() {
+            rate_cols.extend(col..col + 3);
+        }
+        for &row in &rate_cols {
+            for &col in &rate_cols {
+                starting[(row, col)] = models[0].covariance[(row, col)];
+            }
+        }
         let mut stepped = Vec::new();
         let mut log_weights = Vec::new();
         let mut moving_counters = (0, 0, 0);
@@ -845,7 +858,12 @@ impl FusionCore {
                     } else {
                         f64::from(u8::from(from == to))
                     };
-                    (&model.state, &model.covariance, weight)
+                    let covariance = if from == 1 && to == 0 {
+                        &starting
+                    } else {
+                        &model.covariance
+                    };
+                    (&model.state, covariance, weight)
                 })
                 .collect();
             self.filter.mix(&priors);
@@ -2312,5 +2330,60 @@ mod tests {
         assert!((in_order - late).norm() < 1e-9, "{in_order} {late}");
         let (p_in_order, p_late) = (p_in_order.expect("imm"), p_late.expect("imm"));
         assert!((p_in_order - p_late).abs() <= 1e-9 * p_in_order.max(p_late));
+    }
+
+    #[test]
+    fn imm_follows_a_drifting_visual_source_through_an_arc() {
+        const REST: f64 = 3.0;
+        // Visual pose deltas at 30 Hz, wheels at 50 Hz with no yaw: a 0.5 m/s, 0.3 rad/s arc
+        // after 3 s at rest, the way Alfred fuses heading from vision alone.
+        let truth = |ts_ns: i64| {
+            let t = (ts_ns as f64 / 1.0e9 - REST).max(0.0);
+            let yaw = 0.3 * t;
+            let r = 0.5 / 0.3;
+            Isometry3::from_parts(
+                Translation3::new(r * yaw.sin(), r * (1.0 - yaw.cos()), 0.0),
+                UnitQuaternion::from_euler_angles(0.0, 0.0, yaw),
+            )
+        };
+        let run = |imm: bool, v: f64| {
+            let mut config = base_config(false);
+            config.imm = imm;
+            let mut visual = source("visual_odom", SourceKind::PoseDelta);
+            visual.pose_variances = [v, v, 0.0, v, v, v];
+            let mut wheel = source("wheel", SourceKind::Twist);
+            wheel.twist_variances = [0.02, 0.02, 0.0, 0.0, 0.0, 0.0];
+            config.odom_sources = vec![visual, wheel];
+            let mut core = FusionCore::new(config);
+            for step in 0..=3000_i64 {
+                let ts_ns = step * MS * 10 / 3;
+                if step % 10 == 0 {
+                    core.handle_source(&OdometryEstimate {
+                        pose: truth(ts_ns),
+                        ..pose_message("visual_odom", ts_ns, 0.0)
+                    });
+                }
+                if step % 6 == 0 {
+                    let moving = ts_ns as f64 >= REST * 1e9;
+                    core.handle_source(&twist_message(
+                        "wheel",
+                        ts_ns,
+                        if moving { 0.5 } else { 0.0 },
+                        0.0,
+                    ));
+                }
+            }
+            let end = truth(3000 * MS * 10 / 3);
+            (core.filter.x.position - end.translation.vector).norm()
+        };
+        // Nothing absolute corrects a heading lost at the start, so this is where an IMM that
+        // carried the stopped model's certain zero rates into the moving one fell apart.
+        for variance in [1e-2, 1e-4, 1e-6] {
+            let (single, imm) = (run(false, variance), run(true, variance));
+            assert!(
+                imm < 2.0 * single,
+                "variance {variance}: imm {imm} single {single}"
+            );
+        }
     }
 }
