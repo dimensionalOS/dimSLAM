@@ -104,6 +104,8 @@ pub struct LidarScan {
     pub frame_id: String,
     pub points: Vec<[f32; 3]>,
     pub offsets_ns: Vec<u32>,
+    /// Livox per-point tags (bits 4-5: the return's confidence); empty when the driver has none.
+    pub tags: Vec<u8>,
 }
 
 pub trait TfLookup {

@@ -19,7 +19,7 @@ use crate::warn_throttled;
 use eskf::{yaw_only, Cov, Filter, ImuBias, ImuInput, Jacobian, State};
 use lidar::{CloudSlice, PlaneEvidence, PlaneMap};
 use nalgebra::DMatrix;
-pub use lidar::{LidarConfig, LidarMapConfig, Matching};
+pub use lidar::{livox_surface_points, LidarConfig, LidarMapConfig, Matching, SurfacePoint};
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 

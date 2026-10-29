@@ -255,6 +255,8 @@ pub fn lidar_scan(buf: &[u8]) -> Result<LidarScan> {
     };
     let (x, y, z) = (field("x", FLOAT32)?, field("y", FLOAT32)?, field("z", FLOAT32)?);
     let time = field("offset_time", UINT32).ok();
+    const UINT8: u8 = 2;
+    let tag = field("tag", UINT8).ok();
     let count = (width.max(0) as usize) * (height.max(0) as usize);
     if point_step == 0 || data.len() < count * point_step {
         return Err(format!("cloud data has {} bytes for {count} points", data.len()));
@@ -262,7 +264,11 @@ pub fn lidar_scan(buf: &[u8]) -> Result<LidarScan> {
     let f32_at = |p: &[u8], at: usize| f32::from_le_bytes(p[at..at + 4].try_into().expect("4"));
     let mut points = Vec::with_capacity(count);
     let mut offsets_ns = Vec::new();
+    let mut tags = Vec::new();
     for p in data.chunks_exact(point_step).take(count) {
+        if let Some(at) = tag {
+            tags.push(p[at]);
+        }
         points.push([f32_at(p, x), f32_at(p, y), f32_at(p, z)]);
         if let Some(at) = time {
             offsets_ns.push(u32::from_le_bytes(p[at..at + 4].try_into().expect("4")));
@@ -273,6 +279,7 @@ pub fn lidar_scan(buf: &[u8]) -> Result<LidarScan> {
         frame_id,
         points,
         offsets_ns,
+        tags,
     })
 }
 
