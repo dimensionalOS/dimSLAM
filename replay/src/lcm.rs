@@ -165,6 +165,9 @@ pub fn image(buf: &[u8]) -> Result<ImageFrame> {
     let data = r
         .take(usize::try_from(data_length).map_err(|_| "negative image length")?)?
         .to_vec();
+    if encoding == "jpeg" {
+        return jpeg_frame(timestamp_ns, frame_id, &data);
+    }
     Ok(ImageFrame {
         timestamp_ns,
         frame_id,
@@ -173,6 +176,27 @@ pub fn image(buf: &[u8]) -> Result<ImageFrame> {
         encoding,
         step,
         data,
+    })
+}
+
+/// A JPEG payload as rgb8, or mono8 for a grayscale one.
+fn jpeg_frame(timestamp_ns: i64, frame_id: String, jpeg: &[u8]) -> Result<ImageFrame> {
+    let mut decoder = jpeg_decoder::Decoder::new(jpeg);
+    let pixels = decoder.decode().map_err(|e| format!("jpeg: {e}"))?;
+    let info = decoder.info().ok_or("jpeg: no header")?;
+    let (encoding, channels) = match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => ("mono8", 1),
+        jpeg_decoder::PixelFormat::RGB24 => ("rgb8", 3),
+        other => return Err(format!("jpeg: unsupported pixel format {other:?}")),
+    };
+    Ok(ImageFrame {
+        timestamp_ns,
+        frame_id,
+        width: i32::from(info.width),
+        height: i32::from(info.height),
+        encoding: encoding.to_string(),
+        step: i32::from(info.width) * channels,
+        data: pixels,
     })
 }
 

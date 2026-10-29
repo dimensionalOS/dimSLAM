@@ -52,7 +52,8 @@ impl Recording {
                     |row| row.get(0),
                 )
                 .map_err(|_| format!("{}: no stream {name:?}", path.display()))?;
-            if codec != "lcm" {
+            // dimos's jpeg codec is still an LCM Image, its data a JPEG; lcm::image unpacks it.
+            if codec != "lcm" && codec != "jpeg" {
                 return Err(format!(
                     "stream {name:?} is {codec:?}-encoded; only lcm is decoded"
                 ));

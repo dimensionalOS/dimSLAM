@@ -59,7 +59,15 @@ impl Default for LidarConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LidarMapConfig {
-    /// m. Each voxel holds one plane fit. A point is matched to the largest voxel around it
+    /// How a point finds the surface it hit: a plane per voxel, or a plane through its
+    /// nearest map points.
+    pub matching: Matching,
+    /// `nearest_points`: how many map points a point's plane is fitted through.
+    pub neighbors: u32,
+    /// m. `nearest_points`: a point joins the map only where no map point is this close.
+    pub point_spacing: f64,
+    /// m. Each voxel holds one plane fit (`voxel_planes`), or is one cell of the point map
+    /// searched with its neighbors, which bounds how far a neighbor can be (`nearest_points`). A point is matched to the largest voxel around it
     /// that is flat, so walls and floors get big, steady planes.
     pub voxel_size: f64,
     /// Voxel sizes, each half the one before, starting at `voxel_size`: where a voxel is not
@@ -91,9 +99,20 @@ pub struct LidarMapConfig {
     pub radius: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Matching {
+    #[default]
+    VoxelPlanes,
+    NearestPoints,
+}
+
 impl Default for LidarMapConfig {
     fn default() -> Self {
         Self {
+            matching: Matching::VoxelPlanes,
+            neighbors: 5,
+            point_spacing: 0.1,
             voxel_size: 0.5,
             levels: 3,
             max_points_per_voxel: 50,
@@ -211,6 +230,8 @@ struct Voxel {
 
 pub struct PlaneMap {
     config: LidarMapConfig,
+    /// `nearest_points`: the map's points, by cell of `voxel_size`.
+    cells: HashMap<[i32; 3], Vec<Vector3<f64>>>,
     /// Per level, coarsest first: 1 / voxel size and the voxels.
     levels: Vec<(f64, HashMap<[i32; 3], Voxel>)>,
     /// Where the body was at the last prune.
@@ -224,6 +245,7 @@ impl PlaneMap {
             .collect();
         Self {
             config,
+            cells: HashMap::new(),
             levels,
             pruned_at: None,
         }
@@ -235,10 +257,19 @@ impl PlaneMap {
 
     /// Voxels at the coarsest level.
     pub fn voxel_count(&self) -> usize {
-        self.levels[0].1.len()
+        self.levels[0].1.len() + self.cells.len()
     }
 
     pub fn insert(&mut self, point: &Vector3<f64>) {
+        if self.config.matching == Matching::NearestPoints {
+            let spacing_sq = self.config.point_spacing * self.config.point_spacing;
+            let cap = self.config.max_points_per_voxel as usize;
+            let cell = self.cells.entry(voxel_key(point, self.levels[0].0)).or_default();
+            if cell.len() < cap && cell.iter().all(|p| (p - point).norm_squared() > spacing_sq) {
+                cell.push(*point);
+            }
+            return;
+        }
         let cap = self.config.max_points_per_voxel;
         for (inverse_size, voxels) in &mut self.levels {
             let voxel = voxels.entry(voxel_key(point, *inverse_size)).or_default();
@@ -252,8 +283,11 @@ impl PlaneMap {
         }
     }
 
-    /// The plane of the largest flat voxel `point` falls in.
+    /// The plane of the largest flat voxel `point` falls in, or through its nearest points.
     pub fn plane_at(&mut self, point: &Vector3<f64>) -> Option<Plane> {
+        if self.config.matching == Matching::NearestPoints {
+            return self.nearest_plane(point);
+        }
         let config = &self.config;
         for (inverse_size, voxels) in &mut self.levels {
             let Some(voxel) = voxels.get_mut(&voxel_key(point, *inverse_size)) else {
@@ -274,6 +308,102 @@ impl PlaneMap {
         None
     }
 
+    /// The plane through the `neighbors` map points nearest `point` within a cell of it, when
+    /// they are flat: none farther from their fit than twice `max_plane_std`.
+    fn nearest_plane(&self, point: &Vector3<f64>) -> Option<Plane> {
+        let config = &self.config;
+        let wanted = config.neighbors.max(3) as usize;
+        let size = config.voxel_size;
+        let inverse_size = self.levels[0].0;
+        let key = voxel_key(point, inverse_size);
+        // Within its cell, the point's distance to each face: a neighbor cell can hold nothing
+        // nearer than the gap to it, so cells are visited nearest first and the search stops
+        // at the first one farther than the worst of the best found so far.
+        let low = Vector3::new(key[0] as f64, key[1] as f64, key[2] as f64) * size;
+        let below = point - low;
+        let above = Vector3::from_element(size) - below;
+        let mut cells: [(f64, [i32; 3]); 27] = [(0.0, [0; 3]); 27];
+        let mut n = 0;
+        for dx in -1..=1i32 {
+            for dy in -1..=1i32 {
+                for dz in -1..=1i32 {
+                    let gap = |offset: i32, axis: usize| match offset {
+                        -1 => below[axis],
+                        1 => above[axis],
+                        _ => 0.0,
+                    };
+                    let gap_sq = gap(dx, 0).powi(2) + gap(dy, 1).powi(2) + gap(dz, 2).powi(2);
+                    cells[n] = (gap_sq, [key[0] + dx, key[1] + dy, key[2] + dz]);
+                    n += 1;
+                }
+            }
+        }
+        cells.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let reach_sq = size * size;
+        // The best `wanted` so far, nearest first.
+        let mut nearest: Vec<(f64, Vector3<f64>)> = Vec::with_capacity(wanted + 1);
+        for (gap_sq, cell_key) in cells {
+            let worst = if nearest.len() == wanted {
+                nearest[wanted - 1].0
+            } else {
+                reach_sq
+            };
+            if gap_sq > worst {
+                break;
+            }
+            let Some(cell) = self.cells.get(&cell_key) else {
+                continue;
+            };
+            for p in cell {
+                let d = (p - point).norm_squared();
+                let worst = if nearest.len() == wanted {
+                    nearest[wanted - 1].0
+                } else {
+                    reach_sq
+                };
+                if d > worst {
+                    continue;
+                }
+                let at = nearest.partition_point(|(e, _)| *e <= d);
+                nearest.insert(at, (d, *p));
+                nearest.truncate(wanted);
+            }
+        }
+        if nearest.len() < wanted {
+            return None;
+        }
+        let mean: Vector3<f64> =
+            nearest.iter().map(|(_, p)| p).sum::<Vector3<f64>>() / wanted as f64;
+        let mut covariance = Matrix3::zeros();
+        for (_, p) in &nearest {
+            let d = p - mean;
+            covariance += d * d.transpose();
+        }
+        covariance /= wanted as f64;
+        let eigen = SymmetricEigen::new(covariance);
+        let mut order = [0, 1, 2];
+        order.sort_by(|a, b| eigen.eigenvalues[*a].total_cmp(&eigen.eigenvalues[*b]));
+        // Collinear neighbors have no normal.
+        if eigen.eigenvalues[order[1]] <= config.min_plane_aspect.powi(2) * eigen.eigenvalues[order[0]].max(0.0)
+        {
+            return None;
+        }
+        let normal: Vector3<f64> = eigen.eigenvectors.column(order[0]).into_owned();
+        let offset = -normal.dot(&mean);
+        let limit = 2.0 * config.max_plane_std;
+        if nearest
+            .iter()
+            .any(|(_, p)| (normal.dot(p) + offset).abs() > limit)
+        {
+            return None;
+        }
+        Some(Plane {
+            normal,
+            offset,
+            variance: eigen.eigenvalues[order[0]].max(0.0),
+        })
+    }
+
     /// Drops the voxels past `radius`, once the body has moved a voxel since the last prune.
     pub fn prune(&mut self, body: &Vector3<f64>) {
         if let Some(at) = self.pruned_at {
@@ -286,6 +416,8 @@ impl PlaneMap {
         for (_, voxels) in &mut self.levels {
             voxels.retain(|_, voxel| (voxel.mean - body).norm_squared() <= radius_sq);
         }
+        self.cells
+            .retain(|_, cell| cell.first().is_none_or(|p| (p - body).norm_squared() <= radius_sq));
     }
 }
 
@@ -336,7 +468,11 @@ impl PlaneEvidence {
         pose_covariance: &Matrix6<f64>,
         gate: f64,
     ) {
-        let predicted = (row.transpose() * pose_covariance * row)[(0, 0)] + noise;
+        let predicted = if std::env::var_os("DIMSLAM_GATE_NOPOSE").is_some() {
+            noise
+        } else {
+            (row.transpose() * pose_covariance * row)[(0, 0)] + noise
+        };
         if residual * residual > gate * predicted {
             self.gated += 1;
             return;
@@ -452,6 +588,42 @@ mod tests {
         let upper = map.plane_at(&Vector3::new(0.35, 0.1, 0.3)).expect("upper tread");
         assert!((lower.offset.abs() - 0.10).abs() < 1e-6 && lower.normal.z.abs() > 0.999);
         assert!((upper.offset.abs() - 0.27).abs() < 1e-6 && upper.normal.z.abs() > 0.999);
+    }
+
+    fn nearest_points_map() -> PlaneMap {
+        PlaneMap::new(LidarMapConfig {
+            matching: Matching::NearestPoints,
+            point_spacing: 0.02,
+            ..LidarMapConfig::default()
+        })
+    }
+
+    /// The plane through a point's nearest map points, found across cell borders, and none
+    /// for a point with no map points within reach.
+    #[test]
+    fn nearest_points_fit_the_surface_under_a_point_across_cells_and_none_out_of_reach() {
+        let mut map = nearest_points_map();
+        for i in 0..20 {
+            for j in 0..20 {
+                // A floor at z = 0.1 straddling the cell border at x = 0.5.
+                map.insert(&Vector3::new(0.3 + 0.03 * i as f64, 0.03 * j as f64, 0.1));
+            }
+        }
+        let plane = map.plane_at(&Vector3::new(0.49, 0.2, 0.15)).expect("floor");
+        assert!(plane.normal.z.abs() > 0.999);
+        assert!((plane.offset.abs() - 0.1).abs() < 1e-6);
+
+        // Farther than a cell from every mapped point: nothing to fit.
+        assert!(map.plane_at(&Vector3::new(2.5, 2.5, 2.5)).is_none());
+    }
+
+    #[test]
+    fn nearest_points_skip_a_point_too_close_to_one_already_mapped() {
+        let mut map = nearest_points_map();
+        map.insert(&Vector3::new(0.1, 0.1, 0.1));
+        map.insert(&Vector3::new(0.11, 0.1, 0.1));
+        map.insert(&Vector3::new(0.2, 0.1, 0.1));
+        assert_eq!(map.cells.values().map(Vec::len).sum::<usize>(), 2);
     }
 
     #[test]
