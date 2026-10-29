@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use dim_slam::nalgebra::Isometry3;
 use dim_slam::{
-    DimSlamCore, DimSlamCoreConfig, FusionCore, OdometryEstimate, OdometryFusionConfig, TfLookup,
+    DimSlamCore, DimSlamCoreConfig, FusionCore, LidarScan, OdometryEstimate, OdometryFusionConfig,
+    TfLookup,
 };
 
 use crate::db::Recording;
@@ -47,6 +48,19 @@ impl Core {
         }
     }
 
+    fn cloud(&mut self, scan: &LidarScan, tf: &TfBuffer, output_frame: &str) -> Result<(), String> {
+        match self {
+            Core::Fusion(core) => {
+                let mount = tf
+                    .latest(output_frame, &scan.frame_id)
+                    .ok_or(format!("lidar: tf has no {output_frame} -> {}", scan.frame_id))?;
+                core.handle_cloud(scan, &mount);
+            }
+            Core::Slam(core) => core.handle_cloud(scan, tf),
+        }
+        Ok(())
+    }
+
     fn report(&self) {
         match self {
             Core::Fusion(core) => core.report(),
@@ -60,7 +74,8 @@ enum Role {
     Source(usize),
     Reference,
     Rest,
-    Imu,
+    Imu(usize),
+    Lidar(usize),
     Image,
     CameraInfo,
 }
@@ -135,8 +150,11 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
     }
     add(&scenario.reference.stream, Role::Reference);
     add(&scenario.rest.stream, Role::Rest);
-    for name in &scenario.imus {
-        add(name, Role::Imu);
+    for (index, imu) in scenario.imus.iter().enumerate() {
+        add(imu.stream(), Role::Imu(index));
+    }
+    for (index, lidar) in scenario.lidars.iter().enumerate() {
+        add(lidar.stream(), Role::Lidar(index));
     }
     if scenario.mode == Mode::Slam {
         for name in &scenario.camera_infos {
@@ -176,7 +194,8 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                 Role::Source(_) | Role::Reference | Role::Rest => {
                     lcm::odometry(&record.data)?.timestamp_ns
                 }
-                Role::Imu => lcm::imu(&record.data)?.timestamp_ns,
+                Role::Imu(_) => lcm::imu(&record.data)?.timestamp_ns,
+                Role::Lidar(_) => lcm::lidar_stamp(&record.data)?,
                 Role::Image | Role::CameraInfo => (record.ts * 1e9) as i64,
             };
             // Publish every tick the data clock has passed, as the live module's timer would.
@@ -208,8 +227,20 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                         && msg.twist.angular.norm() < scenario.rest.angular_speed;
                     run.rest.push((msg.timestamp_ns, still));
                 }
-                Role::Imu => {
-                    let sample = lcm::imu(&record.data)?;
+                Role::Lidar(index) => {
+                    let mut scan = lcm::lidar_scan(&record.data)?;
+                    if let Some(frame_id) = scenario.lidars[index].frame_id() {
+                        scan.frame_id = frame_id.to_string();
+                    }
+                    if let Err(why) = core.cloud(&scan, &tf, &output_frame) {
+                        run.dropped.push(why);
+                    }
+                }
+                Role::Imu(index) => {
+                    let mut sample = lcm::imu(&record.data)?;
+                    if let Some(frame_id) = scenario.imus[index].frame_id() {
+                        sample.frame_id = frame_id.to_string();
+                    }
                     match &mut core {
                         Core::Fusion(core) => match tf.latest(&output_frame, &sample.frame_id) {
                             Some(mount) => core.handle_imu(&sample, &mount),

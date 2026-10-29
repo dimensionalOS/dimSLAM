@@ -30,6 +30,34 @@ pub struct OdometryStream {
     pub carry_to: Option<String>,
 }
 
+/// A sensor stream, by name alone or with its samples' frame_id overridden.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SensorStream {
+    Name(String),
+    Spec {
+        stream: String,
+        #[serde(default)]
+        frame_id: Option<String>,
+    },
+}
+
+impl SensorStream {
+    pub fn stream(&self) -> &str {
+        match self {
+            SensorStream::Name(name) => name,
+            SensorStream::Spec { stream, .. } => stream,
+        }
+    }
+
+    pub fn frame_id(&self) -> Option<&str> {
+        match self {
+            SensorStream::Name(_) => None,
+            SensorStream::Spec { frame_id, .. } => frame_id.as_deref(),
+        }
+    }
+}
+
 /// When the body counts as at rest: this stream's twist under both speeds for at least
 /// `min_seconds`; `trim_seconds` comes off each end of a stretch.
 #[derive(Clone, Debug, Deserialize)]
@@ -69,7 +97,10 @@ pub struct Scenario {
     #[serde(default)]
     pub sources: Vec<OdometryStream>,
     #[serde(default)]
-    pub imus: Vec<String>,
+    pub imus: Vec<SensorStream>,
+    /// PointCloud2 scans fed to the core as lidar measurements.
+    #[serde(default)]
+    pub lidars: Vec<SensorStream>,
     #[serde(default)]
     pub images: Vec<String>,
     #[serde(default)]

@@ -3,7 +3,7 @@
 //! trailing NUL) and the bytes.
 
 use dim_slam::nalgebra::{Isometry3, Matrix6, Quaternion, Translation3, UnitQuaternion, Vector3};
-use dim_slam::{CameraModel, ImageFrame, ImuSample, OdometryEstimate, Twist};
+use dim_slam::{CameraModel, ImageFrame, ImuSample, LidarScan, OdometryEstimate, Twist};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -196,4 +196,65 @@ pub fn camera_info(buf: &[u8]) -> Result<CameraModel> {
         distortion,
         intrinsics,
     })
+}
+
+/// sensor_msgs.PointCloud2 as a lidar scan: float32 x/y/z and, when present, a uint32
+/// `offset_time` (ns after the stamp, as Livox drivers write it). Little-endian data only.
+pub fn lidar_scan(buf: &[u8]) -> Result<LidarScan> {
+    let mut r = Reader::message(buf);
+    let fields_length = r.i32()?;
+    let data_length = r.i32()?;
+    let (timestamp_ns, frame_id) = r.header()?;
+    let height = r.i32()?;
+    let width = r.i32()?;
+    let mut offsets = std::collections::HashMap::new();
+    for _ in 0..fields_length {
+        let name = r.string()?;
+        let offset = r.i32()?;
+        let datatype = r.u8()?;
+        let _count = r.i32()?;
+        offsets.insert(name, (offset as usize, datatype));
+    }
+    if r.u8()? != 0 {
+        return Err("big-endian point cloud".into());
+    }
+    let point_step = r.i32()? as usize;
+    let _row_step = r.i32()?;
+    let data = r.take(usize::try_from(data_length).map_err(|_| "negative cloud length")?)?;
+    const FLOAT32: u8 = 7;
+    const UINT32: u8 = 6;
+    let field = |name: &str, datatype: u8| -> Result<usize> {
+        match offsets.get(name) {
+            Some((offset, kind)) if *kind == datatype => Ok(*offset),
+            _ => Err(format!("cloud has no {name} field of type {datatype}")),
+        }
+    };
+    let (x, y, z) = (field("x", FLOAT32)?, field("y", FLOAT32)?, field("z", FLOAT32)?);
+    let time = field("offset_time", UINT32).ok();
+    let count = (width.max(0) as usize) * (height.max(0) as usize);
+    if point_step == 0 || data.len() < count * point_step {
+        return Err(format!("cloud data has {} bytes for {count} points", data.len()));
+    }
+    let f32_at = |p: &[u8], at: usize| f32::from_le_bytes(p[at..at + 4].try_into().expect("4"));
+    let mut points = Vec::with_capacity(count);
+    let mut offsets_ns = Vec::new();
+    for p in data.chunks_exact(point_step).take(count) {
+        points.push([f32_at(p, x), f32_at(p, y), f32_at(p, z)]);
+        if let Some(at) = time {
+            offsets_ns.push(u32::from_le_bytes(p[at..at + 4].try_into().expect("4")));
+        }
+    }
+    Ok(LidarScan {
+        timestamp_ns,
+        frame_id,
+        points,
+        offsets_ns,
+    })
+}
+
+/// A PointCloud2's header stamp, without decoding its points.
+pub fn lidar_stamp(buf: &[u8]) -> Result<i64> {
+    let mut r = Reader::message(buf);
+    r.take(8)?;
+    Ok(r.header()?.0)
 }

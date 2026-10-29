@@ -5,7 +5,7 @@
 // there is no IMU, else a gyro_bias/accel_bias pair per IMU, then a position/theta pair per
 // cloned pose. theta is a right (body-frame) perturbation: q_true = q_est * Exp(theta).
 
-use nalgebra::{DMatrix, DVector, Matrix3, UnitQuaternion, Vector3};
+use nalgebra::{DMatrix, DVector, Matrix3, Matrix6, UnitQuaternion, Vector3, Vector6};
 
 use super::{InitialStds, ProcessNoise};
 
@@ -457,6 +457,42 @@ impl Filter {
         true
     }
 
+    /// A batch of scalar measurements on the position and rotation columns alone, given as
+    /// information (see `lidar::PlaneEvidence`). Through the Woodbury identity the gain needs
+    /// only a 6x6 inverse, (I + G P_pose)^-1, whatever the number of rows, and that stays
+    /// invertible where planar mode has pinned P_pose singular.
+    pub fn update_pose_information(
+        &mut self,
+        information: &Matrix6<f64>,
+        weighted_residual: &Vector6<f64>,
+        weighted_residual_sq: f64,
+        log_det_noise: f64,
+        rows: usize,
+    ) {
+        let cols = [0, 1, 2, 6, 7, 8];
+        let dim = self.dim();
+        let pose_covariance = Matrix6::from_fn(|r, c| self.p_cov[(cols[r], cols[c])]);
+        let Some(inverse) = (Matrix6::identity() + information * pose_covariance).try_inverse()
+        else {
+            return;
+        };
+        // M = (I + G P)^-1 G and v = (I + G P)^-1 g are H^T S^-1 H and H^T S^-1 r.
+        let shrink = inverse * information;
+        let pulled = inverse * weighted_residual;
+        let cross = Cov::from_fn(dim, 6, |r, c| self.p_cov[(r, cols[c])]);
+        // r^T S^-1 r = r^T R^-1 r - g^T (I + P G)^-1 P g, and det S = det R det(I + P G).
+        let mahalanobis_sq = weighted_residual_sq - pulled.dot(&(pose_covariance * weighted_residual));
+        let log_det = log_det_noise - inverse.determinant().ln();
+        self.log_likelihood -= 0.5
+            * (mahalanobis_sq + log_det + rows as f64 * (2.0 * std::f64::consts::PI).ln());
+        let dx: DVector<f64> = &cross * DVector::from_column_slice(pulled.as_slice());
+        let shrink = Cov::from_column_slice(6, 6, shrink.as_slice());
+        self.p_cov -= &cross * shrink * cross.transpose();
+        self.p_cov = (&self.p_cov + self.p_cov.transpose()) * 0.5;
+        self.inject(&dx);
+        self.constrain();
+    }
+
     /// The error vector that takes `self.x` to `other`: `other = self.x [+] difference`.
     fn difference(&self, other: &State) -> DVector<f64> {
         let layout = self.layout;
@@ -717,6 +753,58 @@ mod tests {
             0.0
         ));
         assert!(filter.x.position.x > 0.9);
+    }
+
+    /// Scalar rows over position and rotation fused as information land where the dense update
+    /// does, covariance and likelihood included, in full 3D and with planar's singular P.
+    #[test]
+    fn a_pose_information_update_matches_the_dense_update() {
+        for planar in [false, true] {
+            let mut dense = level_filter();
+            dense.planar = planar;
+            dense.constrain();
+            advance(&mut dense, 3, 10);
+            let mut batched = dense.clone();
+            let rows = [
+                ([1.0, 0.0, 0.0, 0.0, 0.2, -0.1], 0.3, 1e-3),
+                ([0.0, 1.0, 0.0, 0.1, 0.0, 0.4], -0.2, 2e-3),
+                ([0.0, 0.0, 1.0, -0.3, 0.1, 0.0], 0.05, 1e-3),
+                ([0.6, 0.8, 0.0, 0.0, 0.0, 1.0], 0.1, 5e-3),
+            ];
+            let dim = dense.dim();
+            let cols = [0, 1, 2, 6, 7, 8];
+            let mut jacobian = Jacobian::zeros(rows.len(), dim);
+            let mut residual = DVector::zeros(rows.len());
+            let mut variance = DVector::zeros(rows.len());
+            let mut information = Matrix6::zeros();
+            let mut weighted = Vector6::zeros();
+            let (mut weighted_sq, mut log_det) = (0.0, 0.0);
+            for (i, (row, r, noise)) in rows.iter().enumerate() {
+                let h = Vector6::from_row_slice(row);
+                for (k, col) in cols.iter().enumerate() {
+                    jacobian[(i, *col)] = h[k];
+                }
+                residual[i] = *r;
+                variance[i] = *noise;
+                information += h * h.transpose() / *noise;
+                weighted += h * (*r / *noise);
+                weighted_sq += r * r / noise;
+                log_det += noise.ln();
+            }
+            if planar {
+                for col in dense.layout.pinned_cols() {
+                    jacobian.column_mut(col).fill(0.0);
+                }
+            }
+            assert!(dense.update(&residual, &jacobian, &variance, 0.0));
+            batched.update_pose_information(&information, &weighted, weighted_sq, log_det, rows.len());
+            assert!((dense.x.position - batched.x.position).norm() < 1e-9, "planar {planar}");
+            assert!(dense.x.q.angle_to(&batched.x.q) < 1e-9, "planar {planar}");
+            assert!((&dense.p_cov - &batched.p_cov).amax() < 1e-9, "planar {planar}");
+            if !planar {
+                assert!((dense.log_likelihood - batched.log_likelihood).abs() < 1e-6);
+            }
+        }
     }
 
     #[test]

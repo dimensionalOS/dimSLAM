@@ -1,0 +1,52 @@
+{
+ "name": "china_office1_lio",
+ "description": "Go2 walking a 20-minute office loop with a Mid-360; dimSLAM's own lidar-inertial odometry from raw scans and the Mid-360 IMU, scored against Point-LIO corrected by AprilTag loop closures",
+ "recording": "mid360_recordings/2026-06-12_03-26am-PST__china_office1/mem2.db",
+ "mode": "fusion",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom",
+  "map",
+  "world"
+ ],
+ "imus": [
+  "livox_imu"
+ ],
+ "lidars": [
+  "livox_lidar"
+ ],
+ "reference": {
+  "stream": "pointlio_odometry_corrected",
+  "carry_to": "base_link"
+ },
+ "rest": {
+  "stream": "go2_odom",
+  "speed": 0.02,
+  "angular_speed": 0.02,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ },
+ "config": {
+  "odom_frame_id": "odom",
+  "output_frame_id": "base_link",
+  "publish_rate": 50.0,
+  "imus": [
+   {
+    "frame_id": "mid360_link",
+    "gyro_noise_density": 0.005,
+    "gyro_random_walk": 0.0001,
+    "accel_noise_density": 0.05,
+    "accel_random_walk": 0.001,
+    "init_gyro_limit": 0.1
+   }
+  ],
+  "lidars": [
+   {
+    "frame_id": "mid360_link"
+   }
+  ]
+ },
+ "variants": {
+  "lio": {}
+ }
+}

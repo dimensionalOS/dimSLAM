@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::cuvslam_odometry::{CameraConfig, CuvslamCore, CuvslamOdometryConfig};
 use crate::odometry_fusion::{
-    FusionCore, ImuConfig, InitialStds, OdometryFusionConfig, ProcessNoise, SourceConfig,
+    FusionCore, ImuConfig, InitialStds, LidarConfig, LidarMapConfig, OdometryFusionConfig, ProcessNoise, SourceConfig,
     SourceKind,
 };
-use crate::types::{CameraModel, ImageFrame, ImuSample, OdometryEstimate, PointCloud, TfLookup};
+use crate::types::{
+    CameraModel, ImageFrame, ImuSample, LidarScan, OdometryEstimate, PointCloud, TfLookup,
+};
 use crate::warn_throttled;
 
 /// The tracker's own drifting world frame. It never leaves this struct: it exists only to tell
@@ -79,6 +81,9 @@ pub struct DimSlamCoreConfig {
     pub no_imu_blend: bool,
     /// See [`OdometryFusionConfig::imm`].
     pub imm: bool,
+    /// See [`OdometryFusionConfig::lidars`].
+    pub lidars: Vec<LidarConfig>,
+    pub lidar_map: LidarMapConfig,
 }
 
 /// Defers to the two cores so a field's default cannot drift from the core that reads it.
@@ -112,6 +117,8 @@ impl Default for DimSlamCoreConfig {
             zero_velocity_variances: fusion.zero_velocity_variances,
             no_imu_blend: fusion.no_imu_blend,
             imm: fusion.imm,
+            lidars: fusion.lidars,
+            lidar_map: fusion.lidar_map,
         }
     }
 }
@@ -168,6 +175,8 @@ impl DimSlamCore {
             zero_velocity_variances: config.zero_velocity_variances,
             no_imu_blend: config.no_imu_blend,
             imm: config.imm,
+            lidars: config.lidars,
+            lidar_map: config.lidar_map,
         };
         Ok(Self {
             visual_odometry,
@@ -212,6 +221,20 @@ impl DimSlamCore {
             return;
         };
         self.fusion.handle_imu(sample, &base_from_imu);
+    }
+
+    /// A no-op for a frame with no `lidars` entry. The mount is read off `tf`, so the scan's
+    /// frame must be placed in the output frame.
+    pub fn handle_cloud(&mut self, scan: &LidarScan, tf: &dyn TfLookup) {
+        let Some(base_from_lidar) = tf.latest(&self.output_frame_id, &scan.frame_id) else {
+            warn_throttled!(
+                std::time::Duration::from_secs(10),
+                lidar_frame = %scan.frame_id,
+                "scan dropped: tf does not place the lidar in the output frame",
+            );
+            return;
+        };
+        self.fusion.handle_cloud(scan, &base_from_lidar);
     }
 
     /// An external odometry source's estimate, told apart by the transform it carries.

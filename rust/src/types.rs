@@ -96,6 +96,16 @@ pub struct PointCloud {
 
 /// Both cores look up rigid mounts only, so a single latest-value query is enough; they
 /// re-query until it answers and cache the result.
+/// One lidar sweep in its sensor frame. `offsets_ns[i]` is when point `i` was measured, after
+/// `timestamp_ns`; empty means every point was measured at `timestamp_ns`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LidarScan {
+    pub timestamp_ns: i64,
+    pub frame_id: String,
+    pub points: Vec<[f32; 3]>,
+    pub offsets_ns: Vec<u32>,
+}
+
 pub trait TfLookup {
     /// The transform taking a point in `child` to one in `parent`, or `None` if unconnected.
     fn latest(&self, parent: &str, child: &str) -> Option<Isometry3<f64>>;

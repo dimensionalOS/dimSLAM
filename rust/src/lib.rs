@@ -56,11 +56,11 @@ pub mod types;
 pub use cuvslam_odometry::{CameraConfig, CuvslamCore, CuvslamOdometryConfig};
 pub use dim_slam_core::{DimSlamCore, DimSlamCoreConfig};
 pub use odometry_fusion::{
-    FusionCore, ImuConfig, InitialStds, OdometryFusionConfig, ProcessNoise, SourceConfig,
+    FusionCore, ImuConfig, InitialStds, LidarConfig, LidarMapConfig, OdometryFusionConfig, ProcessNoise, SourceConfig,
     SourceKind,
 };
 pub use types::{
-    CameraModel, ImageFrame, ImuNoiseModel, ImuSample, OdometryEstimate, PointCloud, TfLookup,
+    CameraModel, ImageFrame, ImuNoiseModel, ImuSample, LidarScan, OdometryEstimate, PointCloud, TfLookup,
     Twist,
 };
 
