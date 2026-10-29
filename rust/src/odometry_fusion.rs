@@ -7,6 +7,7 @@
 
 mod eskf;
 mod lidar;
+pub mod lio_filter;
 mod point_map;
 mod scan_sync;
 
