@@ -7,7 +7,11 @@
 // of operations, since floating point is not associative; the quirks go once the outputs
 // agree. Not to leave this branch while it mirrors (GPL upstream).
 
-use nalgebra::{Matrix3, SMatrix, SVector, Vector3};
+use nalgebra::{Const, DMatrix, DVector, Dyn, Matrix3, OMatrix, SMatrix, SVector, Vector3};
+
+use super::lidar::SurfacePoint;
+use super::plane_fit::{fit_plane, PLANE_POINTS};
+use super::point_map::{to_world, PointMap};
 
 pub const STATE_DIM: usize = 30;
 pub type StateVector = SVector<f64, STATE_DIM>;
@@ -353,6 +357,145 @@ impl LioFilter {
         let step = gain * residual;
         self.p -= gain * h_p;
         self.x.advance(&step, 1.0);
+    }
+}
+
+/// How a scan's points are matched to the map and weighed.
+#[derive(Clone, Copy, Debug)]
+pub struct LidarMeasurement {
+    /// m: a fitted plane is used only when all its points lie this close to it.
+    pub plane_tolerance: f32,
+    /// A point is used only when its range exceeds this times the square of its distance to
+    /// its plane: near points must lie closer to it than far ones.
+    pub range_per_distance_sq: f64,
+    /// m^2: variance of one point-to-plane distance.
+    pub point_variance: f64,
+    /// m: map points farther than this are not neighbors.
+    pub neighbor_range: f64,
+    pub mount_rotation: Matrix3<f64>,
+    pub mount_translation: Vector3<f64>,
+}
+
+/// One group of a scan's points taken at the same instant, with the buffers that persist
+/// across scans per point slot: its world position, its neighbors (left as they were when the
+/// map has none near it) and whether it was used.
+pub struct PointGroup<'a> {
+    pub body: &'a [SurfacePoint],
+    pub world: &'a mut [SurfacePoint],
+    pub neighbors: &'a mut [Vec<SurfacePoint>],
+    pub used: &'a mut [bool],
+}
+
+impl LioFilter {
+    /// Matches `group` against `map` from the current pose and, when any point finds a plane,
+    /// updates the state with the points' distances to their planes. True when it updated.
+    pub fn update_points(
+        &mut self,
+        group: &mut PointGroup,
+        map: &mut PointMap,
+        m: &LidarMeasurement,
+    ) -> bool {
+        let mut planes = Vec::with_capacity(group.body.len());
+        for j in 0..group.body.len() {
+            let body = &group.body[j];
+            let world = to_world(
+                body,
+                &self.x.rotation,
+                &self.x.position,
+                &m.mount_rotation,
+                &m.mount_translation,
+            );
+            group.world[j].position = world.position;
+            group.world[j].reflectivity = world.reflectivity;
+            let lever = Vector3::new(
+                body.position[0] as f64,
+                body.position[1] as f64,
+                body.position[2] as f64,
+            );
+            let range = norm(&lever);
+            let near = &mut group.neighbors[j];
+            map.nearest(&group.world[j], PLANE_POINTS, m.neighbor_range, near);
+            group.used[j] = false;
+            planes.push(None);
+            if near.len() < PLANE_POINTS {
+                continue;
+            }
+            if let Some(plane) = fit_plane(near, m.plane_tolerance) {
+                let w = group.world[j].position;
+                let distance =
+                    (plane[0] * w[0] + plane[1] * w[1] + plane[2] * w[2] + plane[3]).abs();
+                if range > m.range_per_distance_sq * distance as f64 * distance as f64 {
+                    group.used[j] = true;
+                    planes[j] = Some(plane);
+                }
+            }
+        }
+        let used = planes.iter().flatten().count();
+        if used == 0 {
+            return false;
+        }
+        // Rows over position and rotation (12 columns; mount columns stay zero).
+        let mut h = DMatrix::<f64>::zeros(used, 12);
+        let mut residual = DVector::<f64>::zeros(used);
+        let mut row = 0;
+        for (j, plane) in planes.iter().enumerate() {
+            let Some(plane) = plane else {
+                continue;
+            };
+            let normal = Vector3::new(plane[0] as f64, plane[1] as f64, plane[2] as f64);
+            let body = &group.body[j];
+            let lever = Vector3::new(
+                body.position[0] as f64,
+                body.position[1] as f64,
+                body.position[2] as f64,
+            );
+            let in_body = m.mount_rotation * lever + m.mount_translation;
+            let local_normal = self.x.rotation.transpose() * normal;
+            let turn = hat(&in_body) * local_normal;
+            let mut entries = SVector::<f64, 12>::zeros();
+            entries.fixed_rows_mut::<3>(0).copy_from(&normal);
+            entries.fixed_rows_mut::<3>(3).copy_from(&turn);
+            h.row_mut(row).copy_from(&entries.transpose());
+            let w = group.world[j].position;
+            residual[row] = -normal[0] * w[0] as f64
+                - normal[1] * w[1] as f64
+                - normal[2] * w[2] as f64
+                - plane[3] as f64;
+            row += 1;
+        }
+        let noise = m.point_variance;
+        let gain: OMatrix<f64, Const<STATE_DIM>, Dyn> = if STATE_DIM > used {
+            let p_ht = self.p.fixed_view::<STATE_DIM, 12>(0, 0) * h.transpose();
+            let mut innovation = &h * p_ht.rows(0, 12);
+            for d in 0..used {
+                innovation[(d, d)] += noise;
+            }
+            p_ht * innovation.try_inverse().expect("lidar innovation singular")
+        } else {
+            // Many points: through the information form, as Point-LIO weighs it.
+            let information = noise * h.transpose() * &h;
+            let mut inverse = self.p.try_inverse().expect("covariance singular");
+            let mut pose_block = inverse.fixed_view_mut::<12, 12>(0, 0);
+            pose_block += information.fixed_view::<12, 12>(0, 0);
+            inverse = inverse.try_inverse().expect("information singular");
+            inverse.fixed_view::<STATE_DIM, 12>(0, 0) * h.transpose() * noise
+        };
+        let step: OMatrix<f64, Const<STATE_DIM>, nalgebra::U1> = &gain * &residual;
+        self.x.advance(&StateVector::from(step), 1.0);
+        self.p -= gain * &h * self.p.fixed_view::<12, STATE_DIM>(0, 0);
+        // The group's world positions from the updated pose.
+        for j in 0..group.body.len() {
+            let world = to_world(
+                &group.body[j],
+                &self.x.rotation,
+                &self.x.position,
+                &m.mount_rotation,
+                &m.mount_translation,
+            );
+            group.world[j].position = world.position;
+            group.world[j].reflectivity = world.reflectivity;
+        }
+        true
     }
 }
 
