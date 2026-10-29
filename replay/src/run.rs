@@ -63,6 +63,10 @@ impl Camera {
             return;
         };
         let (t, rotation) = (estimate.timestamp_ns, estimate.pose.rotation);
+        // A tracker's first estimate can come back unstamped.
+        if t == 0 {
+            return;
+        }
         if lio.rates_rejected_in_a_row >= REJECTED_FRAMES {
             eprintln!("cuvslam disagreed with the filter for {REJECTED_FRAMES} frames: rebuilding the tracker");
             self.tracker.reset();

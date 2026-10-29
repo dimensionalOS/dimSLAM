@@ -151,13 +151,16 @@ impl LioOdometry {
         self.rates.push_back((stamp, rate, variance));
     }
 
-    /// Takes the measured rates stamped before `until`, each at its own instant.
+    /// Takes the measured rates stamped before `until`, each at its own instant; a rate that
+    /// arrives after the state has passed its stamp (a camera's frames trail the IMU) is taken
+    /// at the state's instant instead.
     fn take_rates(&mut self, until: f64) {
         while self.rates.front().is_some_and(|(stamp, _, _)| *stamp < until) {
             let (stamp, rate, variance) = self.rates.pop_front().expect("checked");
-            if stamp < self.state_at || self.first_scan {
+            if self.first_scan {
                 continue;
             }
+            let stamp = stamp.max(self.state_at);
             self.filter
                 .predict(stamp - self.state_at, &self.noise, true, false);
             self.state_at = stamp;
