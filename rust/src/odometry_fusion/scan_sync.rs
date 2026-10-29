@@ -67,8 +67,11 @@ pub fn header_seconds(stamp_ns: i64) -> f64 {
 pub struct ScanSync {
     scans: VecDeque<(f64, Vec<SurfacePoint>)>,
     newest_scan: f64,
-    imus: VecDeque<StampedImu>,
+    /// Samples not yet taken: the filter's update loop reads them from here once levelled.
+    pub imus: VecDeque<StampedImu>,
     newest_imu: f64,
+    /// Until the map has its first points, scans still take the samples that reach them.
+    map_ready: bool,
     /// The scan at the head of `scans`, with its end, once taken up.
     taken: Option<f64>,
     /// Every sample handed to levelling so far; never emptied, so the mean recounts them.
@@ -116,6 +119,11 @@ impl ScanSync {
         self.scans.push_back((stamp, points));
     }
 
+    /// The map has its first points: from here the filter takes the samples itself.
+    pub fn set_map_ready(&mut self) {
+        self.map_ready = true;
+    }
+
     pub fn pending_scans(&self) -> usize {
         self.scans.len()
     }
@@ -143,7 +151,7 @@ impl ScanSync {
         if self.newest_imu < end {
             return None;
         }
-        if !self.levelled {
+        if !self.levelled || !self.map_ready {
             let mut stamp = self.imus[0].stamp;
             while !self.imus.is_empty() && stamp < end {
                 stamp = self.imus[0].stamp;
