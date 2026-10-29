@@ -1,6 +1,6 @@
 {
  "name": "china_office1_point_lio",
- "description": "Go2 walking a 20-minute office loop with stairs, Mid-360; dimSLAM's LioOdometry (Point-LIO's schedule, bit-for-bit equal to pointlio-core) from raw scans and the Mid-360 IMU. Scored against Point-LIO corrected by AprilTag loop closures, and on AprilTag revisits",
+ "description": "Go2 walking a 20-minute office loop with stairs, Mid-360; dimSLAM's LioOdometry (Point-LIO's schedule, bit-for-bit equal to pointlio-core) from raw scans and the Mid-360 IMU at its full 200 Hz (livox_imu_pcap3: the pcap's samples on the lidar's clock; the recorded livox_imu lost 13% of them), clipping at the sensor's real 4 g. Scored against Point-LIO corrected by AprilTag loop closures, and on AprilTag revisits",
  "recording": "mid360_recordings/2026-06-12_03-26am-PST__china_office1/mem2.db",
  "mode": "point_lio",
  "tf_stream": "tf",
@@ -22,7 +22,7 @@
  ],
  "imus": [
   {
-   "stream": "livox_imu",
+   "stream": "livox_imu_pcap3",
    "frame_id": "mid360_imu"
   }
  ],
@@ -56,7 +56,8 @@
   "trim_seconds": 0.3
  },
  "config": {
-  "output_frame_id": "mid360_imu"
+  "output_frame_id": "mid360_imu",
+  "accel_clip_g": 4.0
  },
  "variants": {
   "point_lio": {}

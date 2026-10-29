@@ -196,7 +196,15 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                 .and_then(|v| v.as_str())
                 .unwrap_or("mid360_imu")
                 .to_string();
-            (Core::Lio(Box::new(LioOdometry::new(LioConfig::default()))), 50.0, frame)
+            let mut lio = LioConfig::default();
+            // The sensor's clip levels, when they differ from Point-LIO's defaults.
+            if let Some(clip) = config.get("accel_clip_g").and_then(|v| v.as_f64()) {
+                lio.imu.clip = lio.imu.clip.map(|(gyro, _)| (gyro, clip));
+            }
+            if let Some(clip) = config.get("gyro_clip").and_then(|v| v.as_f64()) {
+                lio.imu.clip = lio.imu.clip.map(|(_, accel)| (clip, accel));
+            }
+            (Core::Lio(Box::new(LioOdometry::new(lio))), 50.0, frame)
         }
     };
 
