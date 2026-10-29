@@ -52,6 +52,24 @@ pub fn evaluate(
         let scored = metrics::score(&run, &segments);
         runs.push((run, scored));
     }
+    if let Some((first, _)) = runs.first() {
+        let mut scored_baselines = Vec::new();
+        for (stream, track) in scenario.baselines.iter().zip(&first.baselines) {
+            let run = Run {
+                variant: format!("baseline:{}", stream.stream),
+                fused: track.clone(),
+                reference: first.reference.clone(),
+                baselines: Vec::new(),
+                rest: first.rest.clone(),
+                wall_seconds: f64::NAN,
+                data_seconds: first.data_seconds,
+                dropped: Vec::new(),
+            };
+            let scored = metrics::score(&run, &segments);
+            scored_baselines.push((run, scored));
+        }
+        runs.extend(scored_baselines);
+    }
     let reference = runs
         .first()
         .map(|(run, _)| metrics::score_reference(run, &segments))

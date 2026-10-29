@@ -84,6 +84,9 @@ pub struct Noise {
     pub gyro_random_walk: f64,    // rad/s^2/sqrt(Hz)
     pub accel_noise_density: f64, // m/s^2/sqrt(Hz)
     pub accel_random_walk: f64,   // m/s^3/sqrt(Hz)
+    /// m/s^2 and rad/s the sensor clips at, or 0 when it never does.
+    pub accel_saturation: f64,
+    pub gyro_saturation: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -98,6 +101,9 @@ pub struct ImuInput {
     pub imu: usize,
     pub gyro: Vector3<f64>,
     pub accel: Vector3<f64>,
+    /// Some axis read at its clip: the true value was at least that, by how much more unknown.
+    pub accel_saturated: bool,
+    pub gyro_saturated: bool,
 }
 
 /// A copy of the pose at some past time, so a relative measurement can span to the present.
@@ -230,7 +236,7 @@ impl Filter {
             .clone()
             .filter(|_| dt <= MAX_INERTIAL_STEP_SECONDS)
         {
-            self.predict_inertial(dt, input.imu, &input.gyro, &input.accel);
+            self.predict_inertial(dt, &input);
             true
         } else {
             false
@@ -305,7 +311,8 @@ impl Filter {
         }
     }
 
-    fn predict_inertial(&mut self, dt: f64, imu: usize, gyro: &Vector3<f64>, accel: &Vector3<f64>) {
+    fn predict_inertial(&mut self, dt: f64, input: &ImuInput) {
+        let (imu, gyro, accel) = (input.imu, &input.gyro, &input.accel);
         let dim = self.dim();
         let layout = self.layout;
         let rotation = self.x.q.to_rotation_matrix();
@@ -344,6 +351,18 @@ impl Filter {
             q_noise
                 .view_mut((block, block), (3, 3))
                 .copy_from(&(Matrix3::identity() * density * density * dt));
+        }
+        // A clipped sample understates the step by up to a clip's worth over dt, or more: the
+        // velocity (or rotation) takes that much doubt, and the other sensors settle it.
+        let noise = self.noise[imu];
+        for (saturated, block, clip) in [
+            (input.accel_saturated, 3, noise.accel_saturation),
+            (input.gyro_saturated, 6, noise.gyro_saturation),
+        ] {
+            if saturated {
+                let mut view = q_noise.view_mut((block, block), (3, 3));
+                view += Matrix3::identity() * (clip * dt).powi(2);
+            }
         }
         self.p_cov = &f * &self.p_cov * f.transpose() + q_noise;
     }
@@ -458,38 +477,58 @@ impl Filter {
     }
 
     /// A batch of scalar measurements on the position and rotation columns alone, given as
-    /// information (see `lidar::PlaneEvidence`). Through the Woodbury identity the gain needs
-    /// only a 6x6 inverse, (I + G P_pose)^-1, whatever the number of rows, and that stays
-    /// invertible where planar mode has pinned P_pose singular.
+    /// information (see `lidar::PlaneEvidence`), linearized at the current state. Through the
+    /// Woodbury identity the gain needs only a 6x6 inverse, (I + G P_pose)^-1, whatever the
+    /// number of rows, and that stays invertible where planar mode has pinned P_pose singular.
+    ///
+    /// Iterated: `prior` and `prior_cov` are the state and covariance before this measurement;
+    /// the current state may already have moved off the prior by an earlier iteration, and the
+    /// correction is then re-taken from the prior with the residuals moved to it (r + H dx).
+    /// Only the last iteration (`settle`) shrinks the covariance and scores the likelihood.
+    #[allow(clippy::too_many_arguments)]
     pub fn update_pose_information(
         &mut self,
+        prior: &State,
+        prior_cov: &Cov,
         information: &Matrix6<f64>,
         weighted_residual: &Vector6<f64>,
         weighted_residual_sq: f64,
         log_det_noise: f64,
         rows: usize,
+        settle: bool,
     ) {
         let cols = [0, 1, 2, 6, 7, 8];
         let dim = self.dim();
-        let pose_covariance = Matrix6::from_fn(|r, c| self.p_cov[(cols[r], cols[c])]);
+        let linearized = std::mem::replace(&mut self.x, prior.clone());
+        let moved = self.difference(&linearized);
+        let moved = Vector6::from_fn(|r, _| moved[cols[r]]);
+        let weighted_residual = weighted_residual + information * moved;
+        let weighted_residual_sq = weighted_residual_sq
+            + 2.0 * moved.dot(&(weighted_residual - information * moved))
+            + moved.dot(&(information * moved));
+        let pose_covariance = Matrix6::from_fn(|r, c| prior_cov[(cols[r], cols[c])]);
         let Some(inverse) = (Matrix6::identity() + information * pose_covariance).try_inverse()
         else {
+            self.x = linearized;
             return;
         };
         // M = (I + G P)^-1 G and v = (I + G P)^-1 g are H^T S^-1 H and H^T S^-1 r.
-        let shrink = inverse * information;
         let pulled = inverse * weighted_residual;
-        let cross = Cov::from_fn(dim, 6, |r, c| self.p_cov[(r, cols[c])]);
-        // r^T S^-1 r = r^T R^-1 r - g^T (I + P G)^-1 P g, and det S = det R det(I + P G).
-        let mahalanobis_sq = weighted_residual_sq - pulled.dot(&(pose_covariance * weighted_residual));
-        let log_det = log_det_noise - inverse.determinant().ln();
-        self.log_likelihood -= 0.5
-            * (mahalanobis_sq + log_det + rows as f64 * (2.0 * std::f64::consts::PI).ln());
+        let cross = Cov::from_fn(dim, 6, |r, c| prior_cov[(r, cols[c])]);
         let dx: DVector<f64> = &cross * DVector::from_column_slice(pulled.as_slice());
-        let shrink = Cov::from_column_slice(6, 6, shrink.as_slice());
-        self.p_cov -= &cross * shrink * cross.transpose();
-        self.p_cov = (&self.p_cov + self.p_cov.transpose()) * 0.5;
         self.inject(&dx);
+        if settle {
+            // r^T S^-1 r = r^T R^-1 r - g^T (I + P G)^-1 P g, and det S = det R det(I + P G).
+            let mahalanobis_sq =
+                weighted_residual_sq - pulled.dot(&(pose_covariance * weighted_residual));
+            let log_det = log_det_noise - inverse.determinant().ln();
+            self.log_likelihood -= 0.5
+                * (mahalanobis_sq + log_det + rows as f64 * (2.0 * std::f64::consts::PI).ln());
+            let shrink = inverse * information;
+            let shrink = Cov::from_column_slice(6, 6, shrink.as_slice());
+            self.p_cov = prior_cov - &cross * shrink * cross.transpose();
+            self.p_cov = (&self.p_cov + self.p_cov.transpose()) * 0.5;
+        }
         self.constrain();
     }
 
@@ -595,7 +634,23 @@ mod tests {
             gyro_random_walk: 0.001,
             accel_noise_density: 0.1,
             accel_random_walk: 0.01,
+            ..Noise::default()
         }
+    }
+
+    /// A clipped accelerometer sample loosens the velocity by the clip times the step, squared.
+    #[test]
+    fn a_clipped_sample_adds_its_unknown_excess_to_the_velocity_uncertainty() {
+        let mut clean = level_filter();
+        clean.noise[0].accel_saturation = 40.0;
+        let mut clipped = clean.clone();
+        if let Some(input) = clipped.x.input.as_mut() {
+            input.accel_saturated = true;
+        }
+        clean.predict_to(10 * MS);
+        clipped.predict_to(10 * MS);
+        let added = clipped.p_cov[(3, 3)] - clean.p_cov[(3, 3)];
+        assert!((added - (40.0f64 * 0.01).powi(2)).abs() < 1e-9, "added {added}");
     }
 
     fn still_input(imu: usize, gyro: Vector3<f64>) -> Option<ImuInput> {
@@ -603,6 +658,8 @@ mod tests {
             imu,
             gyro,
             accel: Vector3::new(0.0, 0.0, GRAVITY),
+            accel_saturated: false,
+            gyro_saturated: false,
         })
     }
 
@@ -797,7 +854,17 @@ mod tests {
                 }
             }
             assert!(dense.update(&residual, &jacobian, &variance, 0.0));
-            batched.update_pose_information(&information, &weighted, weighted_sq, log_det, rows.len());
+            let (prior, prior_cov) = (batched.x.clone(), batched.p_cov.clone());
+            batched.update_pose_information(
+                &prior,
+                &prior_cov,
+                &information,
+                &weighted,
+                weighted_sq,
+                log_det,
+                rows.len(),
+                true,
+            );
             assert!((dense.x.position - batched.x.position).norm() < 1e-9, "planar {planar}");
             assert!(dense.x.q.angle_to(&batched.x.q) < 1e-9, "planar {planar}");
             assert!((&dense.p_cov - &batched.p_cov).amax() < 1e-9, "planar {planar}");

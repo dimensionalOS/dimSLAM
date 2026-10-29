@@ -30,6 +30,21 @@ pub struct OdometryStream {
     pub carry_to: Option<String>,
 }
 
+/// parent_from_child, rotation as [x, y, z, w].
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StaticTransform {
+    pub parent: String,
+    pub child: String,
+    pub translation: [f64; 3],
+    #[serde(default = "identity_rotation")]
+    pub rotation: [f64; 4],
+}
+
+fn identity_rotation() -> [f64; 4] {
+    [0.0, 0.0, 0.0, 1.0]
+}
+
 /// A sensor stream, by name alone or with its samples' frame_id overridden.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
@@ -91,6 +106,10 @@ pub struct Scenario {
     pub duration_seconds: f64,
     pub mode: Mode,
     pub tf_stream: String,
+    /// Mounts the recording's tf lacks, e.g. an IMU's offset inside its lidar from the
+    /// sensor's datasheet.
+    #[serde(default)]
+    pub static_tf: Vec<StaticTransform>,
     /// tf edges under these parents are poses, not mounts, and are left out of lookups.
     #[serde(default)]
     pub tf_ignored_parents: Vec<String>,
@@ -107,6 +126,10 @@ pub struct Scenario {
     pub camera_infos: Vec<String>,
     /// What the output is scored against; never fed in.
     pub reference: OdometryStream,
+    /// Other estimators' outputs in the recording, never fed in, scored against the reference
+    /// exactly as a variant is (as variant `baseline:<stream>`): what the output has to beat.
+    #[serde(default)]
+    pub baselines: Vec<OdometryStream>,
     pub rest: Rest,
     /// The core's config: `OdometryFusionConfig` for fusion, `DimSlamCoreConfig` for slam.
     pub config: Value,

@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::time::Instant;
 
-use dim_slam::nalgebra::Isometry3;
+use dim_slam::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion, Vector3};
 use dim_slam::{
     DimSlamCore, DimSlamCoreConfig, FusionCore, LidarScan, OdometryEstimate, OdometryFusionConfig,
     TfLookup,
@@ -20,6 +20,8 @@ pub struct Run {
     /// The core's output at each publish tick, ns.
     pub fused: Vec<(i64, Isometry3<f64>)>,
     pub reference: Vec<(i64, Isometry3<f64>)>,
+    /// Each `baselines` stream's poses, in scenario order.
+    pub baselines: Vec<Vec<(i64, Isometry3<f64>)>>,
     /// The rest stream's samples: stamp and whether the body was still.
     pub rest: Vec<(i64, bool)>,
     pub wall_seconds: f64,
@@ -73,6 +75,7 @@ impl Core {
 enum Role {
     Source(usize),
     Reference,
+    Baseline(usize),
     Rest,
     Imu(usize),
     Lidar(usize),
@@ -121,18 +124,35 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
         }
     };
 
-    // tf first, whole window: mounts are static, and every lookup then sees all of them.
+    // tf first, from the recording's start through the window: mounts are static, often
+    // published only once at the start, and every lookup then sees all of them.
     let mut tf = TfBuffer::ignoring(&scenario.tf_ignored_parents);
+    let tf_duration = if scenario.duration_seconds > 0.0 {
+        scenario.start_seconds + scenario.duration_seconds
+    } else {
+        0.0
+    };
     let mut tf_recording = Recording::open(
         &path,
         std::slice::from_ref(&scenario.tf_stream),
-        scenario.start_seconds,
-        scenario.duration_seconds,
+        0.0,
+        tf_duration,
     )?;
     while let Some(record) = tf_recording.next_record()? {
         for edge in lcm::tf(&record.data)? {
             tf.insert(edge.parent, edge.child, edge.transform);
         }
+    }
+    for edge in &scenario.static_tf {
+        let [x, y, z, w] = edge.rotation;
+        tf.insert(
+            edge.parent.clone(),
+            edge.child.clone(),
+            Isometry3::from_parts(
+                Translation3::from(Vector3::from(edge.translation)),
+                UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z)),
+            ),
+        );
     }
 
     let mut names: Vec<String> = Vec::new();
@@ -149,6 +169,9 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
         add(&source.stream, Role::Source(index));
     }
     add(&scenario.reference.stream, Role::Reference);
+    for (index, baseline) in scenario.baselines.iter().enumerate() {
+        add(&baseline.stream, Role::Baseline(index));
+    }
     add(&scenario.rest.stream, Role::Rest);
     for (index, imu) in scenario.imus.iter().enumerate() {
         add(imu.stream(), Role::Imu(index));
@@ -176,6 +199,7 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
         variant: variant.to_string(),
         fused: Vec::new(),
         reference: Vec::new(),
+        baselines: vec![Vec::new(); scenario.baselines.len()],
         rest: Vec::new(),
         wall_seconds: 0.0,
         data_seconds: 0.0,
@@ -191,7 +215,7 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
         last_ts = record.ts;
         for role in roles[record.stream].clone() {
             let stamp = match role {
-                Role::Source(_) | Role::Reference | Role::Rest => {
+                Role::Source(_) | Role::Reference | Role::Baseline(_) | Role::Rest => {
                     lcm::odometry(&record.data)?.timestamp_ns
                 }
                 Role::Imu(_) => lcm::imu(&record.data)?.timestamp_ns,
@@ -199,7 +223,7 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                 Role::Image | Role::CameraInfo => (record.ts * 1e9) as i64,
             };
             // Publish every tick the data clock has passed, as the live module's timer would.
-            if !matches!(role, Role::Reference | Role::Rest) {
+            if !matches!(role, Role::Reference | Role::Baseline(_) | Role::Rest) {
                 let tick = next_tick.get_or_insert(stamp);
                 while *tick <= stamp {
                     if let Some(msg) = core.publish(*tick) {
@@ -218,6 +242,12 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                 Role::Reference => {
                     match remap(&scenario.reference, lcm::odometry(&record.data)?, &tf) {
                         Ok(msg) => run.reference.push((msg.timestamp_ns, msg.pose)),
+                        Err(why) => run.dropped.push(why),
+                    }
+                }
+                Role::Baseline(index) => {
+                    match remap(&scenario.baselines[index], lcm::odometry(&record.data)?, &tf) {
+                        Ok(msg) => run.baselines[index].push((msg.timestamp_ns, msg.pose)),
                         Err(why) => run.dropped.push(why),
                     }
                 }

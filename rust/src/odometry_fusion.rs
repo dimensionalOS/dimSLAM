@@ -109,6 +109,11 @@ pub struct ImuConfig {
     pub gyro_random_walk: f64,
     pub accel_noise_density: f64,
     pub accel_random_walk: f64,
+    /// m/s^2 and rad/s, per axis, that the sensor clips at (a legged robot's footfalls clip
+    /// most IMUs' accelerometers); 0 when it never clips. A clipped sample still moves the
+    /// filter, but with the excess it could not read as added uncertainty.
+    pub accel_saturation: f64,
+    pub gyro_saturation: f64,
     /// Samples averaged while stationary to level the filter and take the biases.
     pub init_samples: i64,
     /// rad/s. Bias calibration restarts above this rate, so it belongs above this gyro's own
@@ -126,6 +131,8 @@ impl Default for ImuConfig {
             gyro_random_walk: 0.0,
             accel_noise_density: 0.0,
             accel_random_walk: 0.0,
+            accel_saturation: 0.0,
+            gyro_saturation: 0.0,
             init_samples: 200,
             init_gyro_limit: 0.05,
         }
@@ -322,6 +329,8 @@ struct Event {
     imm: Vec<ImmModel>,
     /// `imm`: how many times the likelier model has changed since init.
     imm_switches: u64,
+    /// A cloud slice's points are in the map.
+    mapped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +351,7 @@ impl Event {
             sources: Vec::new(),
             imm: Vec::new(),
             imm_switches: 0,
+            mapped: false,
         }
     }
 }
@@ -498,12 +508,25 @@ impl FusionCore {
             runtime.lever_gyro = gyro;
             runtime.lever_gyro_ns = ts_ns;
             // The lever arm adds centripetal and tangential terms: mount kinematics, not base motion.
-            accel -= gyro.cross(&gyro.cross(&lever)) + runtime.lever_alpha.cross(&lever);
+            let mode = std::env::var("DIMSLAM_LEVER").unwrap_or_default();
+            if mode == "none" {
+            } else if mode == "centripetal" {
+                accel -= gyro.cross(&gyro.cross(&lever));
+            } else {
+                accel -= gyro.cross(&gyro.cross(&lever)) + runtime.lever_alpha.cross(&lever);
+            }
         }
+        let config = &self.config.imus[index];
+        // 1% short of the clip, as a clipped reading jitters just under it.
+        let clipped = |reading: &Vector3<f64>, clip: f64| {
+            clip > 0.0 && reading.iter().any(|value| value.abs() >= 0.99 * clip)
+        };
         let input = ImuInput {
             imu: index,
             gyro,
             accel,
+            accel_saturated: clipped(&imu.linear_acceleration, config.accel_saturation),
+            gyro_saturated: clipped(&imu.angular_velocity, config.gyro_saturation),
         };
         if !self.initialized {
             self.check_config();
@@ -843,6 +866,8 @@ impl FusionCore {
                 gyro_random_walk: imu.gyro_random_walk,
                 accel_noise_density: imu.accel_noise_density,
                 accel_random_walk: imu.accel_random_walk,
+                accel_saturation: imu.accel_saturation,
+                gyro_saturation: imu.gyro_saturation,
             })
             .collect();
         self.filter.process_noise = self.config.process_noise;
@@ -932,18 +957,28 @@ impl FusionCore {
         for index in earliest..self.events.len() {
             self.process_at(index);
         }
+        // A slice joins the map once, at the pose its first update left: what is ahead of the
+        // body is then matchable within the next slice, as it must be going down stairs. A
+        // replay from a late source re-fuses the slice but cannot move points already mapped.
+        for index in earliest..self.events.len() {
+            if self.events[index].mapped {
+                continue;
+            }
+            self.events[index].mapped = true;
+            if let EventKind::Cloud(slice) = &self.events[index].kind {
+                let (slice, state) = (slice.clone(), self.events[index].state.clone());
+                self.map_slice(&slice, &state);
+            }
+        }
         self.trim_history();
     }
 
-    /// Drops what has left the replay buffer; a settled cloud slice goes into the map then.
+    /// Drops what has left the replay buffer.
     fn trim_history(&mut self) {
         let horizon = self.events.back().expect("nonempty").ts_ns
             - (self.config.replay_buffer_seconds * 1.0e9) as i64;
         while self.events.len() > 1 && self.events.front().expect("nonempty").ts_ns < horizon {
-            let event = self.events.pop_front().expect("nonempty");
-            if let EventKind::Cloud(slice) = &event.kind {
-                self.map_slice(slice, &event.state);
-            }
+            self.events.pop_front();
         }
     }
 
@@ -973,50 +1008,58 @@ impl FusionCore {
             .map_or(Vector3::zeros(), |input| input.gyro - state.biases[input.imu].gyro)
     }
 
-    /// Point-to-plane against the map, one update over the slice's matched points.
+    /// Point-to-plane against the map: an iterated update over the slice's matched points,
+    /// each iteration re-matching the points from where the last one left the pose.
     fn apply_cloud(&mut self, slice: &CloudSlice) {
-        let x = self.filter.x.clone();
+        let prior = self.filter.x.clone();
+        let prior_cov = self.filter.p_cov.clone();
         let (angular_velocity, _) = self.filter.angular_velocity();
         let cols = [0, 1, 2, 6, 7, 8];
-        let pose_covariance = Matrix6::from_fn(|r, c| self.filter.p_cov[(cols[r], cols[c])]);
+        let pose_covariance = Matrix6::from_fn(|r, c| prior_cov[(cols[r], cols[c])]);
         let point_variance = self.config.lidars[slice.lidar].point_std.powi(2);
         let gate = self.map.config().point_gate;
-        let mut evidence = PlaneEvidence::default();
-        for point in &slice.points {
-            let (world, body) =
-                lidar::world_point(point, &x.position, &x.q, &x.velocity, &angular_velocity);
-            let Some(plane) = self.map.plane_at(&world) else {
-                continue;
-            };
-            let residual = -(plane.normal.dot(&world) + plane.offset);
-            let row = lidar::plane_row(&plane, &x.q, &body);
-            evidence.add(
-                &row,
-                residual,
-                point_variance + plane.variance,
-                &pose_covariance,
-                gate,
+        let iterations = self.map.config().iterations.max(1);
+        for iteration in 0..iterations {
+            let x = self.filter.x.clone();
+            let mut evidence = PlaneEvidence::default();
+            for point in &slice.points {
+                let (world, body) =
+                    lidar::world_point(point, &x.position, &x.q, &x.velocity, &angular_velocity);
+                let Some(plane) = self.map.plane_at(&world) else {
+                    continue;
+                };
+                let residual = -(plane.normal.dot(&world) + plane.offset);
+                let row = lidar::plane_row(&plane, &x.q, &body);
+                evidence.add(
+                    &row,
+                    residual,
+                    point_variance + plane.variance,
+                    &pose_covariance,
+                    gate,
+                );
+            }
+            let settle = iteration + 1 == iterations;
+            if settle {
+                self.matched_points += evidence.matched as u64;
+                self.gated_points += evidence.gated as u64;
+            }
+            if evidence.matched == 0 {
+                // Nothing matched from here: keep the prior, untouched.
+                self.filter.x = prior;
+                self.filter.p_cov = prior_cov;
+                return;
+            }
+            self.filter.update_pose_information(
+                &prior,
+                &prior_cov,
+                &evidence.information,
+                &evidence.weighted_residual,
+                evidence.weighted_residual_sq,
+                evidence.log_det_noise,
+                evidence.matched,
+                settle,
             );
         }
-        if std::env::var_os("DIMSLAM_LIDAR_TRACE").is_some() {
-            eprintln!(
-                "TRACE {} pts {} matched {} gated {} z {:.2} vz {:.2} pstd {:.3}",
-                self.filter.x.time_ns, slice.points.len(), evidence.matched, evidence.gated,
-                self.filter.x.position.z, self.filter.x.velocity.z, self.filter.p_cov[(2, 2)].sqrt()
-            );
-        }
-        self.matched_points += evidence.matched as u64;
-        self.gated_points += evidence.gated as u64;
-        if evidence.matched == 0 {
-            return;
-        }
-        self.filter.update_pose_information(
-            &evidence.information,
-            &evidence.weighted_residual,
-            evidence.weighted_residual_sq,
-            evidence.log_det_noise,
-            evidence.matched,
-        );
     }
 
     fn process_at(&mut self, index: usize) {
@@ -1797,6 +1840,7 @@ mod tests {
             accel_random_walk: 0.01,
             init_samples: 5,
             init_gyro_limit: 0.05,
+            ..ImuConfig::default()
         }
     }
 

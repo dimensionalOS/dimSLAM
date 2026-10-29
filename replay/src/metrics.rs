@@ -240,6 +240,7 @@ pub fn score_reference(run: &Run, segments: &[(i64, i64)]) -> Metrics {
         variant: "reference".into(),
         fused: run.reference.clone(),
         reference: run.reference.clone(),
+        baselines: Vec::new(),
         rest: Vec::new(),
         wall_seconds: run.wall_seconds,
         data_seconds: run.data_seconds,

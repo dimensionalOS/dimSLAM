@@ -6,9 +6,8 @@
 // steps to it like any other measurement and the IMU carries the pose between slices. A
 // slice's points are matched against a map of planes, one per voxel, each kept as the running
 // mean and scatter of the points that fell in it: a lookup is a hash and a 3x3 eigensolve, with
-// no neighbor search. Points enter the map only once their slice has left the replay buffer,
-// at the pose the filter settled on, since a map cannot be un-inserted when a late message
-// rewrites history.
+// no neighbor search. A slice's points enter the map right after its own update; a late
+// message that replays it later cannot move them, since a map cannot be un-inserted.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,11 +26,14 @@ pub struct LidarConfig {
     pub min_range: f64,
     /// m. Points farther are too sparse to make planes of and lever every angular error.
     pub max_range: f64,
-    /// m. A scan keeps one point per voxel of this size, its earliest.
+    /// m. Each slice keeps one point per voxel of this size, its earliest.
     pub scan_voxel_size: f64,
     /// s. A scan becomes one measurement per slice of this length: shorter tracks faster motion
     /// between slices, longer gives each update more points.
     pub slice_seconds: f64,
+    /// s, added to every scan's stamp: the lidar clock's lag behind the IMU's, or a driver that
+    /// stamps a sweep at its end rather than its start (then minus the sweep's length).
+    pub time_offset_seconds: f64,
     /// m. Noise of one point-to-plane distance. Not the sensor's range noise alone: plane
     /// fits and the map's own pose errors are shared by every point of a slice, so this is set
     /// well above it, or a slice's hundred points make the filter overconfident and its gate
@@ -47,6 +49,7 @@ impl Default for LidarConfig {
             max_range: 60.0,
             scan_voxel_size: 0.3,
             slice_seconds: 0.01,
+            time_offset_seconds: 0.0,
             point_std: 0.1,
         }
     }
@@ -80,6 +83,10 @@ pub struct LidarMapConfig {
     /// (point noise, plane thickness and the pose's own uncertainty), is past this is a
     /// mismatch and is left out.
     pub point_gate: f64,
+    /// Updates per slice, each re-matching the points from the pose the last one left: a
+    /// slice that moves the pose far enough to change which plane a point falls in gets
+    /// matched again from there.
+    pub iterations: u32,
     /// m. Voxels farther than this from the body are dropped.
     pub radius: f64,
 }
@@ -95,6 +102,7 @@ impl Default for LidarMapConfig {
             min_plane_aspect: 3.0,
             min_plane_spread: 0.1,
             point_gate: 9.0,
+            iterations: 3,
             radius: 100.0,
         }
     }
@@ -121,37 +129,33 @@ pub fn slice_scan(
     base_from_lidar: &Isometry3<f64>,
 ) -> Vec<(i64, CloudSlice)> {
     let timed = scan.offsets_ns.len() == scan.points.len();
-    let inverse_voxel = 1.0 / config.scan_voxel_size;
-    let mut occupied = HashSet::new();
-    let mut kept: Vec<(i64, Vector3<f64>)> = Vec::new();
-    let mut order: Vec<usize> = (0..scan.points.len()).collect();
-    if timed {
-        order.sort_by_key(|&i| scan.offsets_ns[i]);
-    }
-    for i in order {
-        let [x, y, z] = scan.points[i];
-        let point = Vector3::new(x as f64, y as f64, z as f64);
+    let mut gated: Vec<(i64, Vector3<f64>)> = Vec::new();
+    for (i, [x, y, z]) in scan.points.iter().enumerate() {
+        let point = Vector3::new(*x as f64, *y as f64, *z as f64);
         let range = point.norm();
         if !range.is_finite() || range < config.min_range || range > config.max_range {
             continue;
         }
-        let body = base_from_lidar * nalgebra::Point3::from(point);
-        let key = voxel_key(&body.coords, inverse_voxel);
-        if !occupied.insert(key) {
-            continue;
-        }
         let offset = if timed { scan.offsets_ns[i] as i64 } else { 0 };
-        kept.push((scan.timestamp_ns + offset, body.coords));
+        let body = base_from_lidar * nalgebra::Point3::from(point);
+        let shift = (config.time_offset_seconds * 1.0e9) as i64;
+        gated.push((scan.timestamp_ns + shift + offset, body.coords));
     }
+    gated.sort_by_key(|(ts, _)| *ts);
+    // Thinned per slice, not per scan: per scan, the earliest point in each voxel wins and the
+    // scan's late slices are left with almost nothing.
+    let inverse_voxel = 1.0 / config.scan_voxel_size;
     let slice_ns = (config.slice_seconds * 1.0e9).max(1.0) as i64;
     let mut slices = Vec::new();
     let mut start = 0;
-    while start < kept.len() {
-        let limit = kept[start].0 + slice_ns;
-        let end = start + kept[start..].partition_point(|(ts, _)| *ts < limit);
-        let stamp = kept[end - 1].0;
-        let points = kept[start..end]
+    while start < gated.len() {
+        let limit = gated[start].0 + slice_ns;
+        let end = start + gated[start..].partition_point(|(ts, _)| *ts < limit);
+        let stamp = gated[end - 1].0;
+        let mut occupied = HashSet::new();
+        let points = gated[start..end]
             .iter()
+            .filter(|(_, body)| occupied.insert(voxel_key(body, inverse_voxel)))
             .map(|(ts, body)| SlicePoint {
                 body: body.cast(),
                 dt: ((ts - stamp) as f64 / 1.0e9) as f32,

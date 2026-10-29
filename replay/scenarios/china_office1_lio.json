@@ -37,7 +37,9 @@
     "gyro_random_walk": 0.0001,
     "accel_noise_density": 0.15,
     "accel_random_walk": 0.001,
-    "init_gyro_limit": 0.3
+    "init_gyro_limit": 0.3,
+    "accel_saturation": 39.2,
+    "gyro_saturation": 34.9
    }
   ],
   "lidars": [
@@ -48,20 +50,12 @@
  },
  "variants": {
   "lio": {},
+  "no_saturation": {
+   "/imus/0/accel_saturation": 0.0
+  },
   "levels_1": {
    "/lidar_map": {
     "levels": 1
-   }
-  },
-  "levels_4": {
-   "/lidar_map": {
-    "levels": 4
-   }
-  },
-  "voxel_1m_levels_4": {
-   "/lidar_map": {
-    "voxel_size": 1.0,
-    "levels": 4
    }
   }
  }
