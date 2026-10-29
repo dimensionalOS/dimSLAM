@@ -98,7 +98,28 @@ impl Core {
                 core.handle_cloud(scan, &mount);
             }
             Core::Slam(core) => core.handle_cloud(scan, tf),
-            Core::Lio(lio) => lio.push_scan(scan),
+            Core::Lio(lio) => match perturbation() {
+                // One point of the 9th scan dropped: a run that differs by nothing physical,
+                // to see how far a chaotic filter's outcome spreads.
+                Some(seed) if lio.scans_pushed() == 8 => {
+                    let mut scan = scan.clone();
+                    if !scan.points.is_empty() {
+                        let i = (seed as usize) % scan.points.len();
+                        if scan.offsets_ns.len() > i {
+                            scan.offsets_ns.remove(i);
+                        }
+                        scan.points.remove(i);
+                        if scan.tags.len() > i {
+                            scan.tags.remove(i);
+                        }
+                        if scan.intensities.len() > i {
+                            scan.intensities.remove(i);
+                        }
+                    }
+                    lio.push_scan(&scan);
+                }
+                _ => lio.push_scan(scan),
+            },
         }
         Ok(())
     }
@@ -110,6 +131,11 @@ impl Core {
             Core::Lio(_) => {}
         }
     }
+}
+
+/// `REPLAY_PERTURB_SEED`: which point the 9th scan loses in `point_lio` mode.
+fn perturbation() -> Option<u64> {
+    std::env::var("REPLAY_PERTURB_SEED").ok()?.parse().ok()
 }
 
 #[derive(Clone, Copy)]

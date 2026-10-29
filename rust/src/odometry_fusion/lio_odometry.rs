@@ -102,6 +102,7 @@ pub struct LioOdometry {
     pub used: Vec<bool>,
     /// The last scan's thinned points, in the IMU frame at their own times.
     pub thinned: Vec<SurfacePoint>,
+    scans_pushed: u64,
 }
 
 impl LioOdometry {
@@ -127,6 +128,7 @@ impl LioOdometry {
             neighbors: Vec::new(),
             used: Vec::new(),
             thinned: Vec::new(),
+            scans_pushed: 0,
         }
     }
 
@@ -135,7 +137,13 @@ impl LioOdometry {
         self.sync.push_imu(stamp, gyro, accel);
     }
 
+    /// Scans handed in so far.
+    pub fn scans_pushed(&self) -> u64 {
+        self.scans_pushed
+    }
+
     pub fn push_scan(&mut self, scan: &LidarScan) {
+        self.scans_pushed += 1;
         let points = surface_points(scan, self.config.min_range, self.config.keep_every);
         self.sync.push_scan(scan.timestamp_ns as u64, points);
     }
