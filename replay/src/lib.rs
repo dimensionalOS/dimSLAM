@@ -56,9 +56,19 @@ pub fn evaluate(
     if let Some((first, _)) = runs.first() {
         let mut scored_baselines = Vec::new();
         for (stream, track) in scenario.baselines.iter().zip(&first.baselines) {
+            // Over the same span the output covers, or a windowed scenario would compare a
+            // window against the whole recording.
+            let (start, end) = (
+                first.fused.first().map_or(i64::MIN, |(t, _)| *t),
+                first.fused.last().map_or(i64::MAX, |(t, _)| *t),
+            );
             let run = Run {
                 variant: format!("baseline:{}", stream.stream),
-                fused: track.clone(),
+                fused: track
+                    .iter()
+                    .filter(|(t, _)| (start..=end).contains(t))
+                    .cloned()
+                    .collect(),
                 reference: first.reference.clone(),
                 baselines: Vec::new(),
                 body_from_camera: first.body_from_camera,

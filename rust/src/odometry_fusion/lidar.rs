@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use nalgebra::{Isometry3, Matrix3, Matrix6, SymmetricEigen, UnitQuaternion, Vector3, Vector6};
+use nalgebra::{DMatrix, DVector, Isometry3, Matrix3, SymmetricEigen, UnitQuaternion, Vector3};
 use serde::{Deserialize, Serialize};
 
 use crate::types::LidarScan;
@@ -34,6 +34,11 @@ pub struct LidarConfig {
     /// s, added to every scan's stamp: the lidar clock's lag behind the IMU's, or a driver that
     /// stamps a sweep at its end rather than its start (then minus the sweep's length).
     pub time_offset_seconds: f64,
+    /// rad. How well `base_from_lidar`'s rotation is known: above zero the filter estimates a
+    /// correction to it from the scans, starting this uncertain. Off by default: on the
+    /// benchmarks the estimate settled on a correction that hurt rather than helped. A mount off by a degree
+    /// lifts or sinks the body with every meter walked, since the map is built on the scans.
+    pub mount_rotation_std: f64,
     /// m. Noise of one point-to-plane distance. Not the sensor's range noise alone: plane
     /// fits and the map's own pose errors are shared by every point of a slice, so this is set
     /// well above it, or a slice's hundred points make the filter overconfident and its gate
@@ -50,6 +55,7 @@ impl Default for LidarConfig {
             scan_voxel_size: 0.3,
             slice_seconds: 0.01,
             time_offset_seconds: 0.0,
+            mount_rotation_std: 0.0,
             point_std: 0.05,
         }
     }
@@ -137,6 +143,8 @@ pub struct SlicePoint {
 #[derive(Clone, Debug)]
 pub struct CloudSlice {
     pub lidar: usize,
+    /// The lidar's origin in the body frame: a mount correction turns the points about it.
+    pub origin: Vector3<f64>,
     pub points: Vec<SlicePoint>,
 }
 
@@ -180,7 +188,14 @@ pub fn slice_scan(
                 dt: ((ts - stamp) as f64 / 1.0e9) as f32,
             })
             .collect();
-        slices.push((stamp, CloudSlice { lidar, points }));
+        slices.push((
+            stamp,
+            CloudSlice {
+                lidar,
+                origin: base_from_lidar.translation.vector,
+                points,
+            },
+        ));
         start = end;
     }
     slices
@@ -194,18 +209,39 @@ fn voxel_key(point: &Vector3<f64>, inverse_size: f64) -> [i32; 3] {
     ]
 }
 
-/// A point's world position at `dt` from the state's stamp, moved back along the state's own
-/// velocity and rate: the slice's points are spread over its length, the state is at its end.
-pub fn world_point(
+/// Where a slice point lands: its body position with the mount correction `mount` turned in
+/// about the lidar's `origin`, moved back along the state's own velocity and rate to the
+/// point's time (the slice's points spread over its length, the state is at its end).
+pub struct Landed {
+    pub world: Vector3<f64>,
+    /// The body position at the point's time, deskewed.
+    pub body: Vector3<f64>,
+    /// world_from_body rotation at the point's time, times the deskew: what turns a body
+    /// perturbation into a world one.
+    pub rotation: Matrix3<f64>,
+    /// The point relative to the lidar origin after the mount correction, before deskew.
+    pub from_origin: Vector3<f64>,
+}
+
+pub fn land(
     point: &SlicePoint,
+    origin: &Vector3<f64>,
+    mount: &UnitQuaternion<f64>,
     position: &Vector3<f64>,
     q: &UnitQuaternion<f64>,
     velocity: &Vector3<f64>,
     angular_velocity: &Vector3<f64>,
-) -> (Vector3<f64>, Vector3<f64>) {
+) -> Landed {
     let dt = point.dt as f64;
-    let body = UnitQuaternion::from_scaled_axis(angular_velocity * dt) * point.body.cast::<f64>();
-    (q * body + position + velocity * dt, body)
+    let from_origin = mount * (point.body.cast::<f64>() - origin);
+    let deskew = UnitQuaternion::from_scaled_axis(angular_velocity * dt);
+    let body = deskew * (from_origin + origin);
+    Landed {
+        world: q * body + position + velocity * dt,
+        body,
+        rotation: (q * deskew).to_rotation_matrix().into_inner(),
+        from_origin,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -445,14 +481,14 @@ fn fit_plane(voxel: &Voxel, config: &LidarMapConfig, size: f64) -> Option<Plane>
     })
 }
 
-/// A slice's matched points summarized for one update of the pose columns: the information
-/// sum(h h^T / s^2), the information-weighted residual sum(h r / s^2), sum(r^2 / s^2), and
-/// sum(ln s^2), over the points that passed the gate. h is a point's row over
-/// [position, rotation], r its distance to its plane, s^2 its noise.
-#[derive(Clone, Debug, Default)]
+/// A slice's matched points summarized for one update of the pose (and mount) columns: the
+/// information sum(h h^T / s^2), the information-weighted residual sum(h r / s^2),
+/// sum(r^2 / s^2), and sum(ln s^2), over the points that passed the gate. h is a point's row,
+/// r its distance to its plane, s^2 its noise.
+#[derive(Clone, Debug)]
 pub struct PlaneEvidence {
-    pub information: Matrix6<f64>,
-    pub weighted_residual: Vector6<f64>,
+    pub information: DMatrix<f64>,
+    pub weighted_residual: DVector<f64>,
     pub weighted_residual_sq: f64,
     pub log_det_noise: f64,
     pub matched: usize,
@@ -460,17 +496,28 @@ pub struct PlaneEvidence {
 }
 
 impl PlaneEvidence {
-    /// Adds one point-to-plane row: `row` over [position, rotation], `residual` the plane
-    /// distance to remove, `noise` its variance, `pose_covariance` the pose block of P.
+    pub fn new(columns: usize) -> Self {
+        Self {
+            information: DMatrix::zeros(columns, columns),
+            weighted_residual: DVector::zeros(columns),
+            weighted_residual_sq: 0.0,
+            log_det_noise: 0.0,
+            matched: 0,
+            gated: 0,
+        }
+    }
+
+    /// Adds one point-to-plane row: `residual` the plane distance to remove, `noise` its
+    /// variance, `covariance` the block of P over the row's columns.
     pub fn add(
         &mut self,
-        row: &Vector6<f64>,
+        row: &DVector<f64>,
         residual: f64,
         noise: f64,
-        pose_covariance: &Matrix6<f64>,
+        covariance: &DMatrix<f64>,
         gate: f64,
     ) {
-        let predicted = (row.transpose() * pose_covariance * row)[(0, 0)] + noise;
+        let predicted = (row.transpose() * covariance * row)[(0, 0)] + noise;
         if residual * residual > gate * predicted {
             self.gated += 1;
             return;
@@ -483,14 +530,25 @@ impl PlaneEvidence {
     }
 }
 
-/// The point-to-plane row of `world` (seen at body-frame `body`) under the right-perturbed
-/// rotation `q`: d(n . x)/d[position, theta] = [n, -(R [body]x)^T n].
-pub fn plane_row(plane: &Plane, q: &UnitQuaternion<f64>, body: &Vector3<f64>) -> Vector6<f64> {
-    let rotation_row = -(q.to_rotation_matrix().matrix() * body.cross_matrix()).transpose()
-        * plane.normal;
-    let mut row = Vector6::zeros();
+/// The point-to-plane row over [position, rotation] and, when the mount is estimated, its
+/// correction: d(n . x)/d[position, theta, mount] = [n, -(R [body]x)^T n, -(R E [m]x)^T n],
+/// theta the body's right perturbation, mount one about the lidar origin in the body frame.
+pub fn plane_row(
+    plane: &Plane,
+    q: &UnitQuaternion<f64>,
+    landed: &Landed,
+    with_mount: bool,
+) -> DVector<f64> {
+    let mut row = DVector::zeros(if with_mount { 9 } else { 6 });
     row.fixed_rows_mut::<3>(0).copy_from(&plane.normal);
+    let rotation_row =
+        -(q.to_rotation_matrix().matrix() * landed.body.cross_matrix()).transpose() * plane.normal;
     row.fixed_rows_mut::<3>(3).copy_from(&rotation_row);
+    if with_mount {
+        let mount_row =
+            -(landed.rotation * landed.from_origin.cross_matrix()).transpose() * plane.normal;
+        row.fixed_rows_mut::<3>(6).copy_from(&mount_row);
+    }
     row
 }
 
@@ -667,29 +725,40 @@ mod tests {
         };
         let q = UnitQuaternion::from_euler_angles(0.2, -0.1, 0.7);
         let position = Vector3::new(1.0, 2.0, 0.5);
-        let body = Vector3::new(3.0, -1.0, 0.4);
-        let distance = |position: &Vector3<f64>, q: &UnitQuaternion<f64>| {
-            plane.normal.dot(&(q * body + position)) + plane.offset
+        let velocity = Vector3::new(0.5, -0.2, 0.1);
+        let rate = Vector3::new(0.3, 1.2, -0.7);
+        let origin = Vector3::new(0.1, -0.05, 0.3);
+        let mount = UnitQuaternion::from_euler_angles(0.02, -0.03, 0.01);
+        let point = SlicePoint {
+            body: Vector3::new(3.0, -1.0, 0.4),
+            dt: -0.006,
         };
-        let row = plane_row(&plane, &q, &body);
+        let distance = |position: &Vector3<f64>, q: &UnitQuaternion<f64>, mount: &UnitQuaternion<f64>| {
+            let landed = land(&point, &origin, mount, position, q, &velocity, &rate);
+            plane.normal.dot(&landed.world) + plane.offset
+        };
+        let landed = land(&point, &origin, &mount, &position, &q, &velocity, &rate);
+        let row = plane_row(&plane, &q, &landed, true);
         let eps = 1e-6;
+        let base = distance(&position, &q, &mount);
         for axis in 0..3 {
             let mut step = Vector3::zeros();
             step[axis] = eps;
-            let dp = (distance(&(position + step), &q) - distance(&position, &q)) / eps;
+            let dp = (distance(&(position + step), &q, &mount) - base) / eps;
             assert!((dp - row[axis]).abs() < 1e-5);
-            let dq = (distance(&position, &(q * UnitQuaternion::from_scaled_axis(step)))
-                - distance(&position, &q))
-                / eps;
-            assert!((dq - row[3 + axis]).abs() < 1e-5, "theta {axis}: {dq} vs {}", row[3 + axis]);
+            let turn = UnitQuaternion::from_scaled_axis(step);
+            let dq = (distance(&position, &(q * turn), &mount) - base) / eps;
+            assert!((dq - row[3 + axis]).abs() < 1e-4, "theta {axis}: {dq} vs {}", row[3 + axis]);
+            let dm = (distance(&position, &q, &(turn * mount)) - base) / eps;
+            assert!((dm - row[6 + axis]).abs() < 1e-4, "mount {axis}: {dm} vs {}", row[6 + axis]);
         }
     }
 
     #[test]
     fn the_gate_counts_rather_than_fuses_a_far_point() {
-        let mut evidence = PlaneEvidence::default();
-        let row = Vector6::new(0.0, 0.0, 1.0, 0.0, 0.0, 0.0);
-        let p = Matrix6::identity() * 1e-4;
+        let mut evidence = PlaneEvidence::new(6);
+        let row = DVector::from_vec(vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
+        let p = DMatrix::identity(6, 6) * 1e-4;
         evidence.add(&row, 0.01, 1e-4, &p, 9.0);
         evidence.add(&row, 1.0, 1e-4, &p, 9.0);
         assert_eq!((evidence.matched, evidence.gated), (1, 1));

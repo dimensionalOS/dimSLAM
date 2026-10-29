@@ -15,6 +15,9 @@ use crate::lcm;
 use crate::scenario::{Mode, OdometryStream, Scenario};
 use crate::tf::TfBuffer;
 
+/// A sensor stamp this far past the replay's clock is not on it.
+const MAX_CLOCK_JUMP_NS: i64 = 5_000_000_000;
+
 pub struct Run {
     pub variant: String,
     /// The core's output at each publish tick, ns.
@@ -174,11 +177,23 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
     for (index, source) in scenario.sources.iter().enumerate() {
         add(&source.stream, Role::Source(index));
     }
-    add(&scenario.reference.stream, Role::Reference);
+    // What the output is scored on is read whole, not windowed: a stream recorded on another
+    // clock (a re-stamped offline run, say) would otherwise fall outside the window entirely.
+    let mut scoring_names: Vec<String> = Vec::new();
+    let mut scoring_roles: Vec<Vec<Role>> = Vec::new();
+    let mut add_scoring = |name: &str, role: Role| {
+        let index = scoring_names.iter().position(|n| n == name).unwrap_or_else(|| {
+            scoring_names.push(name.to_string());
+            scoring_roles.push(Vec::new());
+            scoring_names.len() - 1
+        });
+        scoring_roles[index].push(role);
+    };
+    add_scoring(&scenario.reference.stream, Role::Reference);
     for (index, baseline) in scenario.baselines.iter().enumerate() {
-        add(&baseline.stream, Role::Baseline(index));
+        add_scoring(&baseline.stream, Role::Baseline(index));
     }
-    add(&scenario.rest.stream, Role::Rest);
+    add_scoring(&scenario.rest.stream, Role::Rest);
     for (index, imu) in scenario.imus.iter().enumerate() {
         add(imu.stream(), Role::Imu(index));
     }
@@ -215,6 +230,32 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
         data_seconds: 0.0,
         dropped: Vec::new(),
     };
+    let mut scoring = Recording::open(&path, &scoring_names, 0.0, 0.0)?;
+    while let Some(record) = scoring.next_record()? {
+        for role in &scoring_roles[record.stream] {
+            let msg = lcm::odometry(&record.data)?;
+            match role {
+                Role::Reference => match remap(&scenario.reference, msg, &tf) {
+                    Ok(msg) => run.reference.push((msg.timestamp_ns, msg.pose)),
+                    Err(why) => run.dropped.push(why),
+                },
+                Role::Baseline(index) => match remap(&scenario.baselines[*index], msg, &tf) {
+                    Ok(msg) => run.baselines[*index].push((msg.timestamp_ns, msg.pose)),
+                    Err(why) => run.dropped.push(why),
+                },
+                _ => {
+                    let still = msg.twist.linear.norm() < scenario.rest.speed
+                        && msg.twist.angular.norm() < scenario.rest.angular_speed;
+                    let offset = (scenario.rest.time_offset_seconds * 1e9).round() as i64;
+                    run.rest.push((msg.timestamp_ns + offset, still));
+                }
+            }
+        }
+    }
+    for track in std::iter::once(&mut run.reference).chain(run.baselines.iter_mut()) {
+        track.sort_by_key(|(t, _)| *t);
+    }
+    run.rest.sort_by_key(|(t, _)| *t);
     let mut next_tick: Option<i64> = None;
     let (mut first_ts, mut last_ts) = (f64::NAN, f64::NAN);
     let started = Instant::now();
@@ -242,8 +283,12 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                     (record.ts * 1e9) as i64 + scenario.camera_infos[index].offset_ns()
                 }
             };
+            // A stamp far ahead of the clock so far is on another clock (a driver glitch) and
+            // must not drag the publish timer with it; the core decides what to do with it.
+            let off_clock = next_tick
+                .is_some_and(|tick| stamp - tick > MAX_CLOCK_JUMP_NS);
             // Publish every tick the data clock has passed, as the live module's timer would.
-            if !matches!(role, Role::Reference | Role::Baseline(_) | Role::Rest) {
+            if !off_clock && !matches!(role, Role::Reference | Role::Baseline(_) | Role::Rest) {
                 let tick = next_tick.get_or_insert(stamp);
                 while *tick <= stamp {
                     if let Some(msg) = core.publish(*tick) {

@@ -28,6 +28,11 @@ pub struct TagSpec {
     pub max_reproj_px: Option<f64>,
     #[serde(default)]
     pub min_tag_px: Option<f64>,
+    #[serde(default)]
+    pub min_sharpness: Option<f64>,
+    /// Tags that moved during the recording, which a revisit cannot score.
+    #[serde(default)]
+    pub exclude_markers: Vec<i64>,
     /// Detector-reported body speeds (its own units), past which motion blur dominates.
     #[serde(default)]
     pub max_lin_speed: Option<f64>,
@@ -64,6 +69,9 @@ pub fn load(path: &Path, spec: &TagSpec) -> Result<Vec<Sighting>, String> {
         let Some(marker) = tags.get("marker_id").and_then(|v| v.as_i64()) else {
             continue;
         };
+        if spec.exclude_markers.contains(&marker) {
+            continue;
+        }
         let number = |key: &str| tags.get(key).and_then(|v| v.as_f64());
         let within = |key: &str, max: Option<f64>| match (max, number(key)) {
             (Some(max), Some(value)) => value <= max,
@@ -75,6 +83,7 @@ pub fn load(path: &Path, spec: &TagSpec) -> Result<Vec<Sighting>, String> {
         };
         if !(within("reproj_px", spec.max_reproj_px)
             && at_least("tag_px", spec.min_tag_px)
+            && at_least("sharpness", spec.min_sharpness)
             && within("lin_speed", spec.max_lin_speed)
             && within("ang_speed", spec.max_ang_speed))
         {

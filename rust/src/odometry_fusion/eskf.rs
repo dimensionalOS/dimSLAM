@@ -5,7 +5,9 @@
 // there is no IMU, else a gyro_bias/accel_bias pair per IMU, then a position/theta pair per
 // cloned pose. theta is a right (body-frame) perturbation: q_true = q_est * Exp(theta).
 
-use nalgebra::{DMatrix, DVector, Matrix3, Matrix6, UnitQuaternion, Vector3, Vector6};
+use nalgebra::{DMatrix, DVector, Matrix3, UnitQuaternion, Vector3};
+#[cfg(test)]
+use nalgebra::{Matrix6, Vector6};
 
 use super::{InitialStds, ProcessNoise};
 
@@ -30,6 +32,12 @@ pub struct Layout {
     /// The IMU is a measurement of angular velocity and specific-force states rather than the
     /// process input.
     pub imu_states: bool,
+    /// Lidar mount corrections estimated, one rotation each.
+    pub mounts: usize,
+    /// Gravity is a world-frame vector state, not fixed straight down: a tilt between the IMU
+    /// and whatever the map is built from then shows up as gravity leaning in the map frame,
+    /// rather than as a drift up or down with every meter moved.
+    pub gravity_state: bool,
 }
 
 impl Layout {
@@ -76,8 +84,18 @@ impl Layout {
         self.clone_position_col(slot) + 3
     }
 
+    /// The 3 columns of mount correction `slot`.
+    pub fn mount_col(&self, slot: usize) -> usize {
+        self.clones_start() + 6 * self.clones + 3 * slot
+    }
+
+    pub fn gravity_col(&self) -> Option<usize> {
+        self.gravity_state
+            .then(|| self.clones_start() + 6 * self.clones + 3 * self.mounts)
+    }
+
     pub fn dim(&self) -> usize {
-        self.clones_start() + 6 * self.clones
+        self.clones_start() + 6 * self.clones + 3 * self.mounts + 3 * usize::from(self.gravity_state)
     }
 
     /// The dimensions a planar body cannot move in: z, roll, pitch and their rates.
@@ -146,6 +164,11 @@ pub struct State {
     pub biases: Vec<ImuBias>,
     pub input: Option<ImuInput>,
     pub clones: Vec<Option<PoseClone>>,
+    /// Per estimated lidar mount, the rotation correcting its tf mount, about the lidar origin
+    /// in the body frame.
+    pub mounts: Vec<UnitQuaternion<f64>>,
+    /// World-frame gravity, m/s^2; a state only with `Layout::gravity_state`.
+    pub gravity: Vector3<f64>,
 }
 
 impl Default for State {
@@ -160,6 +183,8 @@ impl Default for State {
             biases: Vec::new(),
             input: None,
             clones: Vec::new(),
+            mounts: Vec::new(),
+            gravity: Vector3::zeros(),
         }
     }
 }
@@ -181,6 +206,8 @@ pub struct Filter {
     pub log_likelihood: f64,
     pub x: State,
     pub p_cov: Cov,
+    /// Per estimated mount, its initial rotation std (rad).
+    pub mount_stds: Vec<f64>,
 }
 
 impl Filter {
@@ -203,6 +230,8 @@ impl Filter {
             biases,
             input,
             clones: vec![None; self.layout.clones],
+            mounts: vec![UnitQuaternion::identity(); self.layout.mounts],
+            gravity: Vector3::new(0.0, 0.0, -self.gravity),
             ..State::default()
         };
         let dim = self.dim();
@@ -221,6 +250,12 @@ impl Filter {
         for imu in 0..self.layout.imus {
             blocks.push((self.layout.gyro_bias_col(imu), stds.bias));
             blocks.push((self.layout.accel_bias_col(imu), stds.bias));
+        }
+        for (slot, std) in self.mount_stds.iter().enumerate().take(self.layout.mounts) {
+            blocks.push((self.layout.mount_col(slot), *std));
+        }
+        if let Some(col) = self.layout.gravity_col() {
+            blocks.push((col, stds.gravity));
         }
         for (block, std) in blocks {
             self.p_cov
@@ -327,7 +362,7 @@ impl Filter {
         let rotation = self.x.q.to_rotation_matrix();
         let force = self.x.specific_force;
         let omega = self.x.angular_velocity;
-        let world_accel = rotation * force + Vector3::new(0.0, 0.0, -self.gravity);
+        let world_accel = rotation * force + self.gravity_vector();
 
         let mut f = Cov::identity(dim, dim);
         f.view_mut((0, 3), (3, 3))
@@ -336,6 +371,10 @@ impl Filter {
             .copy_from(&(-(rotation.matrix() * skew(&force)) * dt));
         f.view_mut((3, force_col), (3, 3))
             .copy_from(&(rotation.matrix() * dt));
+        if let Some(col) = layout.gravity_col() {
+            f.view_mut((3, col), (3, 3))
+                .copy_from(&(Matrix3::identity() * dt));
+        }
         f.view_mut((6, 6), (3, 3))
             .copy_from(&(Matrix3::identity() - skew(&omega) * dt));
         f.view_mut((6, omega_col), (3, 3))
@@ -446,8 +485,7 @@ impl Filter {
         let rotation = self.x.q.to_rotation_matrix();
         let unbiased_gyro = gyro - self.x.biases[imu].gyro;
         let unbiased_accel = accel - self.x.biases[imu].accel;
-        let gravity_vector = Vector3::new(0.0, 0.0, -self.gravity);
-        let world_accel = rotation * unbiased_accel + gravity_vector;
+        let world_accel = rotation * unbiased_accel + self.gravity_vector();
 
         let mut f = Cov::identity(dim, dim);
         f.view_mut((0, 3), (3, 3))
@@ -460,6 +498,10 @@ impl Filter {
             .copy_from(&(Matrix3::identity() - skew(&unbiased_gyro) * dt));
         f.view_mut((6, layout.gyro_bias_col(imu)), (3, 3))
             .copy_from(&(-Matrix3::identity() * dt));
+        if let Some(col) = layout.gravity_col() {
+            f.view_mut((3, col), (3, 3))
+                .copy_from(&(Matrix3::identity() * dt));
+        }
 
         self.x.position += self.x.velocity * dt + 0.5 * world_accel * dt * dt;
         self.x.velocity += world_accel * dt;
@@ -493,6 +535,15 @@ impl Filter {
             }
         }
         self.p_cov = &f * &self.p_cov * f.transpose() + q_noise;
+    }
+
+    /// World-frame gravity: the state's when it is one, else straight down.
+    pub fn gravity_vector(&self) -> Vector3<f64> {
+        if self.layout.gravity_state {
+            self.x.gravity
+        } else {
+            Vector3::new(0.0, 0.0, -self.gravity)
+        }
     }
 
     /// Projects out what a planar body cannot do. A hard constraint rather than pseudo-
@@ -604,10 +655,11 @@ impl Filter {
         true
     }
 
-    /// A batch of scalar measurements on the position and rotation columns alone, given as
-    /// information (see `lidar::PlaneEvidence`), linearized at the current state. Through the
-    /// Woodbury identity the gain needs only a 6x6 inverse, (I + G P_pose)^-1, whatever the
-    /// number of rows, and that stays invertible where planar mode has pinned P_pose singular.
+    /// A batch of scalar measurements on the columns `cols` alone (position and rotation, and
+    /// any mount correction), given as information (see `lidar::PlaneEvidence`), linearized at
+    /// the current state. Through the Woodbury identity the gain needs only a k x k inverse,
+    /// (I + G P_cols)^-1 for k columns, whatever the number of rows, and that stays invertible
+    /// where planar mode has pinned P_cols singular.
     ///
     /// Iterated: `prior` and `prior_cov` are the state and covariance before this measurement;
     /// the current state may already have moved off the prior by an earlier iteration, and the
@@ -618,42 +670,41 @@ impl Filter {
         &mut self,
         prior: &State,
         prior_cov: &Cov,
-        information: &Matrix6<f64>,
-        weighted_residual: &Vector6<f64>,
+        cols: &[usize],
+        information: &Cov,
+        weighted_residual: &DVector<f64>,
         weighted_residual_sq: f64,
         log_det_noise: f64,
         rows: usize,
         settle: bool,
     ) {
-        let cols = [0, 1, 2, 6, 7, 8];
+        let k = cols.len();
         let dim = self.dim();
         let linearized = std::mem::replace(&mut self.x, prior.clone());
-        let moved = self.difference(&linearized);
-        let moved = Vector6::from_fn(|r, _| moved[cols[r]]);
-        let weighted_residual = weighted_residual + information * moved;
+        let moved_full = self.difference(&linearized);
+        let moved = DVector::from_fn(k, |r, _| moved_full[cols[r]]);
+        let original = weighted_residual;
+        let weighted_residual = original + information * &moved;
         let weighted_residual_sq = weighted_residual_sq
-            + 2.0 * moved.dot(&(weighted_residual - information * moved))
-            + moved.dot(&(information * moved));
-        let pose_covariance = Matrix6::from_fn(|r, c| prior_cov[(cols[r], cols[c])]);
-        let Some(inverse) = (Matrix6::identity() + information * pose_covariance).try_inverse()
-        else {
+            + 2.0 * moved.dot(original)
+            + moved.dot(&(information * &moved));
+        let block = Cov::from_fn(k, k, |r, c| prior_cov[(cols[r], cols[c])]);
+        let Some(inverse) = (Cov::identity(k, k) + information * &block).try_inverse() else {
             self.x = linearized;
             return;
         };
         // M = (I + G P)^-1 G and v = (I + G P)^-1 g are H^T S^-1 H and H^T S^-1 r.
-        let pulled = inverse * weighted_residual;
-        let cross = Cov::from_fn(dim, 6, |r, c| prior_cov[(r, cols[c])]);
-        let dx: DVector<f64> = &cross * DVector::from_column_slice(pulled.as_slice());
+        let pulled = &inverse * &weighted_residual;
+        let cross = Cov::from_fn(dim, k, |r, c| prior_cov[(r, cols[c])]);
+        let dx: DVector<f64> = &cross * &pulled;
         self.inject(&dx);
         if settle {
             // r^T S^-1 r = r^T R^-1 r - g^T (I + P G)^-1 P g, and det S = det R det(I + P G).
-            let mahalanobis_sq =
-                weighted_residual_sq - pulled.dot(&(pose_covariance * weighted_residual));
+            let mahalanobis_sq = weighted_residual_sq - pulled.dot(&(&block * &weighted_residual));
             let log_det = log_det_noise - inverse.determinant().ln();
             self.log_likelihood -= 0.5
                 * (mahalanobis_sq + log_det + rows as f64 * (2.0 * std::f64::consts::PI).ln());
-            let shrink = inverse * information;
-            let shrink = Cov::from_column_slice(6, 6, shrink.as_slice());
+            let shrink = &inverse * information;
             self.p_cov = prior_cov - &cross * shrink * cross.transpose();
             self.p_cov = (&self.p_cov + self.p_cov.transpose()) * 0.5;
         }
@@ -683,6 +734,14 @@ impl Filter {
                 .copy_from(&(theirs.gyro - mine.gyro));
             dx.fixed_rows_mut::<3>(layout.accel_bias_col(imu))
                 .copy_from(&(theirs.accel - mine.accel));
+        }
+        if let Some(col) = layout.gravity_col() {
+            dx.fixed_rows_mut::<3>(col)
+                .copy_from(&(other.gravity - self.x.gravity));
+        }
+        for (slot, (mine, theirs)) in self.x.mounts.iter().zip(&other.mounts).enumerate() {
+            dx.fixed_rows_mut::<3>(layout.mount_col(slot))
+                .copy_from(&(theirs * mine.inverse()).scaled_axis());
         }
         for (slot, (mine, theirs)) in self.x.clones.iter().zip(&other.clones).enumerate() {
             if let (Some(mine), Some(theirs)) = (mine, theirs) {
@@ -734,6 +793,14 @@ impl Filter {
             bias.gyro += dx.fixed_rows::<3>(layout.gyro_bias_col(imu));
             bias.accel += dx.fixed_rows::<3>(layout.accel_bias_col(imu));
         }
+        if let Some(col) = layout.gravity_col() {
+            self.x.gravity += dx.fixed_rows::<3>(col);
+        }
+        for (slot, mount) in self.x.mounts.iter_mut().enumerate() {
+            *mount = UnitQuaternion::from_scaled_axis(
+                dx.fixed_rows::<3>(layout.mount_col(slot)).into_owned(),
+            ) * *mount;
+        }
         for (slot, clone) in self.x.clones.iter_mut().enumerate() {
             if let Some(clone) = clone {
                 clone.position += dx.fixed_rows::<3>(layout.clone_position_col(slot));
@@ -760,6 +827,7 @@ mod tests {
             rotation: 0.05,
             angular_velocity: 0.1,
             specific_force: 0.5,
+            gravity: 0.0,
             bias: 0.01,
         }
     }
@@ -822,6 +890,8 @@ mod tests {
                 imus: 0,
                 clones,
                 imu_states: false,
+                mounts: 0,
+                gravity_state: false,
             },
             process_noise: ProcessNoise {
                 linear_acceleration: 0.5,
@@ -870,6 +940,8 @@ mod tests {
             imus: 0,
             clones: 1,
             imu_states: false,
+            mounts: 0,
+            gravity_state: false,
         };
         assert_eq!(without.angular_velocity_col(), Some(9));
         assert_eq!(without.clone_position_col(0), 12);
@@ -878,6 +950,8 @@ mod tests {
             imus: 2,
             clones: 1,
             imu_states: false,
+            mounts: 0,
+            gravity_state: false,
         };
         assert_eq!(with.angular_velocity_col(), None);
         assert_eq!(with.accel_bias_col(1), 18);
@@ -1008,8 +1082,9 @@ mod tests {
             batched.update_pose_information(
                 &prior,
                 &prior_cov,
-                &information,
-                &weighted,
+                &cols,
+                &Cov::from_column_slice(6, 6, information.as_slice()),
+                &DVector::from_column_slice(weighted.as_slice()),
                 weighted_sq,
                 log_det,
                 rows.len(),
@@ -1120,6 +1195,7 @@ mod tests {
                 rotation: 0.5,
                 angular_velocity: 7.0,
                 specific_force: 0.5,
+                gravity: 0.0,
                 bias: 0.01,
             },
         );

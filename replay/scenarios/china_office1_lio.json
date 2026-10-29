@@ -45,7 +45,8 @@
   "min_tag_px": 12,
   "max_lin_speed": 1.5,
   "max_ang_speed": 150,
-  "visit_gap_seconds": 20
+  "visit_gap_seconds": 20,
+  "min_sharpness": 25
  },
  "rest": {
   "stream": "pointlio_odometry",
