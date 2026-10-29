@@ -109,6 +109,10 @@ pub struct LioOdometry {
     rates: VecDeque<(f64, Vector3<f64>, f64)>,
     /// Measured rates the filter refused since it last took one.
     pub rates_rejected_in_a_row: u32,
+    /// The state's angular velocity at the instants rates were last checked for (s, rad/s),
+    /// reaching back to the newest rate taken: what a late rate is measured against.
+    turn_history: VecDeque<(f64, Vector3<f64>)>,
+    rates_pushed: bool,
 }
 
 impl LioOdometry {
@@ -137,6 +141,8 @@ impl LioOdometry {
             scans_pushed: 0,
             rates: VecDeque::new(),
             rates_rejected_in_a_row: 0,
+            turn_history: VecDeque::new(),
+            rates_pushed: false,
         }
     }
 
@@ -149,18 +155,47 @@ impl LioOdometry {
     /// order with the IMU samples.
     pub fn push_rate(&mut self, stamp: f64, rate: Vector3<f64>, variance: f64) {
         self.rates.push_back((stamp, rate, variance));
+        self.rates_pushed = true;
     }
 
-    /// Takes the measured rates stamped before `until`, each at its own instant; a rate that
+    /// The state's angular velocity at `stamp`, from the history (its oldest entry when
+    /// `stamp` is older still).
+    fn turn_at(&self, stamp: f64) -> Option<Vector3<f64>> {
+        let after = self.turn_history.iter().position(|(t, _)| *t >= stamp);
+        match after {
+            Some(0) => self.turn_history.front().map(|(_, w)| *w),
+            Some(i) => {
+                let (t0, w0) = self.turn_history[i - 1];
+                let (t1, w1) = self.turn_history[i];
+                let along = if t1 > t0 { (stamp - t0) / (t1 - t0) } else { 1.0 };
+                Some(w0 + (w1 - w0) * along)
+            }
+            None => self.turn_history.back().map(|(_, w)| *w),
+        }
+    }
+
+    /// Takes the measured rates stamped before `until`, each at its own instant. A rate that
     /// arrives after the state has passed its stamp (a camera's frames trail the IMU) is taken
-    /// at the state's instant instead.
+    /// at the state's instant, carried there by the state's own change in angular velocity
+    /// since the stamp, so only the sensor's noise is left between the two.
     fn take_rates(&mut self, until: f64) {
+        // Only a LIO given rates keeps the history; it is trimmed as they are taken.
+        if !self.first_scan && self.rates_pushed {
+            self.turn_history
+                .push_back((self.state_at, self.filter.x.angular_velocity));
+        }
         while self.rates.front().is_some_and(|(stamp, _, _)| *stamp < until) {
-            let (stamp, rate, variance) = self.rates.pop_front().expect("checked");
+            let (measured_at, mut rate, variance) = self.rates.pop_front().expect("checked");
             if self.first_scan {
                 continue;
             }
-            let stamp = stamp.max(self.state_at);
+            let late_from = (measured_at < self.state_at)
+                .then(|| self.turn_at(measured_at))
+                .flatten();
+            while self.turn_history.get(1).is_some_and(|(t, _)| *t <= measured_at) {
+                self.turn_history.pop_front();
+            }
+            let stamp = measured_at.max(self.state_at);
             self.filter
                 .predict(stamp - self.state_at, &self.noise, true, false);
             self.state_at = stamp;
@@ -168,6 +203,9 @@ impl LioOdometry {
             if since > 0.0 {
                 self.covariance_at = stamp;
                 self.filter.predict(since, &self.noise, false, true);
+            }
+            if let Some(then) = late_from {
+                rate += self.filter.x.angular_velocity - then;
             }
             if self.filter.update_angular_velocity(&rate, variance) {
                 self.rates_rejected_in_a_row = 0;
