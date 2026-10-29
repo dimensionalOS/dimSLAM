@@ -257,6 +257,7 @@ pub fn lidar_scan(buf: &[u8]) -> Result<LidarScan> {
     let time = field("offset_time", UINT32).ok();
     const UINT8: u8 = 2;
     let tag = field("tag", UINT8).ok();
+    let intensity = field("intensity", FLOAT32).ok();
     let count = (width.max(0) as usize) * (height.max(0) as usize);
     if point_step == 0 || data.len() < count * point_step {
         return Err(format!("cloud data has {} bytes for {count} points", data.len()));
@@ -265,7 +266,11 @@ pub fn lidar_scan(buf: &[u8]) -> Result<LidarScan> {
     let mut points = Vec::with_capacity(count);
     let mut offsets_ns = Vec::new();
     let mut tags = Vec::new();
+    let mut intensities = Vec::new();
     for p in data.chunks_exact(point_step).take(count) {
+        if let Some(at) = intensity {
+            intensities.push(f32_at(p, at));
+        }
         if let Some(at) = tag {
             tags.push(p[at]);
         }
@@ -280,6 +285,7 @@ pub fn lidar_scan(buf: &[u8]) -> Result<LidarScan> {
         points,
         offsets_ns,
         tags,
+        intensities,
     })
 }
 
