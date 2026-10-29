@@ -30,8 +30,8 @@ pub fn time_runs(points: &[SurfacePoint]) -> Vec<usize> {
 pub fn fit_plane(points: &[SurfacePoint], tolerance: f32) -> Option<[f32; 4]> {
     let mut columns = [[0f32; PLANE_POINTS]; 3];
     for (row, p) in points[..PLANE_POINTS].iter().enumerate() {
-        for axis in 0..3 {
-            columns[axis][row] = p.position[axis];
+        for (column, value) in columns.iter_mut().zip(p.position) {
+            column[row] = value;
         }
     }
     let solution = least_squares(&mut columns, [-1.0; PLANE_POINTS]);
