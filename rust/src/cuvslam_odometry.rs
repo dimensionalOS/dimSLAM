@@ -630,6 +630,17 @@ impl CuvslamCore {
                 .find(|camera| camera.frame == depth.frame_id)
                 .map(|camera| &camera.info)
         })?;
+        if depth.width != info.width || depth.height != info.height {
+            error_throttled!(
+                Duration::from_secs(10),
+                depth_width = depth.width,
+                depth_height = depth.height,
+                info_width = info.width,
+                info_height = info.height,
+                "depth image does not match its intrinsics; skipping the cloud",
+            );
+            return None;
+        }
         let camera_config = self.depth_config(&depth.frame_id);
         let mut cloud = PointCloud::default();
         depth_cloud(
