@@ -8,8 +8,8 @@ use dim_slam::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion, Ve
 use dim_slam::odometry_fusion::lio_odometry::{LioConfig, LioOdometry};
 use dim_slam::odometry_fusion::{header_seconds, STANDARD_GRAVITY};
 use dim_slam::{
-    DimSlamCore, DimSlamCoreConfig, FusionCore, ImuSample, LidarScan, OdometryEstimate,
-    OdometryFusionConfig, TfLookup,
+    CuvslamCore, CuvslamOdometryConfig, DimSlamCore, DimSlamCoreConfig, FusionCore, ImageFrame,
+    ImuSample, LidarScan, OdometryEstimate, OdometryFusionConfig, TfLookup,
 };
 
 use crate::db::Recording;
@@ -41,7 +41,38 @@ enum Core {
     Fusion(Box<FusionCore>),
     Slam(Box<DimSlamCore>),
     /// Publishes at its own scans, not the timer: each pose lands in `Run::fused` as it comes.
-    Lio(Box<LioOdometry>),
+    Lio(Box<LioOdometry>, Option<Box<Camera>>),
+}
+
+/// cuVSLAM beside the LIO: each tracked frame's rotation since the last, over the interval,
+/// is a measurement of the body's angular velocity.
+struct Camera {
+    tracker: CuvslamCore,
+    last: Option<(i64, UnitQuaternion<f64>)>,
+    /// rad^2: variance of one frame-to-frame rotation, per axis.
+    rotation_variance: f64,
+}
+
+impl Camera {
+    fn image(&mut self, lio: &mut LioOdometry, image: ImageFrame, tf: &TfBuffer) {
+        let Some(estimate) = self.tracker.handle_image(image, tf) else {
+            return;
+        };
+        let (t, rotation) = (estimate.timestamp_ns, estimate.pose.rotation);
+        if let Some((t0, r0)) = self.last {
+            let dt = (t - t0) as f64 / 1e9;
+            if dt > 0.0 {
+                let rate = (r0.inverse() * rotation).scaled_axis() / dt;
+                let middle = (t0 + t) as f64 / 2e9;
+                if std::env::var_os("REPLAY_RATE_DIAG").is_some() {
+                    let w = lio.filter.x.angular_velocity;
+                    eprintln!("RATE {middle} {} {} {} {} {} {}", rate.x, rate.y, rate.z, w.x, w.y, w.z);
+                }
+                lio.push_rate(middle, rate, self.rotation_variance / (dt * dt));
+            }
+        }
+        self.last = Some((t, rotation));
+    }
 }
 
 impl Core {
@@ -49,7 +80,7 @@ impl Core {
         match self {
             Core::Fusion(core) => core.handle_source(msg),
             Core::Slam(core) => core.handle_source(msg),
-            Core::Lio(_) => {}
+            Core::Lio(..) => {}
         }
     }
 
@@ -57,13 +88,13 @@ impl Core {
         match self {
             Core::Fusion(core) => core.maybe_publish_at(now_ns),
             Core::Slam(core) => core.maybe_publish_at(now_ns),
-            Core::Lio(_) => None,
+            Core::Lio(..) => None,
         }
     }
 
     /// Point-LIO's poses since the last call, as the module drains after every message.
     fn drain(&mut self, fused: &mut Vec<(i64, Isometry3<f64>)>) {
-        if let Core::Lio(lio) = self {
+        if let Core::Lio(lio, _) = self {
             while let Some(published) = lio.step() {
                 if let Some(pose) = published {
                     let [x, y, z, w] = pose.quaternion;
@@ -80,7 +111,7 @@ impl Core {
     }
 
     fn imu(&mut self, sample: &ImuSample) {
-        if let Core::Lio(lio) = self {
+        if let Core::Lio(lio, _) = self {
             lio.push_imu(
                 header_seconds(sample.timestamp_ns),
                 sample.angular_velocity,
@@ -98,7 +129,7 @@ impl Core {
                 core.handle_cloud(scan, &mount);
             }
             Core::Slam(core) => core.handle_cloud(scan, tf),
-            Core::Lio(lio) => match perturbation() {
+            Core::Lio(lio, _) => match perturbation() {
                 // One point of the 9th scan dropped: a run that differs by nothing physical,
                 // to see how far a chaotic filter's outcome spreads.
                 Some(seed) if lio.scans_pushed() == 8 => {
@@ -128,9 +159,40 @@ impl Core {
         match self {
             Core::Fusion(core) => core.report(),
             Core::Slam(core) => core.report(),
-            Core::Lio(_) => {}
+            Core::Lio(..) => {}
         }
     }
+}
+
+/// The LIO's new poses as odometry messages from `frame_id` to `child`, body-frame twist.
+fn lio_messages(lio: &mut LioOdometry, frame_id: &str, child: &str) -> Vec<OdometryEstimate> {
+    let mut out = Vec::new();
+    while let Some(published) = lio.step() {
+        if let Some(pose) = published {
+            let [x, y, z, w] = pose.quaternion;
+            let rotation = UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z));
+            out.push(OdometryEstimate {
+                timestamp_ns: (pose.stamp * 1e9).round() as i64,
+                frame_id: frame_id.to_string(),
+                child_frame_id: child.to_string(),
+                pose: Isometry3::from_parts(Translation3::from(pose.position), rotation),
+                twist: dim_slam::Twist {
+                    linear: rotation.inverse_transform_vector(&pose.velocity),
+                    angular: pose.angular_velocity,
+                },
+                // The LIO's own uncertainty of its position (world) and rotation (body).
+                pose_covariance: dim_slam::nalgebra::Matrix6::from_fn(|r, c| {
+                    if (r < 3) == (c < 3) {
+                        lio.filter.p[(r, c)]
+                    } else {
+                        0.0
+                    }
+                }),
+                ..OdometryEstimate::default()
+            });
+        }
+    }
+    out
 }
 
 /// `REPLAY_PERTURB_SEED`: which point the 9th scan loses in `point_lio` mode.
@@ -204,7 +266,23 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
             if let Some(clip) = config.get("gyro_clip").and_then(|v| v.as_f64()) {
                 lio.imu.clip = lio.imu.clip.map(|(_, accel)| (clip, accel));
             }
-            (Core::Lio(Box::new(LioOdometry::new(lio))), 50.0, frame)
+            let camera = match config.get("cuvslam") {
+                Some(cuvslam) => {
+                    let cuvslam: CuvslamOdometryConfig = serde_json::from_value(cuvslam.clone())
+                        .map_err(|e| format!("cuvslam config: {e}"))?;
+                    let rotation_variance = config
+                        .get("visual_rotation_variance")
+                        .and_then(|v| v.as_f64())
+                        .ok_or("cuvslam needs visual_rotation_variance")?;
+                    Some(Box::new(Camera {
+                        tracker: CuvslamCore::new(cuvslam)?,
+                        last: None,
+                        rotation_variance,
+                    }))
+                }
+                None => None,
+            };
+            (Core::Lio(Box::new(LioOdometry::new(lio)), camera), 50.0, frame)
         }
     };
 
@@ -278,7 +356,7 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
     for (index, lidar) in scenario.lidars.iter().enumerate() {
         add(lidar.stream(), Role::Lidar(index));
     }
-    if scenario.mode == Mode::Slam {
+    if scenario.mode == Mode::Slam || matches!(&core, Core::Lio(_, Some(_))) {
         for (index, info) in scenario.camera_infos.iter().enumerate() {
             add(info.stream(), Role::CameraInfo(index));
         }
@@ -334,6 +412,13 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
         track.sort_by_key(|(t, _)| *t);
     }
     run.rest.sort_by_key(|(t, _)| *t);
+    let mut lio_source = scenario.lio_source.as_ref().map(|spec| {
+        let mut config = LioConfig::default();
+        if let Some(clip) = spec.accel_clip_g {
+            config.imu.clip = config.imu.clip.map(|(gyro, _)| (gyro, clip));
+        }
+        LioOdometry::new(config)
+    });
     let mut next_tick: Option<i64> = None;
     let (mut first_ts, mut last_ts) = (f64::NAN, f64::NAN);
     let started = Instant::now();
@@ -407,6 +492,13 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                     if let Some(frame_id) = scenario.lidars[index].frame_id() {
                         scan.frame_id = frame_id.to_string();
                     }
+                    if let (Some(lio), Some(spec)) = (lio_source.as_mut(), &scenario.lio_source) {
+                        lio.push_scan(&scan);
+                        for msg in lio_messages(lio, &spec.frame_id, &output_frame) {
+                            core.source(&msg);
+                        }
+                        continue;
+                    }
                     if let Err(why) = core.cloud(&scan, &tf, &output_frame) {
                         run.dropped.push(why);
                     }
@@ -418,6 +510,16 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                     if let Some(frame_id) = scenario.imus[index].frame_id() {
                         sample.frame_id = frame_id.to_string();
                     }
+                    if let (Some(lio), Some(spec)) = (lio_source.as_mut(), &scenario.lio_source) {
+                        lio.push_imu(
+                            header_seconds(sample.timestamp_ns),
+                            sample.angular_velocity,
+                            sample.linear_acceleration / STANDARD_GRAVITY,
+                        );
+                        for msg in lio_messages(lio, &spec.frame_id, &output_frame) {
+                            core.source(&msg);
+                        }
+                    }
                     match &mut core {
                         Core::Fusion(core) => match tf.latest(&output_frame, &sample.frame_id) {
                             Some(mount) => core.handle_imu(&sample, &mount),
@@ -427,13 +529,22 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                             )),
                         },
                         Core::Slam(core) => core.handle_imu(&sample, &tf),
-                        Core::Lio(_) => {
+                        Core::Lio(..) => {
                             core.imu(&sample);
                             core.drain(&mut run.fused);
                         }
                     }
                 }
                 Role::Image(index) => {
+                    if let Core::Lio(lio, Some(camera)) = &mut core {
+                        let mut image = lcm::image(&record.data)?;
+                        image.timestamp_ns += scenario.images[index].offset_ns();
+                        if let Some(frame_id) = scenario.images[index].frame_id() {
+                            image.frame_id = frame_id.to_string();
+                        }
+                        camera.image(lio, image, &tf);
+                        core.drain(&mut run.fused);
+                    }
                     if let Core::Slam(core) = &mut core {
                         let mut image = lcm::image(&record.data)?;
                         image.timestamp_ns += scenario.images[index].offset_ns();
@@ -444,6 +555,14 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                     }
                 }
                 Role::CameraInfo(index) => {
+                    if let Core::Lio(_, Some(camera)) = &mut core {
+                        let mut info = lcm::camera_info(&record.data)?;
+                        info.timestamp_ns += scenario.camera_infos[index].offset_ns();
+                        if let Some(frame_id) = scenario.camera_infos[index].frame_id() {
+                            info.frame_id = frame_id.to_string();
+                        }
+                        camera.tracker.handle_camera_info(info, &tf);
+                    }
                     if let Core::Slam(core) = &mut core {
                         let mut info = lcm::camera_info(&record.data)?;
                         info.timestamp_ns += scenario.camera_infos[index].offset_ns();

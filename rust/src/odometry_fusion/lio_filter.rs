@@ -360,6 +360,21 @@ impl LioFilter {
     }
 }
 
+impl LioFilter {
+    /// A direct measurement of the body's angular velocity (rad/s, body frame), such as a
+    /// camera's frame-to-frame rotation over its interval, with `variance` per axis.
+    pub fn update_angular_velocity(&mut self, rate: &Vector3<f64>, variance: f64) {
+        let residual = rate - self.x.angular_velocity;
+        let p_ht = self.p.fixed_view::<STATE_DIM, 3>(0, 15).into_owned();
+        let innovation =
+            self.p.fixed_view::<3, 3>(15, 15).into_owned() + Matrix3::identity() * variance;
+        let gain = p_ht * innovation.try_inverse().expect("rate innovation singular");
+        let step = gain * residual;
+        self.p -= gain * self.p.fixed_view::<3, STATE_DIM>(15, 0);
+        self.x.advance(&step, 1.0);
+    }
+}
+
 /// How a scan's points are matched to the map and weighed.
 #[derive(Clone, Copy, Debug)]
 pub struct LidarMeasurement {

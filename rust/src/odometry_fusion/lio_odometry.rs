@@ -7,6 +7,8 @@
 // that sample as a measurement, then predicts to the group and updates with its points; the
 // scan's points then grow the map and the pose at the scan's end is published.
 
+use std::collections::VecDeque;
+
 use nalgebra::{Matrix3, Vector3};
 
 use super::lidar::{surface_points, voxel_centroids, SurfacePoint};
@@ -103,6 +105,8 @@ pub struct LioOdometry {
     /// The last scan's thinned points, in the IMU frame at their own times.
     pub thinned: Vec<SurfacePoint>,
     scans_pushed: u64,
+    /// Angular velocities measured by other sensors (s, rad/s body, variance), oldest first.
+    rates: VecDeque<(f64, Vector3<f64>, f64)>,
 }
 
 impl LioOdometry {
@@ -129,12 +133,38 @@ impl LioOdometry {
             used: Vec::new(),
             thinned: Vec::new(),
             scans_pushed: 0,
+            rates: VecDeque::new(),
         }
     }
 
     /// `stamp` in seconds, `gyro` rad/s, `accel` in the accelerometer's unit.
     pub fn push_imu(&mut self, stamp: f64, gyro: Vector3<f64>, accel: Vector3<f64>) {
         self.sync.push_imu(stamp, gyro, accel);
+    }
+
+    /// An angular velocity another sensor measured at `stamp` (s), body frame; taken in time
+    /// order with the IMU samples.
+    pub fn push_rate(&mut self, stamp: f64, rate: Vector3<f64>, variance: f64) {
+        self.rates.push_back((stamp, rate, variance));
+    }
+
+    /// Takes the measured rates stamped before `until`, each at its own instant.
+    fn take_rates(&mut self, until: f64) {
+        while self.rates.front().is_some_and(|(stamp, _, _)| *stamp < until) {
+            let (stamp, rate, variance) = self.rates.pop_front().expect("checked");
+            if stamp < self.state_at || self.first_scan {
+                continue;
+            }
+            self.filter
+                .predict(stamp - self.state_at, &self.noise, true, false);
+            self.state_at = stamp;
+            let since = stamp - self.covariance_at;
+            if since > 0.0 {
+                self.covariance_at = stamp;
+                self.filter.predict(since, &self.noise, false, true);
+            }
+            self.filter.update_angular_velocity(&rate, variance);
+        }
     }
 
     /// Scans handed in so far.
@@ -247,9 +277,11 @@ impl LioOdometry {
             self.covariance_at = now;
             self.state_at = now;
         }
-        if !sync.imus.is_empty() {
-            while now > sync.imu_after.stamp {
-                let sample = sync.imu_after;
+        if !self.sync.imus.is_empty() {
+            while now > self.sync.imu_after.stamp {
+                let sample = self.sync.imu_after;
+                self.take_rates(sample.stamp);
+                let sync = &mut self.sync;
                 self.rate = (sample.gyro, sample.accel_g);
                 self.filter
                     .predict(sample.stamp - self.state_at, &self.noise, true, false);
@@ -268,6 +300,7 @@ impl LioOdometry {
                 sync.imu_after = next;
             }
         }
+        self.take_rates(now);
         self.filter
             .predict(now - self.state_at, &self.noise, true, false);
         self.state_at = now;

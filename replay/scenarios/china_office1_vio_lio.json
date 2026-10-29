@@ -1,0 +1,90 @@
+{
+ "name": "china_office1_vio_lio",
+ "description": "Go2 office loop: dimSLAM's LioOdometry with cuVSLAM mono rotation as an angular-velocity measurement in the same filter. china_office1_small = mem2.db's lidar, full-rate IMU, color camera, tf and references",
+ "recording": "mid360_recordings/china_office1_small/mem2.db",
+ "mode": "point_lio",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom",
+  "map",
+  "world"
+ ],
+ "static_tf": [
+  {
+   "parent": "mid360_imu",
+   "child": "mid360_link",
+   "translation": [
+    -0.011,
+    -0.02329,
+    0.04412
+   ]
+  }
+ ],
+ "imus": [
+  {
+   "stream": "livox_imu_pcap3",
+   "frame_id": "mid360_imu"
+  }
+ ],
+ "lidars": [
+  "livox_lidar"
+ ],
+ "reference": {
+  "stream": "pointlio_odometry_corrected"
+ },
+ "baselines": [
+  {
+   "stream": "pointlio_odometry"
+  }
+ ],
+ "tags": {
+  "stream": "raw_april_tags",
+  "camera_frame": "camera_optical",
+  "max_distance_m": 1.5,
+  "max_reproj_px": 3.5,
+  "min_tag_px": 12,
+  "max_lin_speed": 1.5,
+  "max_ang_speed": 150,
+  "visit_gap_seconds": 20,
+  "min_sharpness": 25
+ },
+ "rest": {
+  "stream": "pointlio_odometry",
+  "speed": 0.05,
+  "angular_speed": 0.05,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ },
+ "config": {
+  "output_frame_id": "mid360_imu",
+  "accel_clip_g": 4.0,
+  "cuvslam": {
+   "camera_mode": "mono",
+   "cameras": [
+    {
+     "frame_id": "camera_optical"
+    }
+   ],
+   "use_gpu": true,
+   "odom_frame_id": "cuvslam_odom",
+   "output_frame_id": "mid360_imu"
+  },
+  "visual_rotation_variance": 0.001
+ },
+ "variants": {
+  "vio_lio": {},
+  "lio_only": {
+   "/cuvslam": null
+  }
+ },
+ "images": [
+  {
+   "stream": "color_image"
+  }
+ ],
+ "camera_infos": [
+  {
+   "stream": "camera_info"
+  }
+ ]
+}
