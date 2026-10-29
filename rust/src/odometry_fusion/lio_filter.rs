@@ -294,6 +294,68 @@ impl LioFilter {
     }
 }
 
+/// How an IMU sample is weighed as a measurement.
+#[derive(Clone, Copy, Debug)]
+pub struct ImuMeasurement {
+    /// Variances of one gyro (rad^2/s^2) and one accelerometer (m^2/s^4) reading.
+    pub gyro_variance: f64,
+    pub accel_variance: f64,
+    /// Readings within 1% of these are clipped and say nothing (rad/s, and the
+    /// accelerometer's own unit); `None` trusts every reading.
+    pub clip: Option<(f64, f64)>,
+    /// m/s^2 per accelerometer unit.
+    pub accel_scale: f64,
+}
+
+impl LioFilter {
+    /// One IMU sample (`gyro` rad/s, `accel` in the accelerometer's unit) as a measurement of
+    /// the angular velocity and specific force, each read with its bias added.
+    pub fn update_imu(&mut self, gyro: &Vector3<f64>, accel: &Vector3<f64>, m: &ImuMeasurement) {
+        let gyro_residual = gyro - self.x.angular_velocity - self.x.gyro_bias;
+        let accel_residual = accel * m.accel_scale - self.x.specific_force - self.x.accel_bias;
+        let mut residual = SVector::<f64, 6>::zeros();
+        residual.fixed_rows_mut::<3>(0).copy_from(&gyro_residual);
+        residual.fixed_rows_mut::<3>(3).copy_from(&accel_residual);
+        let mut clipped = [false; 6];
+        if let Some((gyro_clip, accel_clip)) = m.clip {
+            for axis in 0..3 {
+                if gyro[axis].abs() >= 0.99 * gyro_clip {
+                    clipped[axis] = true;
+                    residual[axis] = 0.0;
+                }
+            }
+            for axis in 0..3 {
+                if accel[axis].abs() >= 0.99 * accel_clip {
+                    clipped[3 + axis] = true;
+                    residual[3 + axis] = 0.0;
+                }
+            }
+        }
+        // Each reading is a rate state plus its bias: row l picks columns 15 + l and 24 + l.
+        let mut p_ht = SMatrix::<f64, STATE_DIM, 6>::zeros();
+        let mut h_p = SMatrix::<f64, 6, STATE_DIM>::zeros();
+        for l in (0..6).filter(|&l| !clipped[l]) {
+            p_ht.set_column(l, &(self.p.column(15 + l) + self.p.column(24 + l)));
+            h_p.set_row(l, &(self.p.row(15 + l) + self.p.row(24 + l)));
+        }
+        let mut innovation = SMatrix::<f64, 6, 6>::zeros();
+        for l in 0..6 {
+            if !clipped[l] {
+                innovation.set_column(l, &(h_p.column(15 + l) + h_p.column(24 + l)));
+            }
+            innovation[(l, l)] += if l < 3 {
+                m.gyro_variance
+            } else {
+                m.accel_variance
+            };
+        }
+        let gain = p_ht * innovation.try_inverse().expect("IMU innovation singular");
+        let step = gain * residual;
+        self.p -= gain * h_p;
+        self.x.advance(&step, 1.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
