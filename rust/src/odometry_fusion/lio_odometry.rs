@@ -113,6 +113,9 @@ pub struct LioOdometry {
     /// reaching back to the newest rate taken: what a late rate is measured against.
     turn_history: VecDeque<(f64, Vector3<f64>)>,
     rates_pushed: bool,
+    /// Every taken rate's residual against the state, over the spread its given variance
+    /// allows, sorted: their median is how much noisier the sensor is than it was said to be.
+    rate_residuals: Vec<f64>,
 }
 
 impl LioOdometry {
@@ -143,6 +146,7 @@ impl LioOdometry {
             rates_rejected_in_a_row: 0,
             turn_history: VecDeque::new(),
             rates_pushed: false,
+            rate_residuals: Vec::new(),
         }
     }
 
@@ -207,6 +211,13 @@ impl LioOdometry {
             if let Some(then) = late_from {
                 rate += self.filter.x.angular_velocity - then;
             }
+            // The given variance is the sensor's floor; its spread is learned from the residuals'
+            // median absolute value (x1.4826 for a normal's sigma), so outliers don't set it.
+            let residual = (rate - self.filter.x.angular_velocity).norm() / (3.0 * variance).sqrt();
+            let at = self.rate_residuals.partition_point(|r| *r < residual);
+            self.rate_residuals.insert(at, residual);
+            let median = self.rate_residuals[self.rate_residuals.len() / 2];
+            let variance = variance * (1.4826 * median).powi(2).max(1.0);
             if self.filter.update_angular_velocity(&rate, variance) {
                 self.rates_rejected_in_a_row = 0;
             } else {
