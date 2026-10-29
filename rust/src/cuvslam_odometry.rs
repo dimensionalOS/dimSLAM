@@ -700,6 +700,15 @@ impl CuvslamCore {
         Some(DepthChoice::Aligned)
     }
 
+    /// Drops the tracker; the next frame builds a fresh one (a new segment of odometry).
+    pub fn reset(&mut self) {
+        self.vslam = None;
+        self.last_ts_ns = None;
+        self.previous_raw = None;
+        self.was_tracking = false;
+        self.segment_id += 1;
+    }
+
     fn ensure_tracker(&mut self, tf: &dyn TfLookup) {
         if self.vslam.is_some() || self.tracker_unbuildable {
             return;

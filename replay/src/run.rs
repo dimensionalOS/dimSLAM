@@ -51,7 +51,13 @@ struct Camera {
     last: Option<(i64, UnitQuaternion<f64>)>,
     /// rad^2: variance of one frame-to-frame rotation, per axis.
     rotation_variance: f64,
+    /// Frames in a row whose pose came back unturned (under 1e-9 rad): a mono start that failed
+    /// leaves cuVSLAM frozen there without reporting it lost.
+    frozen: u32,
 }
+
+/// Frozen frames before the tracker is rebuilt (~1 s at 15 Hz).
+const FROZEN_FRAMES: u32 = 15;
 
 impl Camera {
     fn image(&mut self, lio: &mut LioOdometry, image: ImageFrame, tf: &TfBuffer) {
@@ -59,6 +65,17 @@ impl Camera {
             return;
         };
         let (t, rotation) = (estimate.timestamp_ns, estimate.pose.rotation);
+        if self.last.is_some_and(|(_, r0)| r0.angle_to(&rotation) < 1e-9) {
+            self.frozen += 1;
+            if self.frozen >= FROZEN_FRAMES {
+                eprintln!("cuvslam frozen for {} frames: rebuilding the tracker", self.frozen);
+                self.tracker.reset();
+                self.last = None;
+                self.frozen = 0;
+            }
+            return;
+        }
+        self.frozen = 0;
         if let Some((t0, r0)) = self.last {
             let dt = (t - t0) as f64 / 1e9;
             if dt > 0.0 {
@@ -278,6 +295,7 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                         tracker: CuvslamCore::new(cuvslam)?,
                         last: None,
                         rotation_variance,
+                        frozen: 0,
                     }))
                 }
                 None => None,
