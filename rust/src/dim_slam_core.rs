@@ -39,15 +39,18 @@ pub struct PointLioEngineConfig {
     /// rad/s: the gyro's clip level, when it differs from Point-LIO's assumed 35.
     #[serde(default)]
     pub gyro_clip: Option<f64>,
-    /// rad^2: variance of one frame-to-frame rotation, per axis.
-    pub visual_rotation_variance: f64,
+    /// rad^2: variance of one frame-to-frame rotation, per axis. Unset, it is the camera's
+    /// own: a feature located to one pixel turns the ray by 1/fx.
+    #[serde(default)]
+    pub visual_rotation_variance: Option<f64>,
 }
 
 struct PointLioEngine {
     odometry: Box<LioOdometry>,
     /// The tracker's last stamp and rotation, the start of the next turn.
     last_turn: Option<(i64, UnitQuaternion<f64>)>,
-    rotation_variance: f64,
+    /// rad^2; until set, by config or by the camera's focal length, turns are not taken.
+    rotation_variance: Option<f64>,
     newest: Option<OdometryEstimate>,
 }
 
@@ -92,6 +95,7 @@ impl PointLioEngine {
     /// measurement. False when the LIO has refused so many in a row that the tracker is stuck.
     fn turn(&mut self, tracked: &OdometryEstimate) -> bool {
         let (t, rotation) = (tracked.timestamp_ns, tracked.pose.rotation);
+        let Some(variance) = self.rotation_variance else { return true };
         if self.odometry.rates_rejected_in_a_row >= REFUSED_TURNS {
             self.odometry.rates_rejected_in_a_row = 0;
             self.last_turn = None;
@@ -102,7 +106,7 @@ impl PointLioEngine {
             if dt > 0.0 {
                 let rate = (r0.inverse() * rotation).scaled_axis() / dt;
                 self.odometry
-                    .push_rate((t0 + t) as f64 / 2e9, rate, self.rotation_variance / (dt * dt));
+                    .push_rate((t0 + t) as f64 / 2e9, rate, variance / (dt * dt));
             }
         }
         self.last_turn = Some((t, rotation));
@@ -289,6 +293,12 @@ impl DimSlamCore {
     }
 
     pub fn handle_camera_info(&mut self, info: CameraModel, tf: &dyn TfLookup) {
+        if let Some(lio) = &mut self.point_lio {
+            let focal = info.intrinsics[0];
+            if lio.rotation_variance.is_none() && focal > 0.0 {
+                lio.rotation_variance = Some(1.0 / (focal * focal));
+            }
+        }
         self.visual_odometry.handle_camera_info(info, tf);
     }
 
