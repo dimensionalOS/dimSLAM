@@ -413,6 +413,11 @@ impl CuvslamCore {
             }
         }
 
+        // Mono cuVSLAM ignores rig_from_camera and reports the camera's own motion, so its rig
+        // must be the camera; the published pose is still carried to output_frame_id.
+        if self.mode == Mode::Mono && self.config.rig_frame_id.is_empty() {
+            self.config.rig_frame_id = frames[0].clone();
+        }
         let mut cameras = Vec::new();
         for frame in &frames {
             let Some(rig_from_camera) = tf.latest(self.rig_frame(), frame) else {

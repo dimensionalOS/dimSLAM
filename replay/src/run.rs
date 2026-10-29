@@ -300,7 +300,33 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                 }
                 None => None,
             };
-            (Core::Lio(Box::new(LioOdometry::new(lio)), camera), 50.0, frame)
+            let mut odometry = LioOdometry::new(lio);
+            // Camera rates measured elsewhere (lines "RATE <s> <x> <y> <z> ..." in the body
+            // frame), shifted onto this recording's clock.
+            if let Some(path) = config.get("rates_file").and_then(|v| v.as_str()) {
+                let offset = config.get("rates_time_offset").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let variance = config
+                    .get("visual_rotation_variance")
+                    .and_then(|v| v.as_f64())
+                    .ok_or("rates_file needs visual_rotation_variance")?;
+                let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+                let rows: Vec<[f64; 4]> = text
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("RATE "))
+                    .filter_map(|rest| {
+                        let v: Vec<f64> = rest.split_whitespace().take(4).filter_map(|x| x.parse().ok()).collect();
+                        (v.len() == 4).then(|| [v[0] + offset, v[1], v[2], v[3]])
+                    })
+                    .collect();
+                for pair in rows.windows(2) {
+                    let dt = pair[1][0] - pair[0][0];
+                    let [t, x, y, z] = pair[1];
+                    if dt > 0.0 && (x, y, z) != (0.0, 0.0, 0.0) {
+                        odometry.push_rate(t, Vector3::new(x, y, z), variance / (dt * dt));
+                    }
+                }
+            }
+            (Core::Lio(Box::new(odometry), camera), 50.0, frame)
         }
     };
 
