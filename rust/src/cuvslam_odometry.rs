@@ -1264,8 +1264,10 @@ mod tests {
         let mut out = Vec::new();
         depth_to_meters(&depth, 1000.0, &mut out);
         let values: Vec<f32> = out
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect();
         assert_eq!(values, vec![5.0, 2.0, 1.0, 0.0]);
     }
@@ -1287,8 +1289,10 @@ mod tests {
         let mut out = Vec::new();
         depth_to_meters(&depth, 500.0, &mut out);
         let values: Vec<f32> = out
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect();
         assert_eq!(values, vec![3.0, 0.5]);
     }
