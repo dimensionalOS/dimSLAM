@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use dim_slam::nalgebra::Isometry3;
+use dim_slam::nalgebra::{Isometry3, Vector3};
 
 use crate::run::Run;
 use crate::scenario::Rest;
@@ -51,6 +51,46 @@ pub fn rest_segments(run: &Run, rest: &Rest) -> Vec<(i64, i64)> {
         close(s, *t, &mut segments);
     }
     segments
+}
+
+/// Trajectory error under the yaw and offset that fit the whole run best, so it does not hang
+/// on how either frame was oriented at the start: horizontal error per output sample, and the
+/// vertical error once the mean height difference is taken out.
+pub fn trajectory_errors(run: &Run) -> (Vec<f64>, Vec<f64>) {
+    let pairs: Vec<(Vector3<f64>, Vector3<f64>)> = run
+        .fused
+        .iter()
+        .filter_map(|(t, p)| {
+            interpolate(&run.reference, *t)
+                .map(|r| (p.translation.vector, r.translation.vector))
+        })
+        .collect();
+    if pairs.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let n = pairs.len() as f64;
+    let fused_mean: Vector3<f64> = pairs.iter().map(|(f, _)| f).sum::<Vector3<f64>>() / n;
+    let reference_mean: Vector3<f64> = pairs.iter().map(|(_, r)| r).sum::<Vector3<f64>>() / n;
+    // Closed-form 2D Procrustes: the yaw taking the reference's xy onto the output's.
+    let (mut dot, mut cross) = (0.0, 0.0);
+    for (f, r) in &pairs {
+        let (a, b) = (r - reference_mean, f - fused_mean);
+        dot += a.x * b.x + a.y * b.y;
+        cross += a.x * b.y - a.y * b.x;
+    }
+    let angle = cross.atan2(dot);
+    let (sin, cos) = angle.sin_cos();
+    pairs
+        .iter()
+        .map(|(f, r)| {
+            let a = r - reference_mean;
+            let rotated_x = cos * a.x - sin * a.y + fused_mean.x;
+            let rotated_y = sin * a.x + cos * a.y + fused_mean.y;
+            let horizontal = ((f.x - rotated_x).powi(2) + (f.y - rotated_y).powi(2)).sqrt();
+            let vertical = ((f.z - fused_mean.z) - (r.z - reference_mean.z)).abs();
+            (horizontal * 1000.0, vertical * 1000.0)
+        })
+        .unzip()
 }
 
 fn yaw(pose: &Isometry3<f64>) -> f64 {
@@ -170,6 +210,22 @@ pub fn score(run: &Run, segments: &[(i64, i64)]) -> Metrics {
         "error_mm_final".into(),
         errors.last().copied().unwrap_or(f64::NAN),
     );
+    let (horizontal, vertical) = trajectory_errors(run);
+    let mut sorted_horizontal = horizontal.clone();
+    sorted_horizontal.sort_by(f64::total_cmp);
+    metrics.insert("ate_xy_mm_mean".into(), mean(&horizontal));
+    metrics.insert(
+        "ate_xy_mm_p95".into(),
+        sorted_horizontal
+            .get(sorted_horizontal.len() * 95 / 100)
+            .copied()
+            .unwrap_or(f64::NAN),
+    );
+    metrics.insert(
+        "ate_xy_mm_max".into(),
+        sorted_horizontal.last().copied().unwrap_or(f64::NAN),
+    );
+    metrics.insert("ate_z_mm_mean".into(), mean(&vertical));
     metrics.insert("moving_path_m".into(), path);
     metrics.insert(
         "realtime_factor".into(),
@@ -195,6 +251,10 @@ pub fn score_reference(run: &Run, segments: &[(i64, i64)]) -> Metrics {
         "error_mm_p95",
         "error_mm_max",
         "error_mm_final",
+        "ate_xy_mm_mean",
+        "ate_xy_mm_p95",
+        "ate_xy_mm_max",
+        "ate_z_mm_mean",
         "realtime_factor",
     ] {
         metrics.remove(key);

@@ -20,9 +20,9 @@
   "carry_to": "base_link"
  },
  "rest": {
-  "stream": "go2_odom",
-  "speed": 0.02,
-  "angular_speed": 0.02,
+  "stream": "pointlio_odometry",
+  "speed": 0.05,
+  "angular_speed": 0.05,
   "min_seconds": 1.0,
   "trim_seconds": 0.3
  },
@@ -33,11 +33,11 @@
   "imus": [
    {
     "frame_id": "mid360_link",
-    "gyro_noise_density": 0.005,
+    "gyro_noise_density": 0.01,
     "gyro_random_walk": 0.0001,
-    "accel_noise_density": 0.05,
+    "accel_noise_density": 0.15,
     "accel_random_walk": 0.001,
-    "init_gyro_limit": 0.1
+    "init_gyro_limit": 0.3
    }
   ],
   "lidars": [
@@ -47,6 +47,22 @@
   ]
  },
  "variants": {
-  "lio": {}
+  "lio": {},
+  "levels_1": {
+   "/lidar_map": {
+    "levels": 1
+   }
+  },
+  "levels_4": {
+   "/lidar_map": {
+    "levels": 4
+   }
+  },
+  "voxel_1m_levels_4": {
+   "/lidar_map": {
+    "voxel_size": 1.0,
+    "levels": 4
+   }
+  }
  }
 }

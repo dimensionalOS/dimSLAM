@@ -404,6 +404,9 @@ pub struct FusionCore {
     too_late: u64,
     /// Built from settled slices only, so it lives outside the replay history.
     map: PlaneMap,
+    /// Slices stamped past the newest IMU sample, waiting for it.
+    pending_slices: VecDeque<(i64, CloudSlice)>,
+    newest_imu_ns: i64,
     slices: u64,
     matched_points: u64,
     gated_points: u64,
@@ -444,6 +447,8 @@ impl FusionCore {
             replayed: 0,
             too_late: 0,
             map: PlaneMap::new(config_lidar_map),
+            pending_slices: VecDeque::new(),
+            newest_imu_ns: 0,
             slices: 0,
             matched_points: 0,
             gated_points: 0,
@@ -568,6 +573,25 @@ impl FusionCore {
         }
         self.insert(Event::empty(ts_ns, EventKind::Imu(input)));
         self.imu_samples += 1;
+        self.newest_imu_ns = self.newest_imu_ns.max(ts_ns);
+        self.release_slices();
+    }
+
+    /// With an IMU, a slice waits until the IMU has reached its stamp, so it lands after the
+    /// samples it needs rather than ahead of them, where each arriving sample would replay it.
+    fn release_slices(&mut self) {
+        let ready = self
+            .pending_slices
+            .partition_point(|(ts_ns, _)| *ts_ns <= self.newest_imu_ns);
+        if ready == 0 {
+            return;
+        }
+        let events = self
+            .pending_slices
+            .drain(..ready)
+            .map(|(ts_ns, slice)| Event::empty(ts_ns, EventKind::Cloud(slice)))
+            .collect();
+        self.insert_all(events);
     }
 
     /// `base_from_lidar` carries the scan into the output frame, the filter's body.
@@ -597,6 +621,14 @@ impl FusionCore {
             self.initialize(*first_ns, UnitQuaternion::identity(), Vec::new(), None);
         }
         self.slices += slices.len() as u64;
+        if self.config.use_imu() {
+            for (ts_ns, slice) in slices {
+                let slot = self.pending_slices.partition_point(|(t, _)| *t <= ts_ns);
+                self.pending_slices.insert(slot, (ts_ns, slice));
+            }
+            self.release_slices();
+            return;
+        }
         self.insert_all(
             slices
                 .into_iter()
@@ -964,6 +996,13 @@ impl FusionCore {
                 point_variance + plane.variance,
                 &pose_covariance,
                 gate,
+            );
+        }
+        if std::env::var_os("DIMSLAM_LIDAR_TRACE").is_some() {
+            eprintln!(
+                "TRACE {} pts {} matched {} gated {} z {:.2} vz {:.2} pstd {:.3}",
+                self.filter.x.time_ns, slice.points.len(), evidence.matched, evidence.gated,
+                self.filter.x.position.z, self.filter.x.velocity.z, self.filter.p_cov[(2, 2)].sqrt()
             );
         }
         self.matched_points += evidence.matched as u64;

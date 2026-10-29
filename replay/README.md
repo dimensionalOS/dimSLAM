@@ -32,6 +32,8 @@ Metrics:
 - `rest_step_rms_mm`: tick-to-tick motion while at rest.
 - `moving_roughness_rms_mm`: rms second difference between publish ticks while moving.
 - `error_mm_*`: horizontal distance from the reference, aligned at the first output.
+- `ate_xy_mm_*`, `ate_z_mm_mean`: the same under the yaw and offset that fit the whole run best,
+  so they do not depend on how the two frames were oriented at the start.
 - `realtime_factor`: recording seconds per wall second.
 
 A baseline from another build: copy this directory into a checkout of that build and run it

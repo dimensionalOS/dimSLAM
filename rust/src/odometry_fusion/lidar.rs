@@ -32,7 +32,10 @@ pub struct LidarConfig {
     /// s. A scan becomes one measurement per slice of this length: shorter tracks faster motion
     /// between slices, longer gives each update more points.
     pub slice_seconds: f64,
-    /// m. Range noise of one point.
+    /// m. Noise of one point-to-plane distance. Not the sensor's range noise alone: plane
+    /// fits and the map's own pose errors are shared by every point of a slice, so this is set
+    /// well above it, or a slice's hundred points make the filter overconfident and its gate
+    /// then refuses the very points that would correct it.
     pub point_std: f64,
 }
 
@@ -44,7 +47,7 @@ impl Default for LidarConfig {
             max_range: 60.0,
             scan_voxel_size: 0.3,
             slice_seconds: 0.01,
-            point_std: 0.02,
+            point_std: 0.1,
         }
     }
 }
@@ -53,9 +56,12 @@ impl Default for LidarConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LidarMapConfig {
-    /// m. Each voxel holds one plane fit, so this is about the size of the smallest flat patch
-    /// the map can use.
+    /// m. Each voxel holds one plane fit. A point is matched to the largest voxel around it
+    /// that is flat, so walls and floors get big, steady planes.
     pub voxel_size: f64,
+    /// Voxel sizes, each half the one before, starting at `voxel_size`: where a voxel is not
+    /// flat (stairs, furniture, corners) its point falls through to a smaller one that is.
+    pub levels: u32,
     /// A voxel stops taking points once it holds this many: the plane is settled by then, and
     /// points from a pose that later drifted would only thicken it.
     pub max_points_per_voxel: u32,
@@ -66,8 +72,9 @@ pub struct LidarMapConfig {
     /// A voxel whose points are not this many times wider within the plane than across it
     /// (both as std) is a line or a blob, with no normal to trust.
     pub min_plane_aspect: f64,
-    /// m. A voxel whose points spread less than this (std) along the plane's narrower axis
-    /// is a thin strip: noise-free or not, its normal could point anywhere around the strip.
+    /// A voxel whose points spread less than this fraction of its size (std) along the
+    /// plane's narrower axis is a thin strip: noise-free or not, its normal could point
+    /// anywhere around the strip.
     pub min_plane_spread: f64,
     /// A point whose squared distance from its plane, over that distance's predicted variance
     /// (point noise, plane thickness and the pose's own uncertainty), is past this is a
@@ -81,11 +88,12 @@ impl Default for LidarMapConfig {
     fn default() -> Self {
         Self {
             voxel_size: 0.5,
+            levels: 3,
             max_points_per_voxel: 50,
             min_points_per_plane: 5,
             max_plane_std: 0.05,
             min_plane_aspect: 3.0,
-            min_plane_spread: 0.05,
+            min_plane_spread: 0.1,
             point_gate: 9.0,
             radius: 100.0,
         }
@@ -199,19 +207,20 @@ struct Voxel {
 
 pub struct PlaneMap {
     config: LidarMapConfig,
-    inverse_size: f64,
-    voxels: HashMap<[i32; 3], Voxel>,
+    /// Per level, coarsest first: 1 / voxel size and the voxels.
+    levels: Vec<(f64, HashMap<[i32; 3], Voxel>)>,
     /// Where the body was at the last prune.
     pruned_at: Option<Vector3<f64>>,
 }
 
 impl PlaneMap {
     pub fn new(config: LidarMapConfig) -> Self {
-        let inverse_size = 1.0 / config.voxel_size;
+        let levels = (0..config.levels.max(1))
+            .map(|level| ((1u32 << level) as f64 / config.voxel_size, HashMap::new()))
+            .collect();
         Self {
             config,
-            inverse_size,
-            voxels: HashMap::new(),
+            levels,
             pruned_at: None,
         }
     }
@@ -220,35 +229,45 @@ impl PlaneMap {
         &self.config
     }
 
+    /// Voxels at the coarsest level.
     pub fn voxel_count(&self) -> usize {
-        self.voxels.len()
+        self.levels[0].1.len()
     }
 
     pub fn insert(&mut self, point: &Vector3<f64>) {
-        let key = voxel_key(point, self.inverse_size);
-        let voxel = self.voxels.entry(key).or_default();
-        if voxel.count >= self.config.max_points_per_voxel {
-            return;
+        let cap = self.config.max_points_per_voxel;
+        for (inverse_size, voxels) in &mut self.levels {
+            let voxel = voxels.entry(voxel_key(point, *inverse_size)).or_default();
+            if voxel.count >= cap {
+                continue;
+            }
+            voxel.count += 1;
+            let delta = point - voxel.mean;
+            voxel.mean += delta / voxel.count as f64;
+            voxel.scatter += delta * (point - voxel.mean).transpose();
         }
-        voxel.count += 1;
-        let delta = point - voxel.mean;
-        voxel.mean += delta / voxel.count as f64;
-        voxel.scatter += delta * (point - voxel.mean).transpose();
     }
 
-    /// The plane through the voxel `point` falls in, when that voxel holds one.
+    /// The plane of the largest flat voxel `point` falls in.
     pub fn plane_at(&mut self, point: &Vector3<f64>) -> Option<Plane> {
-        let key = voxel_key(point, self.inverse_size);
         let config = &self.config;
-        let voxel = self.voxels.get_mut(&key)?;
-        if voxel.count < config.min_points_per_plane {
-            return None;
+        for (inverse_size, voxels) in &mut self.levels {
+            let Some(voxel) = voxels.get_mut(&voxel_key(point, *inverse_size)) else {
+                // An empty voxel's sub-voxels are empty too.
+                return None;
+            };
+            if voxel.count < config.min_points_per_plane {
+                return None;
+            }
+            if voxel.fitted_count != voxel.count {
+                voxel.fitted_count = voxel.count;
+                voxel.plane = fit_plane(voxel, config, 1.0 / *inverse_size);
+            }
+            if voxel.plane.is_some() {
+                return voxel.plane;
+            }
         }
-        if voxel.fitted_count != voxel.count {
-            voxel.fitted_count = voxel.count;
-            voxel.plane = fit_plane(voxel, config);
-        }
-        voxel.plane
+        None
     }
 
     /// Drops the voxels past `radius`, once the body has moved a voxel since the last prune.
@@ -260,12 +279,13 @@ impl PlaneMap {
         }
         self.pruned_at = Some(*body);
         let radius_sq = self.config.radius * self.config.radius;
-        self.voxels
-            .retain(|_, voxel| (voxel.mean - body).norm_squared() <= radius_sq);
+        for (_, voxels) in &mut self.levels {
+            voxels.retain(|_, voxel| (voxel.mean - body).norm_squared() <= radius_sq);
+        }
     }
 }
 
-fn fit_plane(voxel: &Voxel, config: &LidarMapConfig) -> Option<Plane> {
+fn fit_plane(voxel: &Voxel, config: &LidarMapConfig, size: f64) -> Option<Plane> {
     let covariance = voxel.scatter / voxel.count as f64;
     let eigen = SymmetricEigen::new(covariance);
     let mut order = [0, 1, 2];
@@ -275,7 +295,7 @@ fn fit_plane(voxel: &Voxel, config: &LidarMapConfig) -> Option<Plane> {
     let aspect_sq = config.min_plane_aspect * config.min_plane_aspect;
     let too_thick = thickness > config.max_plane_std * config.max_plane_std;
     let too_narrow = spread <= aspect_sq * thickness
-        || spread < config.min_plane_spread * config.min_plane_spread;
+        || spread < (config.min_plane_spread * size).powi(2);
     if too_thick || too_narrow {
         return None;
     }
@@ -413,6 +433,21 @@ mod tests {
             map.insert(&Vector3::new(1.0 + 0.02 * i as f64, 1.2, 1.2));
         }
         assert!(map.plane_at(&Vector3::new(1.1, 1.2, 1.2)).is_none());
+    }
+
+    /// Two stair treads share a coarse voxel, which is no plane; each has a finer one that is.
+    #[test]
+    fn a_point_on_a_stair_falls_through_to_its_treads_own_plane() {
+        let mut map = PlaneMap::new(LidarMapConfig::default());
+        for k in 0..64 {
+            let (u, v) = ((k % 8) as f64 * 0.03, (k / 8) as f64 * 0.03);
+            map.insert(&Vector3::new(0.01 + u, 0.01 + v, 0.10));
+            map.insert(&Vector3::new(0.26 + u, 0.01 + v, 0.27));
+        }
+        let lower = map.plane_at(&Vector3::new(0.1, 0.1, 0.12)).expect("lower tread");
+        let upper = map.plane_at(&Vector3::new(0.35, 0.1, 0.3)).expect("upper tread");
+        assert!((lower.offset.abs() - 0.10).abs() < 1e-6 && lower.normal.z.abs() > 0.999);
+        assert!((upper.offset.abs() - 0.27).abs() < 1e-6 && upper.normal.z.abs() > 0.999);
     }
 
     #[test]
