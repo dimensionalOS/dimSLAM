@@ -107,6 +107,8 @@ pub struct LioOdometry {
     scans_pushed: u64,
     /// Angular velocities measured by other sensors (s, rad/s body, variance), oldest first.
     rates: VecDeque<(f64, Vector3<f64>, f64)>,
+    /// Measured rates the filter refused since it last took one.
+    pub rates_rejected_in_a_row: u32,
 }
 
 impl LioOdometry {
@@ -134,6 +136,7 @@ impl LioOdometry {
             thinned: Vec::new(),
             scans_pushed: 0,
             rates: VecDeque::new(),
+            rates_rejected_in_a_row: 0,
         }
     }
 
@@ -163,7 +166,11 @@ impl LioOdometry {
                 self.covariance_at = stamp;
                 self.filter.predict(since, &self.noise, false, true);
             }
-            self.filter.update_angular_velocity(&rate, variance);
+            if self.filter.update_angular_velocity(&rate, variance) {
+                self.rates_rejected_in_a_row = 0;
+            } else {
+                self.rates_rejected_in_a_row += 1;
+            }
         }
     }
 

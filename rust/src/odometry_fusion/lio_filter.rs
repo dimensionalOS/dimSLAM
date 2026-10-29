@@ -13,6 +13,9 @@ use super::lidar::SurfacePoint;
 use super::plane_fit::{fit_plane, PLANE_POINTS};
 use super::point_map::{to_world, PointMap};
 
+/// The 99% quantile of a chi-squared distribution with 3 degrees of freedom.
+const CHI_SQUARED_3_DOF_99: f64 = 11.345;
+
 pub const STATE_DIM: usize = 30;
 pub type StateVector = SVector<f64, STATE_DIM>;
 pub type StateMatrix = SMatrix<f64, STATE_DIM, STATE_DIM>;
@@ -363,15 +366,22 @@ impl LioFilter {
 impl LioFilter {
     /// A direct measurement of the body's angular velocity (rad/s, body frame), such as a
     /// camera's frame-to-frame rotation over its interval, with `variance` per axis.
-    pub fn update_angular_velocity(&mut self, rate: &Vector3<f64>, variance: f64) {
+    /// False, and the state untouched, when the rate is beyond the 99% bound of its predicted
+    /// spread: a frozen or lost tracker, not a turn.
+    pub fn update_angular_velocity(&mut self, rate: &Vector3<f64>, variance: f64) -> bool {
         let residual = rate - self.x.angular_velocity;
         let p_ht = self.p.fixed_view::<STATE_DIM, 3>(0, 15).into_owned();
         let innovation =
             self.p.fixed_view::<3, 3>(15, 15).into_owned() + Matrix3::identity() * variance;
-        let gain = p_ht * innovation.try_inverse().expect("rate innovation singular");
+        let inverse = innovation.try_inverse().expect("rate innovation singular");
+        if residual.dot(&(inverse * residual)) > CHI_SQUARED_3_DOF_99 {
+            return false;
+        }
+        let gain = p_ht * inverse;
         let step = gain * residual;
         self.p -= gain * self.p.fixed_view::<3, STATE_DIM>(15, 0);
         self.x.advance(&step, 1.0);
+        true
     }
 }
 

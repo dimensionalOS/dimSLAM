@@ -51,13 +51,11 @@ struct Camera {
     last: Option<(i64, UnitQuaternion<f64>)>,
     /// rad^2: variance of one frame-to-frame rotation, per axis.
     rotation_variance: f64,
-    /// Frames in a row whose pose came back unturned (under 1e-9 rad): a mono start that failed
-    /// leaves cuVSLAM frozen there without reporting it lost.
-    frozen: u32,
 }
 
-/// Frozen frames before the tracker is rebuilt (~1 s at 15 Hz).
-const FROZEN_FRAMES: u32 = 15;
+/// Rates in a row the filter refuses before the tracker is rebuilt (~1 s at 15 Hz): mono
+/// cuVSLAM can freeze without reporting itself lost.
+const REJECTED_FRAMES: u32 = 15;
 
 impl Camera {
     fn image(&mut self, lio: &mut LioOdometry, image: ImageFrame, tf: &TfBuffer) {
@@ -65,17 +63,13 @@ impl Camera {
             return;
         };
         let (t, rotation) = (estimate.timestamp_ns, estimate.pose.rotation);
-        if self.last.is_some_and(|(_, r0)| r0.angle_to(&rotation) < 1e-9) {
-            self.frozen += 1;
-            if self.frozen >= FROZEN_FRAMES {
-                eprintln!("cuvslam frozen for {} frames: rebuilding the tracker", self.frozen);
-                self.tracker.reset();
-                self.last = None;
-                self.frozen = 0;
-            }
+        if lio.rates_rejected_in_a_row >= REJECTED_FRAMES {
+            eprintln!("cuvslam disagreed with the filter for {REJECTED_FRAMES} frames: rebuilding the tracker");
+            self.tracker.reset();
+            self.last = None;
+            lio.rates_rejected_in_a_row = 0;
             return;
         }
-        self.frozen = 0;
         if let Some((t0, r0)) = self.last {
             let dt = (t - t0) as f64 / 1e9;
             if dt > 0.0 {
@@ -83,7 +77,8 @@ impl Camera {
                 let middle = (t0 + t) as f64 / 2e9;
                 if std::env::var_os("REPLAY_RATE_DIAG").is_some() {
                     let w = lio.filter.x.angular_velocity;
-                    eprintln!("RATE {middle} {} {} {} {} {} {}", rate.x, rate.y, rate.z, w.x, w.y, w.z);
+                    let c = &estimate.pose_covariance;
+                    eprintln!("RATE {middle} {} {} {} {} {} {} {} {}", rate.x, rate.y, rate.z, w.x, w.y, w.z, c[(0, 0)], c[(3, 3)]);
                 }
                 lio.push_rate(middle, rate, self.rotation_variance / (dt * dt));
             }
@@ -295,7 +290,6 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                         tracker: CuvslamCore::new(cuvslam)?,
                         last: None,
                         rotation_variance,
-                        frozen: 0,
                     }))
                 }
                 None => None,
