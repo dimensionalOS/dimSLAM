@@ -7,6 +7,7 @@
 
 mod eskf;
 mod lidar;
+mod scan_sync;
 
 use std::collections::VecDeque;
 
@@ -20,6 +21,7 @@ use eskf::{yaw_only, Cov, Filter, ImuBias, ImuInput, Jacobian, State};
 use lidar::{CloudSlice, PlaneEvidence, PlaneMap};
 use nalgebra::DMatrix;
 pub use lidar::{surface_points, voxel_centroids, LidarConfig, LidarMapConfig, Matching, SurfacePoint};
+pub use scan_sync::{header_seconds, Level, ScanSync, SyncedScan, STANDARD_GRAVITY};
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 
