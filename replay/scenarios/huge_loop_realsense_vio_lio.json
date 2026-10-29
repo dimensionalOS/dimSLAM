@@ -1,6 +1,6 @@
 {
  "name": "huge_loop_realsense_vio_lio",
- "description": "Handheld Mid-360 + RealSense rig, a ~1 h, 3 km loop; cuVSLAM (mono, the RealSense color camera; the recording's depth is a colorized 8-bit JPEG, not metric) fused for rotation alongside dimSLAM's in-filter lidar and the Mid-360 IMU. Scored against Point-LIO corrected by AprilTag loop closures (v5), and on AprilTag revisits. Clocks: Mid-360 on its device clock (the replay's), Point-LIO streams re-stamped by an offline replay (offset by gyro correlation, +-50 ms over the hour)",
+ "description": "Handheld Mid-360 + RealSense rig, ~1 h, 3 km loop. DimSlamCore (slam mode): cuVSLAM mono on the RealSense color camera, its frame-to-frame turn fused as angular velocity into the in-filter lidar-inertial odometry (point_lio engine: Point-LIO, Mid-360 4 g accel clip) with the Mid-360 IMU. Mid-360 streams rebuilt from the pcap (host clock). Scored against Point-LIO + AprilTag loop closures (v5) and on AprilTag revisits. Variant vio_lio_fusion_filter: the fusion core's own lidar filter instead.",
  "recording": "mid360_recordings/2026-06-04_12-57pm-PST__huge_loop_realsense/mem2.db",
  "mode": "slam",
  "tf_stream": "tf",
@@ -16,19 +16,16 @@
   }
  ],
  "lidars": [
-  {
-   "stream": "livox_lidar",
-   "frame_id": "mid360_link"
-  }
+  "livox_lidar"
  ],
  "reference": {
   "stream": "pointlio_odometry_corrected_v5",
-  "time_offset_seconds": -1783812058.56
+  "time_offset_seconds": -3216587.785
  },
  "baselines": [
   {
    "stream": "pointlio_odometry",
-   "time_offset_seconds": -1783812058.56
+   "time_offset_seconds": -3216587.785
   }
  ],
  "rest": {
@@ -37,7 +34,7 @@
   "angular_speed": 0.05,
   "min_seconds": 1.0,
   "trim_seconds": 0.3,
-  "time_offset_seconds": -1783812058.56
+  "time_offset_seconds": -3216587.785
  },
  "config": {
   "odom_frame_id": "odom",
@@ -74,15 +71,22 @@
    0.001,
    0.001,
    0.001
-  ]
+  ],
+  "point_lio": {
+   "accel_clip_g": 4.0,
+   "visual_rotation_variance": 0.001
+  }
  },
  "variants": {
-  "vio_lio": {}
+  "vio_lio": {},
+  "vio_lio_fusion_filter": {
+   "/point_lio": null
+  }
  },
  "tags": {
   "stream": "raw_april_tags",
   "camera_frame": "camera_color_optical_frame",
-  "time_offset_seconds": -1780595471.664,
+  "time_offset_seconds": -0.889,
   "max_distance_m": 1.5,
   "max_reproj_px": 3.5,
   "min_tag_px": 12,
@@ -97,13 +101,13 @@
  "images": [
   {
    "stream": "color_image",
-   "time_offset_seconds": -1780595471.664
+   "time_offset_seconds": -0.889
   }
  ],
  "camera_infos": [
   {
    "stream": "realsense_camera_info",
-   "time_offset_seconds": -1780595471.664
+   "time_offset_seconds": -0.889
   }
  ]
 }

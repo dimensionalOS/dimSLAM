@@ -497,7 +497,8 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                 let tick = next_tick.get_or_insert(stamp);
                 while *tick <= stamp {
                     if let Some(msg) = core.publish(*tick) {
-                        run.fused.push((*tick, msg.pose));
+                        // Scored at the instant the pose is of, which a filter may set past the tick.
+                        run.fused.push((msg.timestamp_ns, msg.pose));
                     }
                     *tick += period_ns;
                 }

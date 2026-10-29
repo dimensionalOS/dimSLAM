@@ -7,7 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion};
+
 use crate::cuvslam_odometry::{CameraConfig, CuvslamCore, CuvslamOdometryConfig};
+use crate::odometry_fusion::lio_odometry::{LioConfig, LioOdometry};
+use crate::odometry_fusion::{header_seconds, STANDARD_GRAVITY};
 use crate::odometry_fusion::{
     FusionCore, ImuConfig, InitialStds, LidarConfig, LidarMapConfig, OdometryFusionConfig, ProcessNoise, SourceConfig,
     SourceKind,
@@ -20,6 +24,91 @@ use crate::warn_throttled;
 /// The tracker's own drifting world frame. It never leaves this struct: it exists only to tell
 /// the tracker's estimates apart from the other sources inside the filter.
 const VISUAL_ODOM_FRAME_ID: &str = "visual_odom";
+
+/// Turns in a row the LIO refuses before the tracker is rebuilt (~1 s at 15 Hz): mono cuVSLAM
+/// can freeze without reporting itself lost.
+const REFUSED_TURNS: u32 = 15;
+
+/// Point-LIO as the lidar-inertial filter, in place of the fusion core's; the tracker's
+/// frame-to-frame turn is fused into it as a measurement of the body's angular velocity.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PointLioEngineConfig {
+    /// g: the accelerometer's clip level, when it differs from Point-LIO's assumed 3 g.
+    #[serde(default)]
+    pub accel_clip_g: Option<f64>,
+    /// rad/s: the gyro's clip level, when it differs from Point-LIO's assumed 35.
+    #[serde(default)]
+    pub gyro_clip: Option<f64>,
+    /// rad^2: variance of one frame-to-frame rotation, per axis.
+    pub visual_rotation_variance: f64,
+}
+
+struct PointLioEngine {
+    odometry: Box<LioOdometry>,
+    /// The tracker's last stamp and rotation, the start of the next turn.
+    last_turn: Option<(i64, UnitQuaternion<f64>)>,
+    rotation_variance: f64,
+    newest: Option<OdometryEstimate>,
+}
+
+impl PointLioEngine {
+    fn new(config: &PointLioEngineConfig) -> Self {
+        let mut lio = LioConfig::default();
+        if let Some(clip) = config.accel_clip_g {
+            lio.imu.clip = lio.imu.clip.map(|(gyro, _)| (gyro, clip));
+        }
+        if let Some(clip) = config.gyro_clip {
+            lio.imu.clip = lio.imu.clip.map(|(_, accel)| (clip, accel));
+        }
+        Self {
+            odometry: Box::new(LioOdometry::new(lio)),
+            last_turn: None,
+            rotation_variance: config.visual_rotation_variance,
+            newest: None,
+        }
+    }
+
+    /// Keeps the newest of the poses the LIO has finished.
+    fn drain(&mut self, odom_frame_id: &str, output_frame_id: &str) {
+        while let Some(published) = self.odometry.step() {
+            let Some(pose) = published else { continue };
+            let [x, y, z, w] = pose.quaternion;
+            let rotation = UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z));
+            self.newest = Some(OdometryEstimate {
+                timestamp_ns: (pose.stamp * 1e9).round() as i64,
+                frame_id: odom_frame_id.to_string(),
+                child_frame_id: output_frame_id.to_string(),
+                pose: Isometry3::from_parts(Translation3::from(pose.position), rotation),
+                twist: crate::types::Twist {
+                    linear: rotation.inverse_transform_vector(&pose.velocity),
+                    angular: pose.angular_velocity,
+                },
+                ..Default::default()
+            });
+        }
+    }
+
+    /// The tracker's turn since its last frame, over the interval, as an angular-velocity
+    /// measurement. False when the LIO has refused so many in a row that the tracker is stuck.
+    fn turn(&mut self, tracked: &OdometryEstimate) -> bool {
+        let (t, rotation) = (tracked.timestamp_ns, tracked.pose.rotation);
+        if self.odometry.rates_rejected_in_a_row >= REFUSED_TURNS {
+            self.odometry.rates_rejected_in_a_row = 0;
+            self.last_turn = None;
+            return false;
+        }
+        if let Some((t0, r0)) = self.last_turn {
+            let dt = (t - t0) as f64 / 1e9;
+            if dt > 0.0 {
+                let rate = (r0.inverse() * rotation).scaled_axis() / dt;
+                self.odometry
+                    .push_rate((t0 + t) as f64 / 2e9, rate, self.rotation_variance / (dt * dt));
+            }
+        }
+        self.last_turn = Some((t, rotation));
+        true
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -86,6 +175,9 @@ pub struct DimSlamCoreConfig {
     pub lidar_map: LidarMapConfig,
     /// See [`OdometryFusionConfig::imu_as_measurement`].
     pub imu_as_measurement: bool,
+    /// Set, Point-LIO is the lidar-inertial filter (fed the raw IMU, in its own frame, and
+    /// the scans) and the fusion core's lidar and IMU settings are unused.
+    pub point_lio: Option<PointLioEngineConfig>,
 }
 
 /// Defers to the two cores so a field's default cannot drift from the core that reads it.
@@ -122,6 +214,7 @@ impl Default for DimSlamCoreConfig {
             lidars: fusion.lidars,
             lidar_map: fusion.lidar_map,
             imu_as_measurement: fusion.imu_as_measurement,
+            point_lio: None,
         }
     }
 }
@@ -134,7 +227,9 @@ pub struct DimSlamCore {
     visual_odometry: CuvslamCore,
     fusion: FusionCore,
     output_frame_id: String,
+    odom_frame_id: String,
     use_imu: bool,
+    point_lio: Option<PointLioEngine>,
 }
 
 impl DimSlamCore {
@@ -162,8 +257,9 @@ impl DimSlamCore {
             ..Default::default()
         }];
         odom_sources.extend(config.odom_sources);
+        let point_lio = config.point_lio.as_ref().map(PointLioEngine::new);
         let fusion_config = OdometryFusionConfig {
-            odom_frame_id: config.odom_frame_id,
+            odom_frame_id: config.odom_frame_id.clone(),
             output_frame_id: config.output_frame_id.clone(),
             publish_rate: config.publish_rate,
             replay_buffer_seconds: config.replay_buffer_seconds,
@@ -185,8 +281,10 @@ impl DimSlamCore {
         Ok(Self {
             visual_odometry,
             output_frame_id: config.output_frame_id,
+            odom_frame_id: config.odom_frame_id,
             use_imu: fusion_config.use_imu(),
             fusion: FusionCore::new(fusion_config),
+            point_lio,
         })
     }
 
@@ -213,6 +311,15 @@ impl DimSlamCore {
     /// A no-op with no IMU configured. The mount is read off `tf`, so the sample's frame must
     /// be placed in the output frame.
     pub fn handle_imu(&mut self, sample: &ImuSample, tf: &dyn TfLookup) {
+        if let Some(lio) = &mut self.point_lio {
+            lio.odometry.push_imu(
+                header_seconds(sample.timestamp_ns),
+                sample.angular_velocity,
+                sample.linear_acceleration / STANDARD_GRAVITY,
+            );
+            lio.drain(&self.odom_frame_id, &self.output_frame_id);
+            return;
+        }
         if !self.use_imu {
             return;
         }
@@ -230,6 +337,11 @@ impl DimSlamCore {
     /// A no-op for a frame with no `lidars` entry. The mount is read off `tf`, so the scan's
     /// frame must be placed in the output frame.
     pub fn handle_cloud(&mut self, scan: &LidarScan, tf: &dyn TfLookup) {
+        if let Some(lio) = &mut self.point_lio {
+            lio.odometry.push_scan(scan);
+            lio.drain(&self.odom_frame_id, &self.output_frame_id);
+            return;
+        }
         let Some(base_from_lidar) = tf.latest(&self.output_frame_id, &scan.frame_id) else {
             warn_throttled!(
                 std::time::Duration::from_secs(10),
@@ -248,11 +360,17 @@ impl DimSlamCore {
 
     /// The fused pose, once a publish period has elapsed.
     pub fn maybe_publish(&mut self) -> Option<OdometryEstimate> {
+        if let Some(lio) = &mut self.point_lio {
+            return lio.newest.take();
+        }
         self.fusion.maybe_publish()
     }
 
     /// The fused pose predicted to `now_ns`, for a caller publishing on its own timer.
     pub fn maybe_publish_at(&mut self, now_ns: i64) -> Option<OdometryEstimate> {
+        if let Some(lio) = &mut self.point_lio {
+            return lio.newest.take();
+        }
         self.fusion.maybe_publish_at(now_ns)
     }
 
@@ -262,8 +380,22 @@ impl DimSlamCore {
     }
 
     fn fuse(&mut self, tracked: Option<OdometryEstimate>) {
-        if let Some(estimate) = tracked {
-            self.fusion.handle_source(&estimate);
+        let Some(estimate) = tracked else { return };
+        // A tracker's first estimate can come back unstamped.
+        match &mut self.point_lio {
+            Some(lio) if estimate.timestamp_ns != 0 => {
+                if !lio.turn(&estimate) {
+                    warn_throttled!(
+                        std::time::Duration::from_secs(10),
+                        refused = REFUSED_TURNS,
+                        "the LIO refused the tracker's turns: rebuilding the tracker",
+                    );
+                    self.visual_odometry.reset();
+                }
+                lio.drain(&self.odom_frame_id, &self.output_frame_id);
+            }
+            Some(_) => {}
+            None => self.fusion.handle_source(&estimate),
         }
     }
 }
