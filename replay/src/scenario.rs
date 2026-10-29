@@ -28,6 +28,15 @@ pub struct OdometryStream {
     /// Carries the pose through the recording's tf to this frame and makes it the child.
     #[serde(default)]
     pub carry_to: Option<String>,
+    /// s added to every stamp: puts a stream recorded on another clock onto the replay's.
+    #[serde(default)]
+    pub time_offset_seconds: f64,
+}
+
+impl OdometryStream {
+    pub fn offset_ns(&self) -> i64 {
+        (self.time_offset_seconds * 1e9).round() as i64
+    }
 }
 
 /// parent_from_child, rotation as [x, y, z, w].
@@ -54,6 +63,9 @@ pub enum SensorStream {
         stream: String,
         #[serde(default)]
         frame_id: Option<String>,
+        /// s added to every stamp, as `OdometryStream::time_offset_seconds`.
+        #[serde(default)]
+        time_offset_seconds: f64,
     },
 }
 
@@ -71,6 +83,16 @@ impl SensorStream {
             SensorStream::Spec { frame_id, .. } => frame_id.as_deref(),
         }
     }
+
+    pub fn offset_ns(&self) -> i64 {
+        match self {
+            SensorStream::Name(_) => 0,
+            SensorStream::Spec {
+                time_offset_seconds,
+                ..
+            } => (time_offset_seconds * 1e9).round() as i64,
+        }
+    }
 }
 
 /// When the body counts as at rest: this stream's twist under both speeds for at least
@@ -83,6 +105,9 @@ pub struct Rest {
     pub angular_speed: f64,
     pub min_seconds: f64,
     pub trim_seconds: f64,
+    /// s added to the rest stream's stamps, as `OdometryStream::time_offset_seconds`.
+    #[serde(default)]
+    pub time_offset_seconds: f64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -121,15 +146,19 @@ pub struct Scenario {
     #[serde(default)]
     pub lidars: Vec<SensorStream>,
     #[serde(default)]
-    pub images: Vec<String>,
+    pub images: Vec<SensorStream>,
     #[serde(default)]
-    pub camera_infos: Vec<String>,
+    pub camera_infos: Vec<SensorStream>,
     /// What the output is scored against; never fed in.
     pub reference: OdometryStream,
     /// Other estimators' outputs in the recording, never fed in, scored against the reference
     /// exactly as a variant is (as variant `baseline:<stream>`): what the output has to beat.
     #[serde(default)]
     pub baselines: Vec<OdometryStream>,
+    /// Fiducial sightings: every trajectory (output, baselines, reference) is also scored on
+    /// how well it puts each tag back where it saw it before. Needs no reference.
+    #[serde(default)]
+    pub tags: Option<crate::tags::TagSpec>,
     pub rest: Rest,
     /// The core's config: `OdometryFusionConfig` for fusion, `DimSlamCoreConfig` for slam.
     pub config: Value,

@@ -50,7 +50,7 @@ impl Default for LidarConfig {
             scan_voxel_size: 0.3,
             slice_seconds: 0.01,
             time_offset_seconds: 0.0,
-            point_std: 0.1,
+            point_std: 0.05,
         }
     }
 }
@@ -73,8 +73,8 @@ pub struct LidarMapConfig {
     /// Voxel sizes, each half the one before, starting at `voxel_size`: where a voxel is not
     /// flat (stairs, furniture, corners) its point falls through to a smaller one that is.
     pub levels: u32,
-    /// A voxel stops taking points once it holds this many: the plane is settled by then, and
-    /// points from a pose that later drifted would only thicken it.
+    /// A voxel (or `nearest_points` cell) stops taking points once it holds this many: the
+    /// surface is settled by then, and points from a pose that later drifted would only smear it.
     pub max_points_per_voxel: u32,
     /// Points a voxel needs before its plane is used.
     pub min_points_per_plane: u32,
@@ -102,17 +102,17 @@ pub struct LidarMapConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Matching {
-    #[default]
     VoxelPlanes,
+    #[default]
     NearestPoints,
 }
 
 impl Default for LidarMapConfig {
     fn default() -> Self {
         Self {
-            matching: Matching::VoxelPlanes,
+            matching: Matching::NearestPoints,
             neighbors: 5,
-            point_spacing: 0.1,
+            point_spacing: 0.05,
             voxel_size: 0.5,
             levels: 3,
             max_points_per_voxel: 50,
@@ -262,6 +262,8 @@ impl PlaneMap {
 
     pub fn insert(&mut self, point: &Vector3<f64>) {
         if self.config.matching == Matching::NearestPoints {
+            // Capped like a plane voxel: the map keeps the points it was first built from,
+            // rather than smearing in later ones from a pose that has since drifted.
             let spacing_sq = self.config.point_spacing * self.config.point_spacing;
             let cap = self.config.max_points_per_voxel as usize;
             let cell = self.cells.entry(voxel_key(point, self.levels[0].0)).or_default();
@@ -468,11 +470,7 @@ impl PlaneEvidence {
         pose_covariance: &Matrix6<f64>,
         gate: f64,
     ) {
-        let predicted = if std::env::var_os("DIMSLAM_GATE_NOPOSE").is_some() {
-            noise
-        } else {
-            (row.transpose() * pose_covariance * row)[(0, 0)] + noise
-        };
+        let predicted = (row.transpose() * pose_covariance * row)[(0, 0)] + noise;
         if residual * residual > gate * predicted {
             self.gated += 1;
             return;
@@ -551,6 +549,13 @@ mod tests {
     }
 
     /// A 10x10 grid at 5 cm on z, in a scattered order so any prefix spans the square.
+    fn voxel_planes() -> LidarMapConfig {
+        LidarMapConfig {
+            matching: Matching::VoxelPlanes,
+            ..LidarMapConfig::default()
+        }
+    }
+
     fn floor(map: &mut PlaneMap, z: f64) {
         for k in 0..100 {
             let cell = (k * 37) % 100;
@@ -562,7 +567,7 @@ mod tests {
     fn a_flat_voxel_fits_its_plane_and_a_line_does_not() {
         let mut map = PlaneMap::new(LidarMapConfig {
             max_points_per_voxel: 1000,
-            ..LidarMapConfig::default()
+            ..voxel_planes()
         });
         floor(&mut map, 0.2);
         let plane = map.plane_at(&Vector3::new(0.1, 0.1, 0.1)).expect("a plane");
@@ -578,7 +583,7 @@ mod tests {
     /// Two stair treads share a coarse voxel, which is no plane; each has a finer one that is.
     #[test]
     fn a_point_on_a_stair_falls_through_to_its_treads_own_plane() {
-        let mut map = PlaneMap::new(LidarMapConfig::default());
+        let mut map = PlaneMap::new(voxel_planes());
         for k in 0..64 {
             let (u, v) = ((k % 8) as f64 * 0.03, (k / 8) as f64 * 0.03);
             map.insert(&Vector3::new(0.01 + u, 0.01 + v, 0.10));
@@ -630,7 +635,7 @@ mod tests {
     fn a_full_voxel_stops_taking_points() {
         let mut map = PlaneMap::new(LidarMapConfig {
             max_points_per_voxel: 20,
-            ..LidarMapConfig::default()
+            ..voxel_planes()
         });
         floor(&mut map, 0.2);
         let before = map.plane_at(&Vector3::new(0.1, 0.1, 0.2)).unwrap();
@@ -645,7 +650,7 @@ mod tests {
     fn prune_drops_voxels_past_the_radius() {
         let mut map = PlaneMap::new(LidarMapConfig {
             radius: 5.0,
-            ..LidarMapConfig::default()
+            ..voxel_planes()
         });
         map.insert(&Vector3::new(1.0, 0.0, 0.0));
         map.insert(&Vector3::new(9.0, 0.0, 0.0));

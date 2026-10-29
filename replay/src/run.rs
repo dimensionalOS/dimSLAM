@@ -22,6 +22,8 @@ pub struct Run {
     pub reference: Vec<(i64, Isometry3<f64>)>,
     /// Each `baselines` stream's poses, in scenario order.
     pub baselines: Vec<Vec<(i64, Isometry3<f64>)>>,
+    /// The tag camera in the output frame, when the scenario scores tags.
+    pub body_from_camera: Option<Isometry3<f64>>,
     /// The rest stream's samples: stamp and whether the body was still.
     pub rest: Vec<(i64, bool)>,
     pub wall_seconds: f64,
@@ -79,8 +81,8 @@ enum Role {
     Rest,
     Imu(usize),
     Lidar(usize),
-    Image,
-    CameraInfo,
+    Image(usize),
+    CameraInfo(usize),
 }
 
 /// Applies a stream's frame overrides and carries the pose to its `carry_to` frame.
@@ -103,6 +105,7 @@ fn remap(
     if let Some(child) = &spec.child_frame_id {
         msg.child_frame_id = child.clone();
     }
+    msg.timestamp_ns += spec.offset_ns();
     Ok(msg)
 }
 
@@ -143,6 +146,9 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
             tf.insert(edge.parent, edge.child, edge.transform);
         }
     }
+    if std::env::var_os("REPLAY_TF_DEBUG").is_some() {
+        eprintln!("tf edges: {:?}", tf.edge_names());
+    }
     for edge in &scenario.static_tf {
         let [x, y, z, w] = edge.rotation;
         tf.insert(
@@ -180,11 +186,11 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
         add(lidar.stream(), Role::Lidar(index));
     }
     if scenario.mode == Mode::Slam {
-        for name in &scenario.camera_infos {
-            add(name, Role::CameraInfo);
+        for (index, info) in scenario.camera_infos.iter().enumerate() {
+            add(info.stream(), Role::CameraInfo(index));
         }
-        for name in &scenario.images {
-            add(name, Role::Image);
+        for (index, image) in scenario.images.iter().enumerate() {
+            add(image.stream(), Role::Image(index));
         }
     }
     let mut recording = Recording::open(
@@ -200,6 +206,10 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
         fused: Vec::new(),
         reference: Vec::new(),
         baselines: vec![Vec::new(); scenario.baselines.len()],
+        body_from_camera: scenario
+            .tags
+            .as_ref()
+            .and_then(|spec| tf.latest(&output_frame, &spec.camera_frame)),
         rest: Vec::new(),
         wall_seconds: 0.0,
         data_seconds: 0.0,
@@ -215,12 +225,22 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
         last_ts = record.ts;
         for role in roles[record.stream].clone() {
             let stamp = match role {
-                Role::Source(_) | Role::Reference | Role::Baseline(_) | Role::Rest => {
-                    lcm::odometry(&record.data)?.timestamp_ns
+                Role::Source(index) => {
+                    lcm::odometry(&record.data)?.timestamp_ns + scenario.sources[index].offset_ns()
                 }
-                Role::Imu(_) => lcm::imu(&record.data)?.timestamp_ns,
-                Role::Lidar(_) => lcm::lidar_stamp(&record.data)?,
-                Role::Image | Role::CameraInfo => (record.ts * 1e9) as i64,
+                Role::Reference | Role::Baseline(_) | Role::Rest => 0,
+                Role::Imu(index) => {
+                    lcm::imu(&record.data)?.timestamp_ns + scenario.imus[index].offset_ns()
+                }
+                Role::Lidar(index) => {
+                    lcm::lidar_stamp(&record.data)? + scenario.lidars[index].offset_ns()
+                }
+                Role::Image(index) => {
+                    (record.ts * 1e9) as i64 + scenario.images[index].offset_ns()
+                }
+                Role::CameraInfo(index) => {
+                    (record.ts * 1e9) as i64 + scenario.camera_infos[index].offset_ns()
+                }
             };
             // Publish every tick the data clock has passed, as the live module's timer would.
             if !matches!(role, Role::Reference | Role::Baseline(_) | Role::Rest) {
@@ -255,10 +275,12 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                     let msg = lcm::odometry(&record.data)?;
                     let still = msg.twist.linear.norm() < scenario.rest.speed
                         && msg.twist.angular.norm() < scenario.rest.angular_speed;
-                    run.rest.push((msg.timestamp_ns, still));
+                    let offset = (scenario.rest.time_offset_seconds * 1e9).round() as i64;
+                    run.rest.push((msg.timestamp_ns + offset, still));
                 }
                 Role::Lidar(index) => {
                     let mut scan = lcm::lidar_scan(&record.data)?;
+                    scan.timestamp_ns += scenario.lidars[index].offset_ns();
                     if let Some(frame_id) = scenario.lidars[index].frame_id() {
                         scan.frame_id = frame_id.to_string();
                     }
@@ -268,6 +290,7 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                 }
                 Role::Imu(index) => {
                     let mut sample = lcm::imu(&record.data)?;
+                    sample.timestamp_ns += scenario.imus[index].offset_ns();
                     if let Some(frame_id) = scenario.imus[index].frame_id() {
                         sample.frame_id = frame_id.to_string();
                     }
@@ -282,14 +305,24 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                         Core::Slam(core) => core.handle_imu(&sample, &tf),
                     }
                 }
-                Role::Image => {
+                Role::Image(index) => {
                     if let Core::Slam(core) = &mut core {
-                        core.handle_image(lcm::image(&record.data)?, &tf);
+                        let mut image = lcm::image(&record.data)?;
+                        image.timestamp_ns += scenario.images[index].offset_ns();
+                        if let Some(frame_id) = scenario.images[index].frame_id() {
+                            image.frame_id = frame_id.to_string();
+                        }
+                        core.handle_image(image, &tf);
                     }
                 }
-                Role::CameraInfo => {
+                Role::CameraInfo(index) => {
                     if let Core::Slam(core) = &mut core {
-                        core.handle_camera_info(lcm::camera_info(&record.data)?, &tf);
+                        let mut info = lcm::camera_info(&record.data)?;
+                        info.timestamp_ns += scenario.camera_infos[index].offset_ns();
+                        if let Some(frame_id) = scenario.camera_infos[index].frame_id() {
+                            info.frame_id = frame_id.to_string();
+                        }
+                        core.handle_camera_info(info, &tf);
                     }
                 }
             }

@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod report;
 pub mod run;
 pub mod scenario;
+pub mod tags;
 pub mod tf;
 
 use std::path::{Path, PathBuf};
@@ -60,6 +61,7 @@ pub fn evaluate(
                 fused: track.clone(),
                 reference: first.reference.clone(),
                 baselines: Vec::new(),
+                body_from_camera: first.body_from_camera,
                 rest: first.rest.clone(),
                 wall_seconds: f64::NAN,
                 data_seconds: first.data_seconds,
@@ -70,10 +72,33 @@ pub fn evaluate(
         }
         runs.extend(scored_baselines);
     }
-    let reference = runs
+    let mut reference = runs
         .first()
         .map(|(run, _)| metrics::score_reference(run, &segments))
         .unwrap_or_default();
+    if let (Some(spec), Some((first, _))) = (&scenario.tags, runs.first()) {
+        let sightings = tags::load(&scenario.recording_path(datasets), spec)?;
+        let body_from_camera = first
+            .body_from_camera
+            .ok_or(format!("tags: tf has no output frame -> {}", spec.camera_frame))?;
+        let score = |track: &[(i64, dim_slam::nalgebra::Isometry3<f64>)], into: &mut Metrics| {
+            let (mean, max, count) = tags::revisit_error(
+                track,
+                &body_from_camera,
+                &sightings,
+                spec.visit_gap_seconds,
+                metrics::interpolate,
+            );
+            into.insert("tag_revisit_mm_mean".into(), mean);
+            into.insert("tag_revisit_mm_max".into(), max);
+            into.insert("tags_revisited".into(), count as f64);
+        };
+        let reference_track = first.reference.clone();
+        score(&reference_track, &mut reference);
+        for (run, scored) in &mut runs {
+            score(&run.fused, scored);
+        }
+    }
     let mut failures = Vec::new();
     for (run, scored) in &runs {
         for (metric, bound) in scenario.expect.get(&run.variant).into_iter().flatten() {

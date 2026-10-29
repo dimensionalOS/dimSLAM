@@ -147,8 +147,12 @@ impl Default for ImuConfig {
 pub struct ProcessNoise {
     /// m/s^2/sqrt(Hz).
     pub linear_acceleration: f64,
-    /// rad/s^2/sqrt(Hz).
+    /// rad/s^2/sqrt(Hz). With `imu_as_measurement`, how fast the angular velocity state can
+    /// change between IMU samples.
     pub angular_acceleration: f64,
+    /// m/s^3/sqrt(Hz), `imu_as_measurement` only: how fast the specific force state can change
+    /// between IMU samples. A legged body's footfalls want it high.
+    pub specific_force_rate: f64,
 }
 
 impl Default for ProcessNoise {
@@ -156,6 +160,7 @@ impl Default for ProcessNoise {
         Self {
             linear_acceleration: 1.0,
             angular_acceleration: 1.0,
+            specific_force_rate: 100.0,
         }
     }
 }
@@ -211,6 +216,10 @@ pub struct OdometryFusionConfig {
     /// fused directly as point-to-plane measurements against `lidar_map`, which they also build.
     pub lidars: Vec<LidarConfig>,
     pub lidar_map: LidarMapConfig,
+    /// With IMUs: angular velocity and specific force become states, each IMU sample a
+    /// measurement of them (clipped axes left out), instead of the samples driving the
+    /// motion model directly. Robust to a body that shakes or clips its IMU.
+    pub imu_as_measurement: bool,
 }
 
 /// 1-sigma uncertainty the filter starts with, per state block. The bias std applies to
@@ -223,6 +232,8 @@ pub struct InitialStds {
     pub rotation: f64,
     /// Without an IMU only.
     pub angular_velocity: f64,
+    /// m/s^2, `imu_as_measurement` only.
+    pub specific_force: f64,
     pub bias: f64,
 }
 
@@ -233,6 +244,7 @@ impl Default for InitialStds {
             velocity: 0.1,
             rotation: 0.05,
             angular_velocity: 0.1,
+            specific_force: 0.5,
             bias: 0.01,
         }
     }
@@ -265,6 +277,7 @@ impl Default for OdometryFusionConfig {
             imm: false,
             lidars: Vec::new(),
             lidar_map: LidarMapConfig::default(),
+            imu_as_measurement: false,
         }
     }
 }
@@ -495,8 +508,12 @@ impl FusionCore {
         let gyro = base_from_imu * imu.angular_velocity;
         let mut accel = base_from_imu * imu.linear_acceleration;
         let ts_ns = imu.timestamp_ns;
+        let mut period = 0.0;
         {
             let runtime = &mut self.imu_runtime[index];
+            if runtime.lever_gyro_ns != 0 {
+                period = (ts_ns - runtime.lever_gyro_ns) as f64 / NS_PER_SEC as f64;
+            }
             if runtime.lever_gyro_ns != 0 {
                 let dt = (ts_ns - runtime.lever_gyro_ns) as f64 / NS_PER_SEC as f64;
                 if dt > 0.0 {
@@ -508,13 +525,7 @@ impl FusionCore {
             runtime.lever_gyro = gyro;
             runtime.lever_gyro_ns = ts_ns;
             // The lever arm adds centripetal and tangential terms: mount kinematics, not base motion.
-            let mode = std::env::var("DIMSLAM_LEVER").unwrap_or_default();
-            if mode == "none" {
-            } else if mode == "centripetal" {
-                accel -= gyro.cross(&gyro.cross(&lever));
-            } else {
-                accel -= gyro.cross(&gyro.cross(&lever)) + runtime.lever_alpha.cross(&lever);
-            }
+            accel -= gyro.cross(&gyro.cross(&lever)) + runtime.lever_alpha.cross(&lever);
         }
         let config = &self.config.imus[index];
         // 1% short of the clip, as a clipped reading jitters just under it.
@@ -527,6 +538,7 @@ impl FusionCore {
             accel,
             accel_saturated: clipped(&imu.linear_acceleration, config.accel_saturation),
             gyro_saturated: clipped(&imu.angular_velocity, config.gyro_saturation),
+            period,
         };
         if !self.initialized {
             self.check_config();
@@ -874,6 +886,7 @@ impl FusionCore {
         self.filter.gravity = self.config.initial_gravity_estimate;
         self.filter.planar = self.config.planar;
         self.filter.layout.clones = self.clone_slots.iter().flatten().count();
+        self.filter.layout.imu_states = self.config.imu_as_measurement && !biases.is_empty();
         let gyro_bias_norms: Vec<f64> = biases.iter().map(|bias| bias.gyro.norm()).collect();
         self.filter.init(
             timestamp_ns,
@@ -1227,6 +1240,9 @@ impl FusionCore {
         let kind = self.events[index].kind.clone();
         match kind {
             EventKind::Seed => {}
+            EventKind::Imu(input) if self.filter.layout.imu_states => {
+                self.filter.update_imu(&input)
+            }
             EventKind::Imu(input) => self.filter.x.input = Some(input),
             EventKind::Measurement(measurement) if self.blending() => {
                 self.blend(&measurement, ts_ns)
@@ -1828,6 +1844,7 @@ mod tests {
             imm: false,
             lidars: Vec::new(),
             lidar_map: LidarMapConfig::default(),
+            imu_as_measurement: false,
         }
     }
 

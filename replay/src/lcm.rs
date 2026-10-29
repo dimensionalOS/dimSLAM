@@ -282,3 +282,10 @@ pub fn lidar_stamp(buf: &[u8]) -> Result<i64> {
     r.take(8)?;
     Ok(r.header()?.0)
 }
+
+/// geometry_msgs.PoseStamped: (stamp ns, pose).
+pub fn pose_stamped(buf: &[u8]) -> Result<(i64, Isometry3<f64>)> {
+    let mut r = Reader::message(buf);
+    let (timestamp_ns, _frame_id) = r.header()?;
+    Ok((timestamp_ns, r.pose()?))
+}

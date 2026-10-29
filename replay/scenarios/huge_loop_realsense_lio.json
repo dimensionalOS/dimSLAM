@@ -1,0 +1,78 @@
+{
+ "name": "huge_loop_realsense_lio",
+ "description": "Handheld Mid-360 + RealSense rig, a ~1 h, 3 km loop; dimSLAM's lidar-inertial odometry from raw scans and the Mid-360 IMU. Scored against Point-LIO corrected by AprilTag loop closures (v5), and on AprilTag revisits. Clocks: Mid-360 on its device clock (the replay's), Point-LIO streams re-stamped by an offline replay (offset by gyro correlation, +-50 ms over the hour)",
+ "recording": "mid360_recordings/2026-06-04_12-57pm-PST__huge_loop_realsense/mem2.db",
+ "mode": "fusion",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom",
+  "world",
+  "map"
+ ],
+ "imus": [
+  {
+   "stream": "livox_imu",
+   "frame_id": "imu_frame"
+  }
+ ],
+ "lidars": [
+  {
+   "stream": "livox_lidar",
+   "frame_id": "mid360_link"
+  }
+ ],
+ "reference": {
+  "stream": "pointlio_odometry_corrected_v5",
+  "time_offset_seconds": -1783812058.56
+ },
+ "baselines": [
+  {
+   "stream": "pointlio_odometry",
+   "time_offset_seconds": -1783812058.56
+  }
+ ],
+ "rest": {
+  "stream": "pointlio_odometry",
+  "speed": 0.05,
+  "angular_speed": 0.05,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3,
+  "time_offset_seconds": -1783812058.56
+ },
+ "config": {
+  "odom_frame_id": "odom",
+  "output_frame_id": "imu_frame",
+  "publish_rate": 50.0,
+  "imus": [
+   {
+    "frame_id": "imu_frame",
+    "gyro_noise_density": 0.01,
+    "gyro_random_walk": 0.0001,
+    "accel_noise_density": 0.15,
+    "accel_random_walk": 0.001,
+    "init_gyro_limit": 0.3,
+    "accel_saturation": 29.4,
+    "gyro_saturation": 34.9
+   }
+  ],
+  "lidars": [
+   {
+    "frame_id": "mid360_link"
+   }
+  ]
+ },
+ "variants": {
+  "lio": {}
+ },
+ "tags": {
+  "stream": "raw_april_tags",
+  "camera_frame": "camera_color_optical_frame",
+  "time_offset_seconds": -1780595471.664,
+  "max_distance_m": 1.5,
+  "max_reproj_px": 3.5,
+  "min_tag_px": 12,
+  "max_lin_speed": 1.5,
+  "max_ang_speed": 150,
+  "visit_gap_seconds": 20
+ }
+}

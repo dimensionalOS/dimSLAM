@@ -84,6 +84,8 @@ pub struct DimSlamCoreConfig {
     /// See [`OdometryFusionConfig::lidars`].
     pub lidars: Vec<LidarConfig>,
     pub lidar_map: LidarMapConfig,
+    /// See [`OdometryFusionConfig::imu_as_measurement`].
+    pub imu_as_measurement: bool,
 }
 
 /// Defers to the two cores so a field's default cannot drift from the core that reads it.
@@ -119,6 +121,7 @@ impl Default for DimSlamCoreConfig {
             imm: fusion.imm,
             lidars: fusion.lidars,
             lidar_map: fusion.lidar_map,
+            imu_as_measurement: fusion.imu_as_measurement,
         }
     }
 }
@@ -177,6 +180,7 @@ impl DimSlamCore {
             imm: config.imm,
             lidars: config.lidars,
             lidar_map: config.lidar_map,
+            imu_as_measurement: config.imu_as_measurement,
         };
         Ok(Self {
             visual_odometry,

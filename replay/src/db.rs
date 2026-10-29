@@ -19,6 +19,9 @@ struct Cursor {
     name: String,
     page: VecDeque<(i64, f64)>,
     last_ts: f64,
+    /// With last_ts, where the next page resumes: (ts, id) order, so records sharing a stamp
+    /// are neither skipped nor read twice.
+    last_id: i64,
     done: bool,
 }
 
@@ -66,13 +69,15 @@ impl Recording {
             first = first.min(ts.unwrap_or(f64::INFINITY));
         }
         let start = first + start_s;
-        // Cursors read strictly after last_ts, so a record exactly at the start is kept.
+        // Cursors resume after (last_ts, last_id); id i64::MIN keeps records stamped exactly at
+        // the start (a recording's static tf is often published once, at its first stamp).
         let cursors = streams
             .iter()
             .map(|name| Cursor {
                 name: name.clone(),
                 page: VecDeque::new(),
-                last_ts: start - 1e-9,
+                last_ts: start,
+                last_id: i64::MIN,
                 done: false,
             })
             .collect();
@@ -91,7 +96,8 @@ impl Recording {
     fn fill(&mut self, index: usize) -> Result<(), String> {
         let cursor = &mut self.cursors[index];
         let sql = format!(
-            "SELECT id, ts FROM {} WHERE ts > ?1 AND ts <= ?2 ORDER BY ts LIMIT ?3",
+            "SELECT id, ts FROM {} WHERE (ts > ?1 OR (ts = ?1 AND id > ?4)) AND ts <= ?2 \
+             ORDER BY ts, id LIMIT ?3",
             quote(&cursor.name)
         );
         let mut statement = self
@@ -100,7 +106,7 @@ impl Recording {
             .map_err(|e| e.to_string())?;
         let rows = statement
             .query_map(
-                rusqlite::params![cursor.last_ts, self.end_ts, PAGE],
+                rusqlite::params![cursor.last_ts, self.end_ts, PAGE, cursor.last_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|e| e.to_string())?
@@ -110,6 +116,7 @@ impl Recording {
             None => cursor.done = true,
             Some(last) => {
                 cursor.last_ts = last.1;
+                cursor.last_id = last.0;
                 cursor.page.extend(rows);
             }
         }

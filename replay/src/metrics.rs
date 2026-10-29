@@ -11,7 +11,7 @@ use crate::scenario::Rest;
 pub type Metrics = BTreeMap<String, f64>;
 
 /// The reference posed at `t`: linear in position, slerped in rotation.
-fn interpolate(track: &[(i64, Isometry3<f64>)], t: i64) -> Option<Isometry3<f64>> {
+pub fn interpolate(track: &[(i64, Isometry3<f64>)], t: i64) -> Option<Isometry3<f64>> {
     let after = track.partition_point(|(ts, _)| *ts < t);
     if after == 0 || after == track.len() {
         return None;
@@ -241,6 +241,7 @@ pub fn score_reference(run: &Run, segments: &[(i64, i64)]) -> Metrics {
         fused: run.reference.clone(),
         reference: run.reference.clone(),
         baselines: Vec::new(),
+        body_from_camera: None,
         rest: Vec::new(),
         wall_seconds: run.wall_seconds,
         data_seconds: run.data_seconds,

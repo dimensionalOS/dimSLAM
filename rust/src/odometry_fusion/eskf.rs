@@ -27,27 +27,44 @@ pub fn yaw_only(q: &UnitQuaternion<f64>) -> UnitQuaternion<f64> {
 pub struct Layout {
     pub imus: usize,
     pub clones: usize,
+    /// The IMU is a measurement of angular velocity and specific-force states rather than the
+    /// process input.
+    pub imu_states: bool,
 }
 
 impl Layout {
-    /// Without an IMU the angular rate is a state; with one it is the gyro reading.
+    /// The angular rate is a state without an IMU, or with one measuring it; else it is the
+    /// gyro reading itself.
     pub fn angular_velocity_col(&self) -> Option<usize> {
-        (self.imus == 0).then_some(9)
+        (self.imus == 0 || self.imu_states).then_some(9)
+    }
+
+    /// Body-frame specific force, what an accelerometer at the body reads, when it is a state.
+    pub fn specific_force_col(&self) -> Option<usize> {
+        (self.imus > 0 && self.imu_states).then_some(12)
+    }
+
+    fn biases_start(&self) -> usize {
+        if self.imu_states {
+            15
+        } else {
+            9
+        }
     }
 
     pub fn gyro_bias_col(&self, imu: usize) -> usize {
-        9 + 6 * imu
+        self.biases_start() + 6 * imu
     }
 
     pub fn accel_bias_col(&self, imu: usize) -> usize {
-        12 + 6 * imu
+        self.biases_start() + 3 + 6 * imu
     }
 
     fn clones_start(&self) -> usize {
         if self.imus == 0 {
             12
         } else {
-            9 + 6 * self.imus
+            self.biases_start() + 6 * self.imus
         }
     }
 
@@ -104,6 +121,8 @@ pub struct ImuInput {
     /// Some axis read at its clip: the true value was at least that, by how much more unknown.
     pub accel_saturated: bool,
     pub gyro_saturated: bool,
+    /// s since this IMU's previous sample: as a measurement, its noise is the density over it.
+    pub period: f64,
 }
 
 /// A copy of the pose at some past time, so a relative measurement can span to the present.
@@ -122,6 +141,8 @@ pub struct State {
     pub q: UnitQuaternion<f64>, // world_from_body
     /// Body frame; a state only without an IMU, otherwise unused.
     pub angular_velocity: Vector3<f64>,
+    /// Body frame; a state only with `Layout::imu_states`.
+    pub specific_force: Vector3<f64>,
     pub biases: Vec<ImuBias>,
     pub input: Option<ImuInput>,
     pub clones: Vec<Option<PoseClone>>,
@@ -135,6 +156,7 @@ impl Default for State {
             velocity: Vector3::zeros(),
             q: UnitQuaternion::identity(),
             angular_velocity: Vector3::zeros(),
+            specific_force: Vector3::zeros(),
             biases: Vec::new(),
             input: None,
             clones: Vec::new(),
@@ -189,6 +211,13 @@ impl Filter {
         if let Some(col) = self.layout.angular_velocity_col() {
             blocks.push((col, stds.angular_velocity));
         }
+        if let Some(col) = self.layout.specific_force_col() {
+            blocks.push((col, stds.specific_force));
+            // Level and still, as init requires: the accelerometer reads gravity alone.
+            self.x.specific_force =
+                world_from_body.inverse_transform_vector(&Vector3::new(0.0, 0.0, self.gravity));
+            self.x.input = None;
+        }
         for imu in 0..self.layout.imus {
             blocks.push((self.layout.gyro_bias_col(imu), stds.bias));
             blocks.push((self.layout.accel_bias_col(imu), stds.bias));
@@ -226,6 +255,9 @@ impl Filter {
         self.x.time_ns = time_ns;
         let bridged = if self.stopped {
             self.predict_stopped(dt);
+            true
+        } else if self.layout.imu_states {
+            self.predict_imu_states(dt);
             true
         } else if self.layout.imus == 0 {
             self.predict_constant_velocity(dt);
@@ -283,6 +315,102 @@ impl Filter {
                 .copy_from(&(identity * spectral * dt));
         }
         self.p_cov = &f * &self.p_cov * f.transpose() + q_noise;
+    }
+
+    /// Constant angular velocity and specific force, each random-walking: the IMU corrects
+    /// them as a measurement, so a clipped or shaken sample only weighs what its noise says.
+    fn predict_imu_states(&mut self, dt: f64) {
+        let dim = self.dim();
+        let layout = self.layout;
+        let omega_col = layout.angular_velocity_col().expect("imu states");
+        let force_col = layout.specific_force_col().expect("imu states");
+        let rotation = self.x.q.to_rotation_matrix();
+        let force = self.x.specific_force;
+        let omega = self.x.angular_velocity;
+        let world_accel = rotation * force + Vector3::new(0.0, 0.0, -self.gravity);
+
+        let mut f = Cov::identity(dim, dim);
+        f.view_mut((0, 3), (3, 3))
+            .copy_from(&(Matrix3::identity() * dt));
+        f.view_mut((3, 6), (3, 3))
+            .copy_from(&(-(rotation.matrix() * skew(&force)) * dt));
+        f.view_mut((3, force_col), (3, 3))
+            .copy_from(&(rotation.matrix() * dt));
+        f.view_mut((6, 6), (3, 3))
+            .copy_from(&(Matrix3::identity() - skew(&omega) * dt));
+        f.view_mut((6, omega_col), (3, 3))
+            .copy_from(&(Matrix3::identity() * dt));
+
+        self.x.position += self.x.velocity * dt + 0.5 * world_accel * dt * dt;
+        self.x.velocity += world_accel * dt;
+        self.x.q *= UnitQuaternion::from_scaled_axis(omega * dt);
+
+        let mut q_noise = Cov::zeros(dim, dim);
+        let mut blocks = vec![
+            (omega_col, self.process_noise.angular_acceleration),
+            (force_col, self.process_noise.specific_force_rate),
+        ];
+        for (imu, noise) in self.noise.iter().enumerate() {
+            blocks.push((layout.gyro_bias_col(imu), noise.gyro_random_walk));
+            blocks.push((layout.accel_bias_col(imu), noise.accel_random_walk));
+        }
+        for (block, density) in blocks {
+            q_noise
+                .view_mut((block, block), (3, 3))
+                .copy_from(&(Matrix3::identity() * density * density * dt));
+        }
+        self.p_cov = &f * &self.p_cov * f.transpose() + q_noise;
+    }
+
+    /// An IMU sample as a measurement of the angular velocity and specific force states plus
+    /// that IMU's biases; a clipped sensor's rows are left out, as they say only "at least".
+    pub fn update_imu(&mut self, input: &ImuInput) {
+        let layout = self.layout;
+        let (Some(omega_col), Some(force_col)) =
+            (layout.angular_velocity_col(), layout.specific_force_col())
+        else {
+            return;
+        };
+        let noise = self.noise[input.imu];
+        let bias = &self.x.biases[input.imu];
+        let period = input.period.max(1e-4);
+        let mut groups = Vec::new();
+        if !input.gyro_saturated {
+            groups.push((
+                input.gyro - self.x.angular_velocity - bias.gyro,
+                omega_col,
+                layout.gyro_bias_col(input.imu),
+                noise.gyro_noise_density.powi(2) / period,
+            ));
+        }
+        if !input.accel_saturated {
+            groups.push((
+                input.accel - self.x.specific_force - bias.accel,
+                force_col,
+                layout.accel_bias_col(input.imu),
+                noise.accel_noise_density.powi(2) / period,
+            ));
+        }
+        if groups.is_empty() {
+            return;
+        }
+        let rows = 3 * groups.len();
+        let mut residual = DVector::zeros(rows);
+        let mut jacobian = Cov::zeros(rows, self.dim());
+        let mut variance = DVector::zeros(rows);
+        for (group, (r, state_col, bias_col, var)) in groups.into_iter().enumerate() {
+            for axis in 0..3 {
+                let row = 3 * group + axis;
+                residual[row] = r[axis];
+                jacobian[(row, state_col + axis)] = 1.0;
+                jacobian[(row, bias_col + axis)] = 1.0;
+                variance[row] = var;
+            }
+        }
+        // The IMU drives the motion model here: its evidence is no vote for or against an IMM model.
+        let evidence = self.log_likelihood;
+        self.update(&residual, &jacobian, &variance, 0.0);
+        self.log_likelihood = evidence;
     }
 
     /// One step of dead reckoning from IMU `imu`'s sample, using that IMU's bias and noise.
@@ -546,6 +674,10 @@ impl Filter {
             dx.fixed_rows_mut::<3>(col)
                 .copy_from(&(other.angular_velocity - self.x.angular_velocity));
         }
+        if let Some(col) = layout.specific_force_col() {
+            dx.fixed_rows_mut::<3>(col)
+                .copy_from(&(other.specific_force - self.x.specific_force));
+        }
         for (imu, (mine, theirs)) in self.x.biases.iter().zip(&other.biases).enumerate() {
             dx.fixed_rows_mut::<3>(layout.gyro_bias_col(imu))
                 .copy_from(&(theirs.gyro - mine.gyro));
@@ -595,6 +727,9 @@ impl Filter {
         if let Some(col) = layout.angular_velocity_col() {
             self.x.angular_velocity += dx.fixed_rows::<3>(col);
         }
+        if let Some(col) = layout.specific_force_col() {
+            self.x.specific_force += dx.fixed_rows::<3>(col);
+        }
         for (imu, bias) in self.x.biases.iter_mut().enumerate() {
             bias.gyro += dx.fixed_rows::<3>(layout.gyro_bias_col(imu));
             bias.accel += dx.fixed_rows::<3>(layout.accel_bias_col(imu));
@@ -624,6 +759,7 @@ mod tests {
             velocity: 0.1,
             rotation: 0.05,
             angular_velocity: 0.1,
+            specific_force: 0.5,
             bias: 0.01,
         }
     }
@@ -660,6 +796,7 @@ mod tests {
             accel: Vector3::new(0.0, 0.0, GRAVITY),
             accel_saturated: false,
             gyro_saturated: false,
+            period: 0.005,
         })
     }
 
@@ -681,10 +818,15 @@ mod tests {
 
     fn constant_velocity_filter(clones: usize) -> Filter {
         let mut filter = Filter {
-            layout: Layout { imus: 0, clones },
+            layout: Layout {
+                imus: 0,
+                clones,
+                imu_states: false,
+            },
             process_noise: ProcessNoise {
                 linear_acceleration: 0.5,
                 angular_acceleration: 0.5,
+                ..ProcessNoise::default()
             },
             ..Filter::default()
         };
@@ -724,11 +866,19 @@ mod tests {
 
     #[test]
     fn the_layout_places_the_rate_state_only_without_an_imu() {
-        let without = Layout { imus: 0, clones: 1 };
+        let without = Layout {
+            imus: 0,
+            clones: 1,
+            imu_states: false,
+        };
         assert_eq!(without.angular_velocity_col(), Some(9));
         assert_eq!(without.clone_position_col(0), 12);
         assert_eq!(without.dim(), 18);
-        let with = Layout { imus: 2, clones: 1 };
+        let with = Layout {
+            imus: 2,
+            clones: 1,
+            imu_states: false,
+        };
         assert_eq!(with.angular_velocity_col(), None);
         assert_eq!(with.accel_bias_col(1), 18);
         assert_eq!(with.clone_rotation_col(0), 24);
@@ -969,6 +1119,7 @@ mod tests {
                 velocity: 3.0,
                 rotation: 0.5,
                 angular_velocity: 7.0,
+                specific_force: 0.5,
                 bias: 0.01,
             },
         );

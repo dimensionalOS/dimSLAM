@@ -28,6 +28,12 @@ impl TfBuffer {
     }
 }
 
+impl TfBuffer {
+    pub fn edge_names(&self) -> Vec<(String, String)> {
+        self.edges.keys().cloned().collect()
+    }
+}
+
 impl TfLookup for TfBuffer {
     fn latest(&self, parent: &str, child: &str) -> Option<Isometry3<f64>> {
         if parent == child {
