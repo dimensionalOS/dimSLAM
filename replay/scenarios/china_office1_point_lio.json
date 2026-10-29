@@ -1,0 +1,64 @@
+{
+ "name": "china_office1_point_lio",
+ "description": "Go2 walking a 20-minute office loop with stairs, Mid-360; dimSLAM's LioOdometry (Point-LIO's schedule, bit-for-bit equal to pointlio-core) from raw scans and the Mid-360 IMU. Scored against Point-LIO corrected by AprilTag loop closures, and on AprilTag revisits",
+ "recording": "mid360_recordings/2026-06-12_03-26am-PST__china_office1/mem2.db",
+ "mode": "point_lio",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom",
+  "map",
+  "world"
+ ],
+ "static_tf": [
+  {
+   "parent": "mid360_imu",
+   "child": "mid360_link",
+   "translation": [
+    -0.011,
+    -0.02329,
+    0.04412
+   ]
+  }
+ ],
+ "imus": [
+  {
+   "stream": "livox_imu",
+   "frame_id": "mid360_imu"
+  }
+ ],
+ "lidars": [
+  "livox_lidar"
+ ],
+ "reference": {
+  "stream": "pointlio_odometry_corrected"
+ },
+ "baselines": [
+  {
+   "stream": "pointlio_odometry"
+  }
+ ],
+ "tags": {
+  "stream": "raw_april_tags",
+  "camera_frame": "camera_optical",
+  "max_distance_m": 1.5,
+  "max_reproj_px": 3.5,
+  "min_tag_px": 12,
+  "max_lin_speed": 1.5,
+  "max_ang_speed": 150,
+  "visit_gap_seconds": 20,
+  "min_sharpness": 25
+ },
+ "rest": {
+  "stream": "pointlio_odometry",
+  "speed": 0.05,
+  "angular_speed": 0.05,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ },
+ "config": {
+  "output_frame_id": "mid360_imu"
+ },
+ "variants": {
+  "point_lio": {}
+ }
+}

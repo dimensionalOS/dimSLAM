@@ -14,6 +14,8 @@ pub enum Mode {
     Fusion,
     /// `DimSlamCore`: cuVSLAM on the images, fused with the sources.
     Slam,
+    /// `LioOdometry`: lidar and IMU in Point-LIO's schedule, each scan's pose published.
+    PointLio,
 }
 
 #[derive(Clone, Debug, Deserialize)]

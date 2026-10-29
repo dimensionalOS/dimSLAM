@@ -5,9 +5,11 @@ use std::path::Path;
 use std::time::Instant;
 
 use dim_slam::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion, Vector3};
+use dim_slam::odometry_fusion::lio_odometry::{LioConfig, LioOdometry};
+use dim_slam::odometry_fusion::{header_seconds, STANDARD_GRAVITY};
 use dim_slam::{
-    DimSlamCore, DimSlamCoreConfig, FusionCore, LidarScan, OdometryEstimate, OdometryFusionConfig,
-    TfLookup,
+    DimSlamCore, DimSlamCoreConfig, FusionCore, ImuSample, LidarScan, OdometryEstimate,
+    OdometryFusionConfig, TfLookup,
 };
 
 use crate::db::Recording;
@@ -38,6 +40,8 @@ pub struct Run {
 enum Core {
     Fusion(Box<FusionCore>),
     Slam(Box<DimSlamCore>),
+    /// Publishes at its own scans, not the timer: each pose lands in `Run::fused` as it comes.
+    Lio(Box<LioOdometry>),
 }
 
 impl Core {
@@ -45,6 +49,7 @@ impl Core {
         match self {
             Core::Fusion(core) => core.handle_source(msg),
             Core::Slam(core) => core.handle_source(msg),
+            Core::Lio(_) => {}
         }
     }
 
@@ -52,6 +57,35 @@ impl Core {
         match self {
             Core::Fusion(core) => core.maybe_publish_at(now_ns),
             Core::Slam(core) => core.maybe_publish_at(now_ns),
+            Core::Lio(_) => None,
+        }
+    }
+
+    /// Point-LIO's poses since the last call, as the module drains after every message.
+    fn drain(&mut self, fused: &mut Vec<(i64, Isometry3<f64>)>) {
+        if let Core::Lio(lio) = self {
+            while let Some(published) = lio.step() {
+                if let Some(pose) = published {
+                    let [x, y, z, w] = pose.quaternion;
+                    fused.push((
+                        (pose.stamp * 1e9).round() as i64,
+                        Isometry3::from_parts(
+                            Translation3::from(pose.position),
+                            UnitQuaternion::from_quaternion(Quaternion::new(w, x, y, z)),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn imu(&mut self, sample: &ImuSample) {
+        if let Core::Lio(lio) = self {
+            lio.push_imu(
+                header_seconds(sample.timestamp_ns),
+                sample.angular_velocity,
+                sample.linear_acceleration / STANDARD_GRAVITY,
+            );
         }
     }
 
@@ -64,6 +98,7 @@ impl Core {
                 core.handle_cloud(scan, &mount);
             }
             Core::Slam(core) => core.handle_cloud(scan, tf),
+            Core::Lio(lio) => lio.push_scan(scan),
         }
         Ok(())
     }
@@ -72,6 +107,7 @@ impl Core {
         match self {
             Core::Fusion(core) => core.report(),
             Core::Slam(core) => core.report(),
+            Core::Lio(_) => {}
         }
     }
 }
@@ -127,6 +163,14 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                 serde_json::from_value(config).map_err(|e| format!("config: {e}"))?;
             let (rate, frame) = (config.publish_rate, config.output_frame_id.clone());
             (Core::Slam(Box::new(DimSlamCore::new(config)?)), rate, frame)
+        }
+        Mode::PointLio => {
+            let frame = config
+                .get("output_frame_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("mid360_imu")
+                .to_string();
+            (Core::Lio(Box::new(LioOdometry::new(LioConfig::default()))), 50.0, frame)
         }
     };
 
@@ -332,6 +376,7 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                     if let Err(why) = core.cloud(&scan, &tf, &output_frame) {
                         run.dropped.push(why);
                     }
+                    core.drain(&mut run.fused);
                 }
                 Role::Imu(index) => {
                     let mut sample = lcm::imu(&record.data)?;
@@ -348,6 +393,10 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                             )),
                         },
                         Core::Slam(core) => core.handle_imu(&sample, &tf),
+                        Core::Lio(_) => {
+                            core.imu(&sample);
+                            core.drain(&mut run.fused);
+                        }
                     }
                 }
                 Role::Image(index) => {
