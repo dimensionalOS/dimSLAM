@@ -1,0 +1,21 @@
+# Copyright 2026 Dimensional Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dim_slam"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Visual-inertial odometry: a cuVSLAM front end and an error-state Kalman fuser"
+repository = "https://github.com/dimensionalOS/dimSLAM"
+
+
+[dependencies]
+cu_vslam_rs = "0.2.0"
+nalgebra = "0.35"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+

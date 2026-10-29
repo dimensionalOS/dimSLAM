@@ -1,0 +1,3 @@
+# dimos is a private repo: fetch with the system git so its credentials apply.
+[net]
+git-fetch-with-cli = true
