@@ -607,6 +607,9 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                         if let Some(frame_id) = scenario.camera_infos[index].frame_id() {
                             info.frame_id = frame_id.to_string();
                         }
+                        if let Some(model) = scenario.camera_infos[index].distortion_model() {
+                            info.distortion_model = model.to_string();
+                        }
                         camera.tracker.handle_camera_info(info, &tf);
                     }
                     if let Core::Slam(core) = &mut core {
@@ -614,6 +617,9 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                         info.timestamp_ns += scenario.camera_infos[index].offset_ns();
                         if let Some(frame_id) = scenario.camera_infos[index].frame_id() {
                             info.frame_id = frame_id.to_string();
+                        }
+                        if let Some(model) = scenario.camera_infos[index].distortion_model() {
+                            info.distortion_model = model.to_string();
                         }
                         core.handle_camera_info(info, &tf);
                     }

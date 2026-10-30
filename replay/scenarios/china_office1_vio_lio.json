@@ -84,7 +84,8 @@
  ],
  "camera_infos": [
   {
-   "stream": "camera_info"
+   "stream": "camera_info",
+   "distortion_model": "equidistant"
   }
  ]
 }

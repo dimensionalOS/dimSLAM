@@ -37,53 +37,98 @@ pub fn cuv_pose_to_isometry(pose: &CuvPose) -> Isometry3<f64> {
     )
 }
 
-/// ROS orders plumb_bob (k1, k2, p1, p2, k3); cuVSLAM's Brown wants (k1, k2, k3, p1, p2).
-pub fn to_distortion(info: &CameraModel) -> (u8, Vec<f32>) {
-    let d = &info.distortion;
-    let distorted = d.len() >= 5 && d.iter().any(|coefficient| *coefficient != 0.0);
-    if !distorted {
-        return (CUV_DISTORTION_PINHOLE, Vec::new());
+/// cuVSLAM's Distortion::Model order; cu_vslam_rs 0.2.0 names only pinhole and Brown.
+const CUV_DISTORTION_FISHEYE: u8 = 1;
+const CUV_DISTORTION_POLYNOMIAL: u8 = 3;
+
+/// camera_info's distortion as cuVSLAM's. A model or coefficient count cuVSLAM cannot take is an
+/// error: tracking through a lens model it was not given bends every ray off the image centre.
+pub fn to_distortion(info: &CameraModel) -> Result<(u8, Vec<f32>), String> {
+    let d: Vec<f32> = info.distortion.iter().map(|coefficient| *coefficient as f32).collect();
+    if d.iter().all(|coefficient| *coefficient == 0.0) {
+        return Ok((CUV_DISTORTION_PINHOLE, Vec::new()));
     }
-    (
-        CUV_DISTORTION_BROWN,
-        vec![
-            d[0] as f32,
-            d[1] as f32,
-            d[4] as f32,
-            d[2] as f32,
-            d[3] as f32,
-        ],
-    )
+    // Trailing zeros are absent terms (OpenCV pads to 5, 8, 12 or 14).
+    let used = d.iter().rposition(|coefficient| *coefficient != 0.0).map_or(0, |last| last + 1);
+    match (info.distortion_model.as_str(), used) {
+        // ROS orders plumb_bob (k1, k2, p1, p2, k3); four coefficients are OpenCV's k3 = 0.
+        // cuVSLAM's Brown wants (k1, k2, k3, p1, p2).
+        ("plumb_bob" | "", ..=5) => {
+            let term = |index: usize| d.get(index).copied().unwrap_or(0.0);
+            Ok((CUV_DISTORTION_BROWN, vec![term(0), term(1), term(4), term(2), term(3)]))
+        }
+        // kalibr's pinhole-equi and OpenCV's fisheye, which cuVSLAM's Fisheye takes as is.
+        ("equidistant" | "fisheye", ..=4) => {
+            Ok((CUV_DISTORTION_FISHEYE, (0..4).map(|index| d.get(index).copied().unwrap_or(0.0)).collect()))
+        }
+        // OpenCV's first eight, which cuVSLAM's Polynomial takes as is.
+        ("rational_polynomial" | "plumb_bob" | "", ..=8) => Ok((
+            CUV_DISTORTION_POLYNOMIAL,
+            (0..8).map(|index| d.get(index).copied().unwrap_or(0.0)).collect(),
+        )),
+        (model, used) => Err(format!(
+            "camera {}: cuVSLAM has no distortion model for {model:?} with {used} coefficients \
+             ({:?}); it takes plumb_bob (up to 5), equidistant (4) or rational_polynomial (8)",
+            info.frame_id, info.distortion
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn distortion_all_zero_is_pinhole() {
-        let info = CameraModel {
-            distortion: vec![0.0; 5],
+    fn camera(model: &str, distortion: Vec<f64>) -> CameraModel {
+        CameraModel {
+            distortion_model: model.to_string(),
+            distortion,
             ..Default::default()
-        };
-        assert_eq!(to_distortion(&info), (CUV_DISTORTION_PINHOLE, Vec::new()));
+        }
     }
 
     #[test]
-    fn distortion_empty_is_pinhole() {
-        let info = CameraModel::default();
-        assert_eq!(to_distortion(&info), (CUV_DISTORTION_PINHOLE, Vec::new()));
+    fn distortion_all_zero_is_pinhole() {
+        let expected = Ok((CUV_DISTORTION_PINHOLE, Vec::new()));
+        assert_eq!(to_distortion(&camera("plumb_bob", vec![0.0; 5])), expected);
+        assert_eq!(to_distortion(&camera("equidistant", vec![0.0; 4])), expected);
+        assert_eq!(to_distortion(&camera("", Vec::new())), expected);
     }
 
     #[test]
     fn distortion_plumb_bob_reorders_to_brown() {
-        let info = CameraModel {
-            distortion: vec![0.1, 0.2, 0.3, 0.4, 0.5],
-            ..Default::default()
-        };
-        let (model, parameters) = to_distortion(&info);
+        let (model, parameters) = to_distortion(&camera("plumb_bob", vec![0.1, 0.2, 0.3, 0.4, 0.5])).unwrap();
         assert_eq!(model, CUV_DISTORTION_BROWN);
         assert_eq!(parameters, vec![0.1, 0.2, 0.5, 0.3, 0.4]); // cuVSLAM: k1 k2 k3 p1 p2
+    }
+
+    #[test]
+    fn distortion_four_plumb_bob_coefficients_are_kept_with_no_k3() {
+        // These used to be dropped as no distortion at all.
+        let (model, parameters) = to_distortion(&camera("plumb_bob", vec![0.1, 0.2, 0.3, 0.4])).unwrap();
+        assert_eq!(model, CUV_DISTORTION_BROWN);
+        assert_eq!(parameters, vec![0.1, 0.2, 0.0, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn distortion_equidistant_is_fisheye() {
+        let go2_front = vec![-0.0731, -0.0234, -0.00693, 0.00924];
+        let (model, parameters) = to_distortion(&camera("equidistant", go2_front)).unwrap();
+        assert_eq!(model, CUV_DISTORTION_FISHEYE);
+        assert_eq!(parameters, vec![-0.0731, -0.0234, -0.00693, 0.00924]);
+    }
+
+    #[test]
+    fn distortion_rational_polynomial_keeps_opencv_order() {
+        let (model, parameters) =
+            to_distortion(&camera("rational_polynomial", vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])).unwrap();
+        assert_eq!(model, CUV_DISTORTION_POLYNOMIAL);
+        assert_eq!(parameters, vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]);
+    }
+
+    #[test]
+    fn distortion_cuvslam_cannot_take_is_refused() {
+        assert!(to_distortion(&camera("equidistant", vec![0.1, 0.2, 0.3, 0.4, 0.5])).is_err());
+        assert!(to_distortion(&camera("double_sphere", vec![0.1])).is_err());
     }
 
     #[test]

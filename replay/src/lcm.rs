@@ -200,14 +200,14 @@ fn jpeg_frame(timestamp_ns: i64, frame_id: String, jpeg: &[u8]) -> Result<ImageF
     })
 }
 
-/// sensor_msgs.CameraInfo, keeping what dimSLAM reads: size, distortion and K.
+/// sensor_msgs.CameraInfo, keeping what dimSLAM reads: size, distortion model and coefficients, and K.
 pub fn camera_info(buf: &[u8]) -> Result<CameraModel> {
     let mut r = Reader::message(buf);
     let distortion_length = r.i32()?;
     let (timestamp_ns, frame_id) = r.header()?;
     let height = r.i32()?;
     let width = r.i32()?;
-    let _model = r.string()?;
+    let distortion_model = r.string()?;
     let distortion = (0..distortion_length)
         .map(|_| r.f64())
         .collect::<Result<Vec<_>>>()?;
@@ -217,6 +217,7 @@ pub fn camera_info(buf: &[u8]) -> Result<CameraModel> {
         frame_id,
         width,
         height,
+        distortion_model,
         distortion,
         intrinsics,
     })

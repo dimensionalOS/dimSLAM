@@ -737,13 +737,13 @@ impl CuvslamCore {
         self.rig_from_base = Some(base_from_rig.inverse());
         self.covariance_adjoint = se3_adjoint(&base_from_rig);
 
-        let cameras: Vec<CameraParams> = self
+        let cameras: Result<Vec<CameraParams>, String> = self
             .cameras
             .iter()
             .map(|rig_camera| {
                 let info = &rig_camera.info;
-                let (distortion_model, distortion_parameters) = to_distortion(info);
-                CameraParams {
+                let (distortion_model, distortion_parameters) = to_distortion(info)?;
+                Ok(CameraParams {
                     width: info.width,
                     height: info.height,
                     principal: [info.intrinsics[2] as f32, info.intrinsics[5] as f32],
@@ -751,9 +751,18 @@ impl CuvslamCore {
                     rig_from_camera: to_cuv_pose(&rig_camera.rig_from_camera),
                     distortion_model,
                     distortion_parameters,
-                }
+                })
             })
             .collect();
+        let cameras = match cameras {
+            Ok(cameras) => cameras,
+            Err(message) => {
+                // camera_info is fixed once the rig is, so a retry would only repeat this.
+                self.tracker_unbuildable = true;
+                error!(error = %message, "cuvslam tracker not built; this module will not publish odometry");
+                return;
+            }
+        };
 
         let mut imu_calibration = None;
         if self.config.enable_imu {
