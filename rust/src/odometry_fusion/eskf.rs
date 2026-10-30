@@ -189,9 +189,6 @@ impl Default for State {
     }
 }
 
-/// Past this an IMU gap is a dropout, and integrating one held sample across it would invent motion.
-const MAX_INERTIAL_STEP_SECONDS: f64 = 1.0;
-
 #[derive(Clone, Debug, Default)]
 pub struct Filter {
     pub layout: Layout,
@@ -280,8 +277,9 @@ impl Filter {
         }
     }
 
-    /// Moves the state to `time_ns` under the process model: the held IMU sample when there
-    /// is an IMU, constant velocity otherwise. Returns false over an IMU gap, left unbridged.
+    /// Moves the state to `time_ns` under the process model: the held IMU sample over the
+    /// interval it measured, constant velocity past that (a gap in the IMU, where holding the
+    /// sample would invent motion) or with no IMU. Returns false with an IMU but no sample yet.
     pub fn predict_to(&mut self, time_ns: i64) -> bool {
         let dt = (time_ns - self.x.time_ns) as f64 / 1.0e9;
         if dt <= 0.0 {
@@ -297,13 +295,13 @@ impl Filter {
         } else if self.layout.imus == 0 {
             self.predict_constant_velocity(dt);
             true
-        } else if let Some(input) = self
-            .x
-            .input
-            .clone()
-            .filter(|_| dt <= MAX_INERTIAL_STEP_SECONDS)
-        {
-            self.predict_inertial(dt, &input);
+        } else if let Some(input) = self.x.input.clone() {
+            let measured = if input.period > 0.0 { dt.min(input.period) } else { dt };
+            self.predict_inertial(measured, &input);
+            if dt > measured {
+                let coasting = self.coasting_input(&input);
+                self.predict_inertial(dt - measured, &coasting);
+            }
             true
         } else {
             false
@@ -538,6 +536,19 @@ impl Filter {
     }
 
     /// World-frame gravity: the state's when it is one, else straight down.
+    /// The sample a body coasting at constant velocity would read: no acceleration, no turn,
+    /// only the biases; its noise still grows the covariance over the gap.
+    fn coasting_input(&self, held: &ImuInput) -> ImuInput {
+        let biases = &self.x.biases[held.imu];
+        ImuInput {
+            gyro: biases.gyro,
+            accel: self.x.q.inverse() * -self.gravity_vector() + biases.accel,
+            accel_saturated: false,
+            gyro_saturated: false,
+            ..held.clone()
+        }
+    }
+
     pub fn gravity_vector(&self) -> Vector3<f64> {
         if self.layout.gravity_state {
             self.x.gravity
@@ -864,7 +875,8 @@ mod tests {
             accel: Vector3::new(0.0, 0.0, GRAVITY),
             accel_saturated: false,
             gyro_saturated: false,
-            period: 0.005,
+            // The tests step 10 ms at a time.
+            period: 0.01,
         })
     }
 
@@ -976,11 +988,13 @@ mod tests {
     }
 
     #[test]
-    fn an_imu_gap_is_not_bridged_by_one_held_sample() {
+    fn an_imu_gap_holds_the_sample_only_over_its_own_period() {
         let mut filter = level_filter();
         filter.x.input.as_mut().expect("held").accel.x = 1.0;
-        assert!(!filter.predict_to(2_000 * MS));
-        assert_eq!(filter.x.position, Vector3::zeros());
+        assert!(filter.predict_to(2_000 * MS));
+        // 1 m/s^2 for the sample's 10 ms, then coasting at the 10 mm/s it reached.
+        let expected = 0.5 * 0.01 * 0.01 + 0.01 * 1.99;
+        assert!((filter.x.position.x - expected).abs() < 1e-9, "{}", filter.x.position.x);
     }
 
     #[test]

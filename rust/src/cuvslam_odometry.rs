@@ -27,9 +27,6 @@ use cu_vslam_rs::{ffi, CameraParams, ImageRef, Tracker};
 /// cuVSLAM's Track() contract asks for stereo stamps within 1 ms.
 const MAX_PAIR_SKEW_NS: i64 = 1_000_000;
 
-/// A stall long enough to overflow this has outlived any use the buffered IMU had.
-const MAX_PENDING_IMU: usize = 2048;
-
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Stereo,
@@ -515,6 +512,8 @@ impl CuvslamCore {
             self.imu_dropped += 1;
             return;
         }
+        // Kept until the next tracked frame drains it: every sample since the last frame is
+        // the motion cuVSLAM integrates to it. Grows only while the cameras are silent.
         self.pending_imu.push_back(ffi::CuvImuMeasurement {
             timestamp_ns: msg.timestamp_ns,
             linear_accelerations: [
@@ -528,9 +527,6 @@ impl CuvslamCore {
                 msg.angular_velocity.z as f32,
             ],
         });
-        while self.pending_imu.len() > MAX_PENDING_IMU {
-            self.pending_imu.pop_front();
-        }
         self.imu_samples += 1;
     }
 
@@ -705,18 +701,9 @@ impl CuvslamCore {
         Some(DepthChoice::Aligned)
     }
 
-    /// Bumped at every loss of tracking and every reset: poses of different segments share no motion.
+    /// Bumped at every loss of tracking: poses of different segments share no motion.
     pub fn segment(&self) -> u64 {
         self.segment_id
-    }
-
-    /// Drops the tracker; the next frame builds a fresh one (a new segment of odometry).
-    pub fn reset(&mut self) {
-        self.vslam = None;
-        self.last_ts_ns = None;
-        self.previous_raw = None;
-        self.was_tracking = false;
-        self.segment_id += 1;
     }
 
     fn ensure_tracker(&mut self, tf: &dyn TfLookup) {
