@@ -1,0 +1,21 @@
+# Copyright 2026 Dimensional Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "dim_slam_replay"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Replays dimos recordings through dimSLAM on the data clock and scores the output"
+
+[dependencies]
+dim_slam = { path = "../rust" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jpeg-decoder = { version = "0.3", default-features = false }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Its own workspace: the library crate's flake builds without this one.
+[workspace]

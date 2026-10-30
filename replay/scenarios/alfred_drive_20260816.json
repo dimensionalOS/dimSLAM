@@ -1,0 +1,196 @@
+{
+ "name": "alfred_drive_20260816",
+ "description": "Alfred driving 170 s on D455 stereo IR + wheels, no Point-LIO or IMU input (vis_nav); scored against Point-LIO",
+ "recording": "alfred/drive_2026-08-16_23-46-03.db",
+ "duration_seconds": 170.0,
+ "mode": "slam",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom",
+  "map",
+  "visual_odom",
+  "wheel_odom"
+ ],
+ "sources": [
+  {
+   "stream": "wheel_odometry",
+   "frame_id": "wheel_odom",
+   "child_frame_id": "base_link"
+  }
+ ],
+ "images": [
+  "infrared_left",
+  "infrared_right"
+ ],
+ "camera_infos": [
+  "infrared_left_camera_info",
+  "infrared_right_camera_info"
+ ],
+ "reference": {
+  "stream": "odometry",
+  "carry_to": "base_link"
+ },
+ "rest": {
+  "stream": "wheel_odometry",
+  "speed": 0.01,
+  "angular_speed": 0.01,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ },
+ "config": {
+  "camera_mode": "stereo",
+  "cameras": [
+   {
+    "frame_id": "camera_infra1_optical_frame"
+   },
+   {
+    "frame_id": "camera_infra2_optical_frame"
+   }
+  ],
+  "use_gpu": true,
+  "covariance_gate_translation_std": 0.0,
+  "speed_gate_max_linear": 5.0,
+  "speed_gate_max_angular": 12.0,
+  "visual_odom_pose_variances": [
+   0.01,
+   0.01,
+   0.0,
+   0.05,
+   0.05,
+   0.05
+  ],
+  "odom_frame_id": "odom",
+  "output_frame_id": "base_link",
+  "publish_rate": 50.0,
+  "replay_buffer_seconds": 2.0,
+  "outlier_rejection_allowed_variance": 25.0,
+  "max_position_m": 10000.0,
+  "imus": [],
+  "initial_stds": {
+   "position": 0.01,
+   "velocity": 0.1,
+   "rotation": 0.05,
+   "angular_velocity": 0.1,
+   "bias": 0.05
+  },
+  "odom_sources": [
+   {
+    "parent_frame_id": "wheel_odom",
+    "child_frame_id": "base_link",
+    "kind": "pose_delta",
+    "pose_variances": [
+     0.05,
+     0.05,
+     0.001,
+     0.001,
+     0.001,
+     0.0
+    ],
+    "twist_variances": [
+     0.02,
+     0.02,
+     0.0,
+     0.0,
+     0.0,
+     0.05
+    ]
+   }
+  ],
+  "planar": false,
+  "zero_velocity_variances": [
+   0.0,
+   0.0,
+   0.01,
+   0.01,
+   0.01,
+   0.0
+  ]
+ },
+ "variants": {
+  "fixes": {},
+  "blend": {
+   "/no_imu_blend": true
+  },
+  "tuned": {
+   "/visual_odom_pose_variances": [
+    1e-05,
+    1e-05,
+    0.0,
+    1e-05,
+    1e-05,
+    1e-05
+   ],
+   "/odom_sources/0/twist_variances/5": 0.0
+  },
+  "tuned_imm": {
+   "/visual_odom_pose_variances": [
+    1e-05,
+    1e-05,
+    0.0,
+    1e-05,
+    1e-05,
+    1e-05
+   ],
+   "/odom_sources/0/twist_variances/5": 0.0,
+   "/imm": true
+  }
+ },
+ "expect": {
+  "fixes": {
+   "error_mm_mean": {
+    "max": 1800
+   },
+   "error_mm_max": {
+    "max": 5000
+   }
+  },
+  "blend": {
+   "error_mm_mean": {
+    "max": 220
+   },
+   "error_mm_max": {
+    "max": 470
+   }
+  },
+  "tuned": {
+   "error_mm_mean": {
+    "max": 300
+   },
+   "error_mm_max": {
+    "max": 650
+   },
+   "rest_p2p_mm_mean": {
+    "max": 2.0
+   }
+  },
+  "tuned_imm": {
+   "error_mm_mean": {
+    "max": 620
+   },
+   "rest_p2p_mm_mean": {
+    "max": 0.5
+   }
+  }
+ },
+ "baseline": {
+  "note": "beta3 = 4a65da1 (scores identical to fixes); blend = the v0.4.x behavior Alfred runs on dimos main. tuned: vis_nav's variances were blend weights, not noise; as noise they say 10 cm and 13 deg per frame, so vision barely counted and wheel yaw rate drifted the heading.",
+  "beta3": {
+   "error_mm_mean": 1724.56,
+   "error_mm_max": 4829.0,
+   "rest_p2p_mm_mean": 0.18
+  },
+  "blend": {
+   "error_mm_mean": 199.71,
+   "error_mm_max": 432.0
+  },
+  "tuned": {
+   "error_mm_mean": 276.79,
+   "error_mm_max": 601.01,
+   "rest_p2p_mm_mean": 1.45
+  },
+  "tuned_imm": {
+   "error_mm_mean": 569.76,
+   "rest_p2p_mm_mean": 0.0
+  }
+ }
+}
