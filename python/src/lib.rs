@@ -138,7 +138,8 @@ impl ImageFrame {
     }
 }
 
-/// Pinhole intrinsics plus plumb_bob distortion (k1, k2, p1, p2, k3).
+/// Pinhole intrinsics plus distortion: `distortion_model` is camera_info's (plumb_bob,
+/// equidistant or rational_polynomial), its coefficients in that model's ROS order.
 /// `intrinsics` is the row-major 3x3: fx, 0, cx, 0, fy, cy, 0, 0, 1.
 #[pyclass]
 #[derive(Clone)]
@@ -149,7 +150,7 @@ struct CameraModel {
 #[pymethods]
 impl CameraModel {
     #[new]
-    #[pyo3(signature = (timestamp_ns, frame_id, width, height, distortion, intrinsics))]
+    #[pyo3(signature = (timestamp_ns, frame_id, width, height, distortion, intrinsics, distortion_model = String::from("plumb_bob")))]
     fn new(
         timestamp_ns: i64,
         frame_id: String,
@@ -157,6 +158,7 @@ impl CameraModel {
         height: i32,
         distortion: Vec<f64>,
         intrinsics: [f64; 9],
+        distortion_model: String,
     ) -> Self {
         Self {
             inner: RsCameraModel {
@@ -164,6 +166,7 @@ impl CameraModel {
                 frame_id,
                 width,
                 height,
+                distortion_model,
                 distortion,
                 intrinsics,
             },

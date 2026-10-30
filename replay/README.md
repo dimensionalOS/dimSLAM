@@ -21,10 +21,10 @@ Each run writes `out/<scenario>/report.html` (interactive), `metrics.json` and o
 ## Scenarios
 
 A scenario (`scenarios/*.json`) names the recording, which streams feed the core and how
-(`frame_id` overrides, `carry_to` a frame through the recording's tf), the reference the
-output is scored against (never fed in), what counts as rest, the core's config, `variants`
-as JSON-pointer edits of that config (null removes a key), and `expect`: per variant, bounds on
-metrics. `baseline` records what an earlier build scored, which the bounds were set from.
+(`frame_id` overrides, `carry_to` a frame through the recording's tf, a camera_info's
+`distortion_model` when the recording mislabels the lens), the reference the output is scored
+against (never fed in), what counts as rest, the core's config, `variants` as JSON-pointer edits
+of that config (null removes a key), and `expect`: per variant, bounds on metrics. `baseline` records what an earlier build scored, which the bounds were set from.
 
 Metrics:
 - `rest_p2p_mm_mean` / `_max`, `rest_p2p_deg_mean`: the output's extent within each stretch the

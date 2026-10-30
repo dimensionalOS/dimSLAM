@@ -48,7 +48,8 @@ enum Core {
 /// is a measurement of the body's angular velocity.
 struct Camera {
     tracker: CuvslamCore,
-    last: Option<(i64, UnitQuaternion<f64>)>,
+    /// The tracker's segment, stamp and rotation at its last tracked frame.
+    last: Option<(u64, i64, UnitQuaternion<f64>)>,
     /// rad^2: variance of one frame-to-frame rotation, per axis.
     rotation_variance: f64,
 }
@@ -74,7 +75,9 @@ impl Camera {
             lio.rates_rejected_in_a_row = 0;
             return;
         }
-        if let Some((t0, r0)) = self.last {
+        let segment = self.tracker.segment();
+        // Across a loss of tracking the tracker's rotation skips the turn made while it was lost.
+        if let Some((_, t0, r0)) = self.last.filter(|(last_segment, ..)| *last_segment == segment) {
             let dt = (t - t0) as f64 / 1e9;
             if dt > 0.0 {
                 let rate = (r0.inverse() * rotation).scaled_axis() / dt;
@@ -87,7 +90,7 @@ impl Camera {
                 lio.push_rate(middle, rate, self.rotation_variance / (dt * dt));
             }
         }
-        self.last = Some((t, rotation));
+        self.last = Some((segment, t, rotation));
     }
 }
 
@@ -604,6 +607,9 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                         if let Some(frame_id) = scenario.camera_infos[index].frame_id() {
                             info.frame_id = frame_id.to_string();
                         }
+                        if let Some(model) = scenario.camera_infos[index].distortion_model() {
+                            info.distortion_model = model.to_string();
+                        }
                         camera.tracker.handle_camera_info(info, &tf);
                     }
                     if let Core::Slam(core) = &mut core {
@@ -611,6 +617,9 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                         info.timestamp_ns += scenario.camera_infos[index].offset_ns();
                         if let Some(frame_id) = scenario.camera_infos[index].frame_id() {
                             info.frame_id = frame_id.to_string();
+                        }
+                        if let Some(model) = scenario.camera_infos[index].distortion_model() {
+                            info.distortion_model = model.to_string();
                         }
                         core.handle_camera_info(info, &tf);
                     }

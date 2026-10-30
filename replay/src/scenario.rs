@@ -78,6 +78,9 @@ pub enum SensorStream {
         /// s added to every stamp, as `OdometryStream::time_offset_seconds`.
         #[serde(default)]
         time_offset_seconds: f64,
+        /// camera_info only: the lens model, for a recording that mislabels it.
+        #[serde(default)]
+        distortion_model: Option<String>,
     },
 }
 
@@ -93,6 +96,13 @@ impl SensorStream {
         match self {
             SensorStream::Name(_) => None,
             SensorStream::Spec { frame_id, .. } => frame_id.as_deref(),
+        }
+    }
+
+    pub fn distortion_model(&self) -> Option<&str> {
+        match self {
+            SensorStream::Name(_) => None,
+            SensorStream::Spec { distortion_model, .. } => distortion_model.as_deref(),
         }
     }
 
