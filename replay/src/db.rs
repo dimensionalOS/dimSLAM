@@ -29,6 +29,8 @@ pub struct Recording {
     connection: Connection,
     cursors: Vec<Cursor>,
     end_ts: f64,
+    /// s: the newest message the streams hold, the end of the time the recording covers.
+    pub last_ts: f64,
 }
 
 fn quote(identifier: &str) -> String {
@@ -46,7 +48,7 @@ impl Recording {
     ) -> Result<Self, String> {
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let mut first = f64::INFINITY;
+        let (mut first, mut last_ts) = (f64::INFINITY, f64::NEG_INFINITY);
         for name in streams {
             let codec: String = connection
                 .query_row(
@@ -67,6 +69,12 @@ impl Recording {
                 })
                 .map_err(|error| error.to_string())?;
             first = first.min(ts.unwrap_or(f64::INFINITY));
+            let newest: Option<f64> = connection
+                .query_row(&format!("SELECT MAX(ts) FROM {}", quote(name)), [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| error.to_string())?;
+            last_ts = last_ts.max(newest.unwrap_or(f64::NEG_INFINITY));
         }
         let start = first + start_s;
         // Cursors resume after (last_ts, last_id); id i64::MIN keeps records stamped exactly at
@@ -90,6 +98,7 @@ impl Recording {
             connection,
             cursors,
             end_ts,
+            last_ts,
         })
     }
 

@@ -451,6 +451,7 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
     });
     let mut next_tick: Option<i64> = None;
     let (mut first_ts, mut last_ts) = (f64::NAN, f64::NAN);
+    let recording_end_ns = (recording.last_ts * 1e9) as i64;
     let mut turns = TurnCache::open(&scenario.name, !scenario.images.is_empty(), options)?;
     let mut scans_given = 0u64;
     let started = Instant::now();
@@ -478,10 +479,10 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
                     (record.ts * 1e9) as i64 + scenario.camera_infos[index].offset_ns()
                 }
             };
-            // A stamp later than the message's own arrival is on another clock (a driver
-            // glitch) and must not drag the publish timer with it; the core decides what to do
-            // with it.
-            let off_clock = stamp > (record.ts * 1e9) as i64;
+            // A stamp past the end of the time the recording covers is on another clock (a
+            // driver glitch) and must not drag the publish timer with it; the core decides what
+            // to do with it.
+            let off_clock = stamp > recording_end_ns;
             // Publish every tick the data clock has passed, as the live module's timer would.
             if !off_clock && !matches!(role, Role::Reference | Role::Baseline(_) | Role::Rest) {
                 let tick = next_tick.get_or_insert(stamp);
