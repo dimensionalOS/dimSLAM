@@ -76,10 +76,10 @@ impl Camera {
 }
 
 impl Core {
-    fn source(&mut self, msg: &OdometryEstimate) {
+    fn source(&mut self, msg: &OdometryEstimate, tf: &TfBuffer) {
         match self {
             Core::Fusion(core) => core.handle_source(msg),
-            Core::Slam(core) => core.handle_source(msg),
+            Core::Slam(core) => core.handle_source(msg, tf),
             Core::Lio(..) => {}
         }
     }
@@ -496,7 +496,7 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
             match role {
                 Role::Source(index) => {
                     match remap(&scenario.sources[index], lcm::odometry(&record.data)?, &tf) {
-                        Ok(msg) => core.source(&msg),
+                        Ok(msg) => core.source(&msg, &tf),
                         Err(why) => run.dropped.push(why),
                     }
                 }
@@ -528,7 +528,7 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
                     if let (Some(lio), Some(spec)) = (lio_source.as_mut(), &scenario.lio_source) {
                         lio.push_scan(&scan);
                         for msg in lio_messages(lio, &spec.frame_id, &output_frame) {
-                            core.source(&msg);
+                            core.source(&msg, &tf);
                         }
                         continue;
                     }
@@ -551,7 +551,7 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
                             sample.linear_acceleration / STANDARD_GRAVITY,
                         );
                         for msg in lio_messages(lio, &spec.frame_id, &output_frame) {
-                            core.source(&msg);
+                            core.source(&msg, &tf);
                         }
                     }
                     match &mut core {

@@ -10,7 +10,7 @@ cargo run --release -- scenarios/r1_nav_20261015.json --variant imm --out out
 cargo test --release                               # every scenario whose recording is here
 ```
 
-Recordings stay out of git. They are found under `$DIMSLAM_DATASETS` (default `~/datasets`), and
+Recordings stay out of git. They are found under `--datasets DIR` (default `~/datasets`), and
 a scenario whose recording is missing is skipped. `slam` scenarios run cuVSLAM, so they need
 `CUVSLAM_SDK_DIR` (and on macOS `CUMETAL_PREBUILT_CACHE_DIR=$CUVSLAM_SDK_DIR/share/cumetal-cache`)
 set at build and run time; without them the test skips them.
