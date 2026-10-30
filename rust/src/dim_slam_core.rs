@@ -390,18 +390,20 @@ impl DimSlamCore {
 
     /// An external odometry source's estimate, told apart by the transform it carries. With the
     /// point_lio engine, its steps are the body's velocity, so its pose must be the output frame's.
-    pub fn handle_source(&mut self, msg: &OdometryEstimate) {
+    /// With the point_lio engine, the source's pose is carried to the output frame through `tf`
+    /// (its steps are then the output frame's velocity).
+    pub fn handle_source(&mut self, msg: &OdometryEstimate, tf: &dyn TfLookup) {
         if let Some(lio) = &mut self.point_lio {
-            if msg.child_frame_id != self.output_frame_id {
+            let Some(carried) = carried_to(msg, &self.output_frame_id, tf) else {
                 warn_throttled!(
                     std::time::Duration::from_secs(10),
                     child_frame = %msg.child_frame_id,
                     output_frame = %self.output_frame_id,
-                    "odometry source dropped: the point_lio engine needs it carried to the output frame",
+                    "odometry source dropped: tf does not place its frame relative to the output frame",
                 );
                 return;
-            }
-            lio.step_velocity(msg);
+            };
+            lio.step_velocity(&carried);
             lio.drain(&self.odom_frame_id, &self.output_frame_id);
             return;
         }
@@ -445,5 +447,48 @@ impl DimSlamCore {
             Some(_) => {}
             None => self.fusion.handle_source(&estimate),
         }
+    }
+}
+
+/// `msg` with its pose carried from its child frame to `frame` (a fixed mount, read off `tf`):
+/// odom_from_frame = odom_from_child * child_from_frame.
+fn carried_to(msg: &OdometryEstimate, frame: &str, tf: &dyn TfLookup) -> Option<OdometryEstimate> {
+    if msg.child_frame_id == frame {
+        return Some(msg.clone());
+    }
+    let child_from_frame = tf.latest(&msg.child_frame_id, frame)?;
+    Some(OdometryEstimate {
+        child_frame_id: frame.to_string(),
+        pose: msg.pose * child_from_frame,
+        ..msg.clone()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::{Isometry3, Translation3, UnitQuaternion, Vector3};
+
+    #[test]
+    fn a_source_in_another_frame_is_carried_to_the_output_frame() {
+        // The wheel odometry reports base_link; the output is an IMU 0.2 m ahead of it.
+        let tf = |parent: &str, child: &str| {
+            (parent == "base_link" && child == "imu")
+                .then(|| Isometry3::from_parts(Translation3::new(0.2, 0.0, 0.0), UnitQuaternion::identity()))
+        };
+        let msg = OdometryEstimate {
+            child_frame_id: "base_link".to_string(),
+            // Turned 90 degrees left at (1, 0): the IMU sits 0.2 m along the base's new heading.
+            pose: Isometry3::from_parts(
+                Translation3::new(1.0, 0.0, 0.0),
+                UnitQuaternion::from_axis_angle(&Vector3::z_axis(), std::f64::consts::FRAC_PI_2),
+            ),
+            ..Default::default()
+        };
+        let carried = carried_to(&msg, "imu", &tf).expect("tf places base_link");
+        assert_eq!(carried.child_frame_id, "imu");
+        assert!((carried.pose.translation.vector - Vector3::new(1.0, 0.2, 0.0)).norm() < 1e-12);
+        assert!(carried_to(&msg, "camera", &tf).is_none());
+        assert_eq!(carried_to(&msg, "base_link", &tf).expect("same frame").pose, msg.pose);
     }
 }
