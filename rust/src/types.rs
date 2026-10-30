@@ -28,7 +28,9 @@ pub struct CameraModel {
     pub frame_id: String,
     pub width: i32,
     pub height: i32,
-    /// `plumb_bob` ordering is assumed: k1, k2, p1, p2, k3.
+    /// camera_info's distortion_model: `plumb_bob` (k1, k2, p1, p2[, k3]), `equidistant` (k1..k4)
+    /// or `rational_polynomial` (k1, k2, p1, p2, k3..k6). Empty reads as `plumb_bob`.
+    pub distortion_model: String,
     pub distortion: Vec<f64>,
     /// Row-major 3x3 intrinsics: fx, 0, cx, 0, fy, cy, 0, 0, 1.
     pub intrinsics: [f64; 9],
