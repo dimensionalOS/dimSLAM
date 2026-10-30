@@ -25,10 +25,6 @@ use crate::warn_throttled;
 /// the tracker's estimates apart from the other sources inside the filter.
 const VISUAL_ODOM_FRAME_ID: &str = "visual_odom";
 
-/// Turns in a row the LIO refuses before the tracker is rebuilt (~1 s at 15 Hz): mono cuVSLAM
-/// can freeze without reporting itself lost.
-const REFUSED_TURNS: u32 = 15;
-
 /// Point-LIO as the lidar-inertial filter, in place of the fusion core's; the tracker's
 /// frame-to-frame turn is fused into it as a measurement of the body's angular velocity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -95,15 +91,10 @@ impl PointLioEngine {
     }
 
     /// The tracker's turn since its last frame, over the interval, as an angular-velocity
-    /// measurement. False when the LIO has refused so many in a row that the tracker is stuck.
-    fn turn(&mut self, tracked: &OdometryEstimate, segment: u64) -> bool {
+    /// measurement.
+    fn turn(&mut self, tracked: &OdometryEstimate, segment: u64) {
         let (t, rotation) = (tracked.timestamp_ns, tracked.pose.rotation);
-        let Some(variance) = self.rotation_variance else { return true };
-        if self.odometry.rates_rejected_in_a_row >= REFUSED_TURNS {
-            self.odometry.rates_rejected_in_a_row = 0;
-            self.last_turn = None;
-            return false;
-        }
+        let Some(variance) = self.rotation_variance else { return };
         // Across a loss of tracking the tracker's rotation skips the turn made while it was lost.
         if let Some((_, t0, r0)) = self.last_turn.filter(|(last_segment, ..)| *last_segment == segment) {
             let dt = (t - t0) as f64 / 1e9;
@@ -114,7 +105,6 @@ impl PointLioEngine {
             }
         }
         self.last_turn = Some((segment, t, rotation));
-        true
     }
 
     /// An odometry source's step since its last message, over the interval, as a measurement of
@@ -449,14 +439,7 @@ impl DimSlamCore {
         // A tracker's first estimate can come back unstamped.
         match &mut self.point_lio {
             Some(lio) if estimate.timestamp_ns != 0 => {
-                if !lio.turn(&estimate, segment) {
-                    warn_throttled!(
-                        std::time::Duration::from_secs(10),
-                        refused = REFUSED_TURNS,
-                        "the LIO refused the tracker's turns: rebuilding the tracker",
-                    );
-                    self.visual_odometry.reset();
-                }
+                lio.turn(&estimate, segment);
                 lio.drain(&self.odom_frame_id, &self.output_frame_id);
             }
             Some(_) => {}

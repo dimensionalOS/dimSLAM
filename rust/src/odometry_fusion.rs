@@ -30,10 +30,6 @@ pub use scan_sync::{header_seconds, Level, ScanSync, SyncedScan, STANDARD_GRAVIT
 
 const NS_PER_SEC: i64 = 1_000_000_000;
 
-/// Raw gyro differences are too noisy for the tangential lever-arm term. A time constant, not
-/// a per-sample weight, so the cutoff does not move with IMU rate.
-const ANGULAR_ACCEL_TIME_CONSTANT: f64 = 0.025;
-
 /// A non-finite or non-positive variance drops the dimension rather than being divided by.
 fn resolve_variance(configured: f64, from_message: f64) -> f64 {
     let variance = if configured < 0.0 {
@@ -317,7 +313,19 @@ struct SourceRuntime {
     /// `no_imu_blend`: the fused pose at its previous message, its last stamp and its shares.
     blend_anchor: Option<Isometry3<f64>>,
     blend_last_ns: i64,
+    /// The gap between its last two messages, ns: its own rate, to tell a silence by.
+    blend_interval_ns: i64,
     blend_inverse_variance: [f64; 6],
+}
+
+impl SourceRuntime {
+    /// Silent at `ts_ns`: never heard, or overdue by at least one whole message (the gap rounds
+    /// to two or more of its own intervals).
+    fn blend_silent(&self, ts_ns: i64) -> bool {
+        self.blend_last_ns == 0
+            || (self.blend_interval_ns > 0
+                && 2 * (ts_ns - self.blend_last_ns) > 3 * self.blend_interval_ns)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -329,9 +337,6 @@ struct PreviousPose {
     /// Gated as a jump: one more message that moves on from it confirms the jump.
     jumped: bool,
 }
-
-/// A source keeps its share of the no-IMU blend until it has been silent this long.
-const BLEND_ACTIVITY_TIMEOUT_SECONDS: f64 = 0.5;
 
 // The snapshot alongside the kind dwarfs any variant, so boxing buys nothing.
 #[allow(clippy::large_enum_variant)]
@@ -549,9 +554,9 @@ impl FusionCore {
             if runtime.lever_gyro_ns != 0 {
                 let dt = (ts_ns - runtime.lever_gyro_ns) as f64 / NS_PER_SEC as f64;
                 if dt > 0.0 {
-                    let raw_alpha = (gyro - runtime.lever_gyro) / dt;
-                    let blend = 1.0 - (-dt / ANGULAR_ACCEL_TIME_CONSTANT).exp();
-                    runtime.lever_alpha += (raw_alpha - runtime.lever_alpha) * blend;
+                    // Unsmoothed: its noise telescopes once integrated (the velocity it adds
+                    // over any span is the change in gyro across it, times the lever).
+                    runtime.lever_alpha = (gyro - runtime.lever_gyro) / dt;
                 }
             }
             runtime.lever_gyro = gyro;
@@ -1321,13 +1326,7 @@ impl FusionCore {
         // Logs once per event, not again each time a late arrival replays it.
         let replaying = index + 1 < self.events.len();
         let ts_ns = self.events[index].ts_ns;
-        if !self.filter.predict_to(ts_ns) && !replaying {
-            warn_throttled!(
-                std::time::Duration::from_secs(10),
-                "imu gap over a second left unbridged: the pose held through it. Check the \
-                 IMU stream.",
-            );
-        }
+        self.filter.predict_to(ts_ns);
         let kind = self.events[index].kind.clone();
         match kind {
             EventKind::Seed => {}
@@ -1571,9 +1570,12 @@ impl FusionCore {
     /// exactly.
     fn blend(&mut self, measurement: &Measurement, ts_ns: i64) {
         let source = measurement.source;
-        let horizon = ts_ns - (BLEND_ACTIVITY_TIMEOUT_SECONDS * 1.0e9) as i64;
-        let returning = self.sources[source].blend_last_ns < horizon;
-        self.sources[source].blend_last_ns = ts_ns;
+        let returning = self.sources[source].blend_silent(ts_ns);
+        let runtime = &mut self.sources[source];
+        if runtime.blend_last_ns != 0 {
+            runtime.blend_interval_ns = ts_ns - runtime.blend_last_ns;
+        }
+        runtime.blend_last_ns = ts_ns;
         for dim in 0..6 {
             let variance = measurement.pose_variance[dim];
             self.sources[source].blend_inverse_variance[dim] =
@@ -1604,7 +1606,7 @@ impl FusionCore {
             let total: f64 = self
                 .sources
                 .iter()
-                .filter(|other| other.blend_last_ns >= horizon)
+                .filter(|other| !other.blend_silent(ts_ns))
                 .map(|other| other.blend_inverse_variance[dim])
                 .sum();
             if total > 0.0 {

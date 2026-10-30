@@ -107,8 +107,6 @@ pub struct LioOdometry {
     scans_pushed: u64,
     /// Motion measured by other sensors, oldest first.
     measured: VecDeque<Measured>,
-    /// Measured rates the filter refused since it last took one.
-    pub rates_rejected_in_a_row: u32,
     /// The state's angular velocity and body-frame velocity at the instants measurements were
     /// last checked for (s, rad/s, m/s), reaching back to the newest one taken: what a late
     /// measurement is measured against.
@@ -161,7 +159,6 @@ impl LioOdometry {
             thinned: Vec::new(),
             scans_pushed: 0,
             measured: VecDeque::new(),
-            rates_rejected_in_a_row: 0,
             motion_history: VecDeque::new(),
             measured_pushed: false,
             rate_residuals: Vec::new(),
@@ -256,11 +253,7 @@ impl LioOdometry {
                         (rate - self.filter.x.angular_velocity).norm() / (3.0 * variance).sqrt();
                     let median = insert_sorted_median(&mut self.rate_residuals, residual);
                     let variance = variance * (1.4826 * median).powi(2).max(1.0);
-                    if self.filter.update_angular_velocity(&rate, variance) {
-                        self.rates_rejected_in_a_row = 0;
-                    } else {
-                        self.rates_rejected_in_a_row += 1;
-                    }
+                    self.filter.update_angular_velocity(&rate, variance);
                 }
                 Motion::Velocity(mut velocity) => {
                     let body = self.body_velocity();
