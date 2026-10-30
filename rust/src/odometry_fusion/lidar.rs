@@ -232,7 +232,8 @@ fn cube_means(points: &[SurfacePoint], leaf: f32) -> Vec<SurfacePoint> {
         }
     }
     let span = |axis: usize| ((high[axis] - low[axis]) * inverse) as i64 + 1;
-    if span(0) * span(1) * span(2) > i64::from(i32::MAX) {
+    // Saturating: a far stray point spans enough cubes to overflow even i64.
+    if span(0).saturating_mul(span(1)).saturating_mul(span(2)) > i64::from(i32::MAX) {
         return points.to_vec();
     }
     let first: [i32; 3] = std::array::from_fn(|axis| (low[axis] * inverse).floor() as i32);
