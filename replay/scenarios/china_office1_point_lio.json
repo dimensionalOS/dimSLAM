@@ -60,6 +60,9 @@
   "accel_clip_g": 4.0
  },
  "variants": {
-  "point_lio": {}
+  "default": {},
+  "clip3": {
+   "/accel_clip_g": null
+  }
  }
 }
