@@ -33,6 +33,8 @@
 //!     ..Default::default()
 //! })
 //! .expect("a usable config");
+//! // Mounts come from tf; the fusion engine does not need any here.
+//! let tf = |_: &str, _: &str| -> Option<Isometry3<f64>> { None };
 //! for step in 0..=50 {
 //!     slam.handle_source(&OdometryEstimate {
 //!         timestamp_ns: step * 20_000_000,
@@ -40,7 +42,7 @@
 //!         child_frame_id: "base_link".into(),
 //!         twist: Twist { linear: Vector3::new(0.5, 0.0, 0.0), angular: Vector3::zeros() },
 //!         ..Default::default()
-//!     });
+//!     }, &tf);
 //! }
 //! let estimate = slam.maybe_publish().expect("a publish period has elapsed");
 //! assert!((estimate.pose.translation.x - 0.5).abs() < 0.05);
