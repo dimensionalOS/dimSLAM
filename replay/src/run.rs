@@ -17,9 +17,6 @@ use crate::scenario::{Mode, OdometryStream, Scenario};
 use crate::tf::TfBuffer;
 use crate::ReplayOptions;
 
-/// A sensor stamp this far past the replay's clock is not on it.
-const MAX_CLOCK_JUMP_NS: i64 = 5_000_000_000;
-
 pub struct Run {
     pub variant: String,
     /// The core's output at each publish tick, ns.
@@ -54,10 +51,6 @@ struct Camera {
     rotation_variance: f64,
 }
 
-/// Rates in a row the filter refuses before the tracker is rebuilt (~1 s at 15 Hz): mono
-/// cuVSLAM can freeze without reporting itself lost.
-const REJECTED_FRAMES: u32 = 15;
-
 impl Camera {
     fn image(&mut self, lio: &mut LioOdometry, image: ImageFrame, tf: &TfBuffer) {
         let Some(estimate) = self.tracker.handle_image(image, tf) else {
@@ -66,13 +59,6 @@ impl Camera {
         let (t, rotation) = (estimate.timestamp_ns, estimate.pose.rotation);
         // A tracker's first estimate can come back unstamped.
         if t == 0 {
-            return;
-        }
-        if lio.rates_rejected_in_a_row >= REJECTED_FRAMES {
-            eprintln!("cuvslam disagreed with the filter for {REJECTED_FRAMES} frames: rebuilding the tracker");
-            self.tracker.reset();
-            self.last = None;
-            lio.rates_rejected_in_a_row = 0;
             return;
         }
         let segment = self.tracker.segment();
@@ -492,10 +478,10 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
                     (record.ts * 1e9) as i64 + scenario.camera_infos[index].offset_ns()
                 }
             };
-            // A stamp far ahead of the clock so far is on another clock (a driver glitch) and
-            // must not drag the publish timer with it; the core decides what to do with it.
-            let off_clock = next_tick
-                .is_some_and(|tick| stamp - tick > MAX_CLOCK_JUMP_NS);
+            // A stamp later than the message's own arrival is on another clock (a driver
+            // glitch) and must not drag the publish timer with it; the core decides what to do
+            // with it.
+            let off_clock = stamp > (record.ts * 1e9) as i64;
             // Publish every tick the data clock has passed, as the live module's timer would.
             if !off_clock && !matches!(role, Role::Reference | Role::Baseline(_) | Role::Rest) {
                 let tick = next_tick.get_or_insert(stamp);
