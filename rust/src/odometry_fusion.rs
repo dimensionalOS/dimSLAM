@@ -313,18 +313,21 @@ struct SourceRuntime {
     /// `no_imu_blend`: the fused pose at its previous message, its last stamp and its shares.
     blend_anchor: Option<Isometry3<f64>>,
     blend_last_ns: i64,
-    /// The gap between its last two messages, ns: its own rate, to tell a silence by.
-    blend_interval_ns: i64,
+    /// Its first stamp and message count: its mean interval, to tell a silence by.
+    blend_first_ns: i64,
+    blend_messages: i64,
     blend_inverse_variance: [f64; 6],
 }
 
 impl SourceRuntime {
     /// Silent at `ts_ns`: never heard, or overdue by at least one whole message (the gap rounds
-    /// to two or more of its own intervals).
+    /// to two or more of its mean interval).
     fn blend_silent(&self, ts_ns: i64) -> bool {
-        self.blend_last_ns == 0
-            || (self.blend_interval_ns > 0
-                && 2 * (ts_ns - self.blend_last_ns) > 3 * self.blend_interval_ns)
+        if self.blend_messages == 0 {
+            return true;
+        }
+        let spanned = self.blend_last_ns - self.blend_first_ns;
+        spanned > 0 && 2 * (ts_ns - self.blend_last_ns) * (self.blend_messages - 1) > 3 * spanned
     }
 }
 
@@ -1572,9 +1575,10 @@ impl FusionCore {
         let source = measurement.source;
         let returning = self.sources[source].blend_silent(ts_ns);
         let runtime = &mut self.sources[source];
-        if runtime.blend_last_ns != 0 {
-            runtime.blend_interval_ns = ts_ns - runtime.blend_last_ns;
+        if runtime.blend_messages == 0 {
+            runtime.blend_first_ns = ts_ns;
         }
+        runtime.blend_messages += 1;
         runtime.blend_last_ns = ts_ns;
         for dim in 0..6 {
             let variance = measurement.pose_variance[dim];
