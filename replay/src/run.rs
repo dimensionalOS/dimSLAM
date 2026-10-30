@@ -139,7 +139,21 @@ impl Core {
         }
     }
 
-    fn cloud(&mut self, scan: &LidarScan, tf: &TfBuffer, output_frame: &str) -> Result<(), String> {
+    /// `scans_before`: how many scans this run already gave the core.
+    fn cloud(
+        &mut self,
+        scan: &LidarScan,
+        tf: &TfBuffer,
+        output_frame: &str,
+        scans_before: u64,
+    ) -> Result<(), String> {
+        // One point of one scan dropped: a run that differs by nothing physical, to see
+        // how far a chaotic filter's outcome spreads.
+        let perturbed = match perturbation() {
+            Some(seed) if scans_before == perturbed_scan() => Some(drop_point(scan, seed)),
+            _ => None,
+        };
+        let scan = perturbed.as_ref().unwrap_or(scan);
         match self {
             Core::Fusion(core) => {
                 let mount = tf
@@ -148,28 +162,7 @@ impl Core {
                 core.handle_cloud(scan, &mount);
             }
             Core::Slam(core) => core.handle_cloud(scan, tf),
-            Core::Lio(lio, _) => match perturbation() {
-                // One point of the 9th scan dropped: a run that differs by nothing physical,
-                // to see how far a chaotic filter's outcome spreads.
-                Some(seed) if lio.scans_pushed() == 8 => {
-                    let mut scan = scan.clone();
-                    if !scan.points.is_empty() {
-                        let i = (seed as usize) % scan.points.len();
-                        if scan.offsets_ns.len() > i {
-                            scan.offsets_ns.remove(i);
-                        }
-                        scan.points.remove(i);
-                        if scan.tags.len() > i {
-                            scan.tags.remove(i);
-                        }
-                        if scan.intensities.len() > i {
-                            scan.intensities.remove(i);
-                        }
-                    }
-                    lio.push_scan(&scan);
-                }
-                _ => lio.push_scan(scan),
-            },
+            Core::Lio(lio, _) => lio.push_scan(scan),
         }
         Ok(())
     }
@@ -214,7 +207,31 @@ fn lio_messages(lio: &mut LioOdometry, frame_id: &str, child: &str) -> Vec<Odome
     out
 }
 
-/// `REPLAY_PERTURB_SEED`: which point the 9th scan loses in `point_lio` mode.
+fn drop_point(scan: &LidarScan, seed: u64) -> LidarScan {
+    let mut scan = scan.clone();
+    if !scan.points.is_empty() {
+        // Spread over the scan: its first points are often zero-range, which the LIO drops anyway.
+        let i = (seed.wrapping_mul(2_654_435_761) as usize) % scan.points.len();
+        if scan.offsets_ns.len() > i {
+            scan.offsets_ns.remove(i);
+        }
+        scan.points.remove(i);
+        if scan.tags.len() > i {
+            scan.tags.remove(i);
+        }
+        if scan.intensities.len() > i {
+            scan.intensities.remove(i);
+        }
+    }
+    scan
+}
+
+/// `REPLAY_PERTURB_SCAN`: which scan (0-based, default 8) loses a point.
+fn perturbed_scan() -> u64 {
+    std::env::var("REPLAY_PERTURB_SCAN").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+}
+
+/// `REPLAY_PERTURB_SEED`: which point the perturbed scan loses.
 fn perturbation() -> Option<u64> {
     std::env::var("REPLAY_PERTURB_SEED").ok()?.parse().ok()
 }
@@ -466,6 +483,8 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
     });
     let mut next_tick: Option<i64> = None;
     let (mut first_ts, mut last_ts) = (f64::NAN, f64::NAN);
+    let mut turns = TurnCache::open(&scenario.name, !scenario.images.is_empty())?;
+    let mut scans_given = 0u64;
     let started = Instant::now();
     while let Some(record) = recording.next_record()? {
         if first_ts.is_nan() {
@@ -545,9 +564,10 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                         }
                         continue;
                     }
-                    if let Err(why) = core.cloud(&scan, &tf, &output_frame) {
+                    if let Err(why) = core.cloud(&scan, &tf, &output_frame, scans_given) {
                         run.dropped.push(why);
                     }
+                    scans_given += 1;
                     core.drain(&mut run.fused);
                 }
                 Role::Imu(index) => {
@@ -592,12 +612,23 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
                         core.drain(&mut run.fused);
                     }
                     if let Core::Slam(core) = &mut core {
+                        if let Some(played) = turns.played.as_mut() {
+                            let (tracked, segment) = played
+                                .pop_front()
+                                .ok_or("the turn cache has fewer frames than the recording")?;
+                            core.handle_tracked(tracked, segment);
+                            continue;
+                        }
                         let mut image = lcm::image(&record.data)?;
                         image.timestamp_ns += scenario.images[index].offset_ns();
                         if let Some(frame_id) = scenario.images[index].frame_id() {
                             image.frame_id = frame_id.to_string();
                         }
-                        core.handle_image(image, &tf);
+                        let (tracked, segment) = core.track_image(image, &tf);
+                        if let Some(recorded) = turns.recorded.as_mut() {
+                            recorded.push(turn_line(tracked.as_ref(), segment));
+                        }
+                        core.handle_tracked(tracked, segment);
                     }
                 }
                 Role::CameraInfo(index) => {
@@ -627,9 +658,79 @@ pub fn run(scenario: &Scenario, variant: &str, datasets: &Path) -> Result<Run, S
             }
         }
     }
+    turns.finish()?;
     run.wall_seconds = started.elapsed().as_secs_f64();
     run.data_seconds = last_ts - first_ts;
     core.report();
     run.dropped.dedup();
     Ok(run)
+}
+
+/// The tracker's output per image, so the fusion can be rerun without the tracker (which is
+/// slow, needs a GPU build, and is not repeatable run to run). `DIMSLAM_TURNS_RECORD=<dir>`
+/// writes `<dir>/<scenario>.jsonl` (once: an existing file is kept); `DIMSLAM_TURNS_PLAY=<dir>`
+/// feeds it back in place of the images.
+struct TurnCache {
+    played: Option<std::collections::VecDeque<(Option<OdometryEstimate>, u64)>>,
+    recorded: Option<Vec<String>>,
+    record_to: Option<std::path::PathBuf>,
+}
+
+impl TurnCache {
+    /// A scenario without images has nothing to cache.
+    fn open(scenario: &str, has_images: bool) -> Result<Self, String> {
+        let file = |var: &str| {
+            std::env::var_os(var).map(|dir| Path::new(&dir).join(format!("{scenario}.jsonl")))
+        };
+        let played = match file("DIMSLAM_TURNS_PLAY").filter(|_| has_images) {
+            Some(path) => {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("turn cache {}: {e}", path.display()))?;
+                Some(text.lines().map(parse_turn_line).collect::<Result<_, _>>()?)
+            }
+            None => None,
+        };
+        let record_to =
+            file("DIMSLAM_TURNS_RECORD").filter(|path| has_images && !path.exists());
+        let recorded = record_to.as_ref().map(|_| Vec::new());
+        Ok(Self { played, recorded, record_to })
+    }
+
+    fn finish(self) -> Result<(), String> {
+        if let Some(left) = self.played.as_ref().filter(|left| !left.is_empty()) {
+            return Err(format!("the turn cache has {} frames past the recording", left.len()));
+        }
+        if let (Some(path), Some(lines)) = (self.record_to, self.recorded) {
+            std::fs::write(&path, lines.join("\n") + "\n")
+                .map_err(|e| format!("turn cache {}: {e}", path.display()))?;
+        }
+        Ok(())
+    }
+}
+
+/// Only what a turn reads: the stamp, the rotation and the segment.
+fn turn_line(tracked: Option<&OdometryEstimate>, segment: u64) -> String {
+    let estimate = tracked.map(|estimate| {
+        let q = estimate.pose.rotation.quaternion();
+        serde_json::json!([estimate.timestamp_ns, q.w, q.i, q.j, q.k])
+    });
+    serde_json::json!({ "segment": segment, "estimate": estimate }).to_string()
+}
+
+fn parse_turn_line(line: &str) -> Result<(Option<OdometryEstimate>, u64), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| format!("turn cache line: {e}"))?;
+    let segment = value["segment"].as_u64().ok_or("turn cache line: no segment")?;
+    let estimate = value["estimate"].as_array().map(|fields| {
+        let at = |i: usize| fields[i].as_f64().unwrap_or(0.0);
+        OdometryEstimate {
+            timestamp_ns: fields[0].as_i64().unwrap_or(0),
+            pose: Isometry3::from_parts(
+                Translation3::identity(),
+                UnitQuaternion::new_unchecked(Quaternion::new(at(1), at(2), at(3), at(4))),
+            ),
+            ..Default::default()
+        }
+    });
+    Ok((estimate, segment))
 }

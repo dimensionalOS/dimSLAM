@@ -334,6 +334,18 @@ impl DimSlamCore {
         self.fuse(tracked);
     }
 
+    /// The tracker's estimate for an image without fusing it, and the tracking segment it
+    /// belongs to: with `handle_tracked`, lets a caller record the tracker and replay it later.
+    pub fn track_image(&mut self, img: ImageFrame, tf: &dyn TfLookup) -> (Option<OdometryEstimate>, u64) {
+        let tracked = self.visual_odometry.handle_image(img, tf);
+        (tracked, self.visual_odometry.segment())
+    }
+
+    /// Fuses an estimate `track_image` returned, in this run or a recorded one.
+    pub fn handle_tracked(&mut self, tracked: Option<OdometryEstimate>, segment: u64) {
+        self.fuse_segment(tracked, segment);
+    }
+
     /// Returns the range-gated depth cloud, in the depth sensor's own frame, when there is one.
     pub fn handle_depth_image(&mut self, img: ImageFrame, tf: &dyn TfLookup) -> Option<PointCloud> {
         let (cloud, tracked) = self.visual_odometry.handle_depth_image(img, tf);
@@ -428,11 +440,16 @@ impl DimSlamCore {
     }
 
     fn fuse(&mut self, tracked: Option<OdometryEstimate>) {
+        let segment = self.visual_odometry.segment();
+        self.fuse_segment(tracked, segment);
+    }
+
+    fn fuse_segment(&mut self, tracked: Option<OdometryEstimate>, segment: u64) {
         let Some(estimate) = tracked else { return };
         // A tracker's first estimate can come back unstamped.
         match &mut self.point_lio {
             Some(lio) if estimate.timestamp_ns != 0 => {
-                if !lio.turn(&estimate, self.visual_odometry.segment()) {
+                if !lio.turn(&estimate, segment) {
                     warn_throttled!(
                         std::time::Duration::from_secs(10),
                         refused = REFUSED_TURNS,
