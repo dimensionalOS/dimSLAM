@@ -705,6 +705,11 @@ impl CuvslamCore {
         Some(DepthChoice::Aligned)
     }
 
+    /// Bumped at every loss of tracking and every reset: poses of different segments share no motion.
+    pub fn segment(&self) -> u64 {
+        self.segment_id
+    }
+
     /// Drops the tracker; the next frame builds a fresh one (a new segment of odometry).
     pub fn reset(&mut self) {
         self.vslam = None;

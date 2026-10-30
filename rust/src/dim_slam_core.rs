@@ -47,8 +47,8 @@ pub struct PointLioEngineConfig {
 
 struct PointLioEngine {
     odometry: Box<LioOdometry>,
-    /// The tracker's last stamp and rotation, the start of the next turn.
-    last_turn: Option<(i64, UnitQuaternion<f64>)>,
+    /// The tracker's last segment, stamp and rotation, the start of the next turn.
+    last_turn: Option<(u64, i64, UnitQuaternion<f64>)>,
     /// rad^2; until set, by config or by the camera's focal length, turns are not taken.
     rotation_variance: Option<f64>,
     newest: Option<OdometryEstimate>,
@@ -93,7 +93,7 @@ impl PointLioEngine {
 
     /// The tracker's turn since its last frame, over the interval, as an angular-velocity
     /// measurement. False when the LIO has refused so many in a row that the tracker is stuck.
-    fn turn(&mut self, tracked: &OdometryEstimate) -> bool {
+    fn turn(&mut self, tracked: &OdometryEstimate, segment: u64) -> bool {
         let (t, rotation) = (tracked.timestamp_ns, tracked.pose.rotation);
         let Some(variance) = self.rotation_variance else { return true };
         if self.odometry.rates_rejected_in_a_row >= REFUSED_TURNS {
@@ -101,7 +101,8 @@ impl PointLioEngine {
             self.last_turn = None;
             return false;
         }
-        if let Some((t0, r0)) = self.last_turn {
+        // Across a loss of tracking the tracker's rotation skips the turn made while it was lost.
+        if let Some((_, t0, r0)) = self.last_turn.filter(|(last_segment, ..)| *last_segment == segment) {
             let dt = (t - t0) as f64 / 1e9;
             if dt > 0.0 {
                 let rate = (r0.inverse() * rotation).scaled_axis() / dt;
@@ -109,7 +110,7 @@ impl PointLioEngine {
                     .push_rate((t0 + t) as f64 / 2e9, rate, variance / (dt * dt));
             }
         }
-        self.last_turn = Some((t, rotation));
+        self.last_turn = Some((segment, t, rotation));
         true
     }
 }
@@ -394,7 +395,7 @@ impl DimSlamCore {
         // A tracker's first estimate can come back unstamped.
         match &mut self.point_lio {
             Some(lio) if estimate.timestamp_ns != 0 => {
-                if !lio.turn(&estimate) {
+                if !lio.turn(&estimate, self.visual_odometry.segment()) {
                     warn_throttled!(
                         std::time::Duration::from_secs(10),
                         refused = REFUSED_TURNS,
