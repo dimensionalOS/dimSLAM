@@ -105,17 +105,35 @@ pub struct LioOdometry {
     /// The last scan's thinned points, in the IMU frame at their own times.
     pub thinned: Vec<SurfacePoint>,
     scans_pushed: u64,
-    /// Angular velocities measured by other sensors (s, rad/s body, variance), oldest first.
-    rates: VecDeque<(f64, Vector3<f64>, f64)>,
+    /// Motion measured by other sensors, oldest first.
+    measured: VecDeque<Measured>,
     /// Measured rates the filter refused since it last took one.
     pub rates_rejected_in_a_row: u32,
-    /// The state's angular velocity at the instants rates were last checked for (s, rad/s),
-    /// reaching back to the newest rate taken: what a late rate is measured against.
-    turn_history: VecDeque<(f64, Vector3<f64>)>,
-    rates_pushed: bool,
+    /// The state's angular velocity and body-frame velocity at the instants measurements were
+    /// last checked for (s, rad/s, m/s), reaching back to the newest one taken: what a late
+    /// measurement is measured against.
+    motion_history: VecDeque<(f64, Vector3<f64>, Vector3<f64>)>,
+    measured_pushed: bool,
     /// Every taken rate's residual against the state, over the spread its given variance
     /// allows, sorted: their median is how much noisier the sensor is than it was said to be.
     rate_residuals: Vec<f64>,
+    /// Every taken body velocity's residual per axis (m/s), sorted: their median sets its spread.
+    velocity_residuals: Vec<f64>,
+}
+
+/// What another sensor measured, body frame.
+#[derive(Clone, Copy, Debug)]
+enum Motion {
+    /// rad/s, with its variance's floor.
+    Rate(Vector3<f64>, f64),
+    /// m/s.
+    Velocity(Vector3<f64>),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Measured {
+    stamp: f64,
+    motion: Motion,
 }
 
 impl LioOdometry {
@@ -142,11 +160,12 @@ impl LioOdometry {
             used: Vec::new(),
             thinned: Vec::new(),
             scans_pushed: 0,
-            rates: VecDeque::new(),
+            measured: VecDeque::new(),
             rates_rejected_in_a_row: 0,
-            turn_history: VecDeque::new(),
-            rates_pushed: false,
+            motion_history: VecDeque::new(),
+            measured_pushed: false,
             rate_residuals: Vec::new(),
+            velocity_residuals: Vec::new(),
         }
     }
 
@@ -158,46 +177,63 @@ impl LioOdometry {
     /// An angular velocity another sensor measured at `stamp` (s), body frame; taken in time
     /// order with the IMU samples.
     pub fn push_rate(&mut self, stamp: f64, rate: Vector3<f64>, variance: f64) {
-        self.rates.push_back((stamp, rate, variance));
-        self.rates_pushed = true;
+        self.push_measured(stamp, Motion::Rate(rate, variance));
     }
 
-    /// The state's angular velocity at `stamp`, from the history (its oldest entry when
-    /// `stamp` is older still).
-    fn turn_at(&self, stamp: f64) -> Option<Vector3<f64>> {
-        let after = self.turn_history.iter().position(|(t, _)| *t >= stamp);
+    /// The body's velocity another sensor measured at `stamp` (s), m/s in the body frame (legged
+    /// or wheeled odometry); its spread is learned from how far it sits from the state.
+    pub fn push_body_velocity(&mut self, stamp: f64, velocity: Vector3<f64>) {
+        self.push_measured(stamp, Motion::Velocity(velocity));
+    }
+
+    /// Sensors interleave out of order; each one's own order is kept.
+    fn push_measured(&mut self, stamp: f64, motion: Motion) {
+        let at = self.measured.partition_point(|m| m.stamp <= stamp);
+        self.measured.insert(at, Measured { stamp, motion });
+        self.measured_pushed = true;
+    }
+
+    /// The state's angular velocity and body velocity at `stamp`, from the history (its oldest
+    /// entry when `stamp` is older still).
+    fn motion_at(&self, stamp: f64) -> Option<(Vector3<f64>, Vector3<f64>)> {
+        let after = self.motion_history.iter().position(|(t, _, _)| *t >= stamp);
         match after {
-            Some(0) => self.turn_history.front().map(|(_, w)| *w),
+            Some(0) => self.motion_history.front().map(|(_, w, v)| (*w, *v)),
             Some(i) => {
-                let (t0, w0) = self.turn_history[i - 1];
-                let (t1, w1) = self.turn_history[i];
+                let (t0, w0, v0) = self.motion_history[i - 1];
+                let (t1, w1, v1) = self.motion_history[i];
                 let along = if t1 > t0 { (stamp - t0) / (t1 - t0) } else { 1.0 };
-                Some(w0 + (w1 - w0) * along)
+                Some((w0 + (w1 - w0) * along, v0 + (v1 - v0) * along))
             }
-            None => self.turn_history.back().map(|(_, w)| *w),
+            None => self.motion_history.back().map(|(_, w, v)| (*w, *v)),
         }
     }
 
-    /// Takes the measured rates stamped before `until`, each at its own instant. A rate that
-    /// arrives after the state has passed its stamp (a camera's frames trail the IMU) is taken
-    /// at the state's instant, carried there by the state's own change in angular velocity
-    /// since the stamp, so only the sensor's noise is left between the two.
+    fn body_velocity(&self) -> Vector3<f64> {
+        self.filter.x.rotation.transpose() * self.filter.x.velocity
+    }
+
+    /// Takes the measurements stamped before `until`, each at its own instant. One that arrives
+    /// after the state has passed its stamp (a camera's frames trail the IMU) is taken at the
+    /// state's instant, carried there by the state's own change since the stamp, so only the
+    /// sensor's noise is left between the two.
     fn take_rates(&mut self, until: f64) {
-        // Only a LIO given rates keeps the history; it is trimmed as they are taken.
-        if !self.first_scan && self.rates_pushed {
-            self.turn_history
-                .push_back((self.state_at, self.filter.x.angular_velocity));
+        // Only a LIO given measurements keeps the history; it is trimmed as they are taken.
+        if !self.first_scan && self.measured_pushed {
+            let body = self.body_velocity();
+            self.motion_history
+                .push_back((self.state_at, self.filter.x.angular_velocity, body));
         }
-        while self.rates.front().is_some_and(|(stamp, _, _)| *stamp < until) {
-            let (measured_at, mut rate, variance) = self.rates.pop_front().expect("checked");
+        while self.measured.front().is_some_and(|m| m.stamp < until) {
+            let Measured { stamp: measured_at, motion } = self.measured.pop_front().expect("checked");
             if self.first_scan {
                 continue;
             }
             let late_from = (measured_at < self.state_at)
-                .then(|| self.turn_at(measured_at))
+                .then(|| self.motion_at(measured_at))
                 .flatten();
-            while self.turn_history.get(1).is_some_and(|(t, _)| *t <= measured_at) {
-                self.turn_history.pop_front();
+            while self.motion_history.get(1).is_some_and(|(t, _, _)| *t <= measured_at) {
+                self.motion_history.pop_front();
             }
             let stamp = measured_at.max(self.state_at);
             self.filter
@@ -208,20 +244,37 @@ impl LioOdometry {
                 self.covariance_at = stamp;
                 self.filter.predict(since, &self.noise, false, true);
             }
-            if let Some(then) = late_from {
-                rate += self.filter.x.angular_velocity - then;
-            }
-            // The given variance is the sensor's floor; its spread is learned from the residuals'
-            // median absolute value (x1.4826 for a normal's sigma), so outliers don't set it.
-            let residual = (rate - self.filter.x.angular_velocity).norm() / (3.0 * variance).sqrt();
-            let at = self.rate_residuals.partition_point(|r| *r < residual);
-            self.rate_residuals.insert(at, residual);
-            let median = self.rate_residuals[self.rate_residuals.len() / 2];
-            let variance = variance * (1.4826 * median).powi(2).max(1.0);
-            if self.filter.update_angular_velocity(&rate, variance) {
-                self.rates_rejected_in_a_row = 0;
-            } else {
-                self.rates_rejected_in_a_row += 1;
+            match motion {
+                Motion::Rate(mut rate, variance) => {
+                    if let Some((then, _)) = late_from {
+                        rate += self.filter.x.angular_velocity - then;
+                    }
+                    // The given variance is the sensor's floor; its spread is learned from the
+                    // residuals' median absolute value (x1.4826 for a normal's sigma), so
+                    // outliers don't set it.
+                    let residual =
+                        (rate - self.filter.x.angular_velocity).norm() / (3.0 * variance).sqrt();
+                    let median = insert_sorted_median(&mut self.rate_residuals, residual);
+                    let variance = variance * (1.4826 * median).powi(2).max(1.0);
+                    if self.filter.update_angular_velocity(&rate, variance) {
+                        self.rates_rejected_in_a_row = 0;
+                    } else {
+                        self.rates_rejected_in_a_row += 1;
+                    }
+                }
+                Motion::Velocity(mut velocity) => {
+                    let body = self.body_velocity();
+                    if let Some((_, then)) = late_from {
+                        velocity += body - then;
+                    }
+                    // No floor: the spread is the residuals' alone, per axis.
+                    let residual = (velocity - body).norm() / 3f64.sqrt();
+                    let median = insert_sorted_median(&mut self.velocity_residuals, residual);
+                    let variance = (1.4826 * median).powi(2);
+                    if variance > 0.0 {
+                        self.filter.update_body_velocity(&velocity, variance);
+                    }
+                }
             }
         }
     }
@@ -364,6 +417,13 @@ impl LioOdometry {
             .predict(now - self.state_at, &self.noise, true, false);
         self.state_at = now;
     }
+}
+
+/// Inserts `value` into the sorted `values` and returns their median.
+fn insert_sorted_median(values: &mut Vec<f64>, value: f64) -> f64 {
+    let at = values.partition_point(|r| *r < value);
+    values.insert(at, value);
+    values[values.len() / 2]
 }
 
 /// The unit quaternion [x, y, z, w] of a rotation matrix (Shoemake's method).

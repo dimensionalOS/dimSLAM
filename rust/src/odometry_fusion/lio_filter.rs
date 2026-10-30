@@ -383,6 +383,28 @@ impl LioFilter {
         self.x.advance(&step, 1.0);
         true
     }
+
+    /// The body's own velocity (m/s, body frame), such as legged or wheeled odometry over its
+    /// interval, with `variance` per axis. Same 99% gate as a rate.
+    pub fn update_body_velocity(&mut self, velocity: &Vector3<f64>, variance: f64) -> bool {
+        let body = self.x.rotation.transpose() * self.x.velocity;
+        let residual = velocity - body;
+        // Rotation on the right turns the measured vector the other way: d(R^T v)/dtheta = [R^T v]x.
+        let mut h = SMatrix::<f64, 3, STATE_DIM>::zeros();
+        h.fixed_view_mut::<3, 3>(0, 3).copy_from(&hat(&body));
+        h.fixed_view_mut::<3, 3>(0, 12).copy_from(&self.x.rotation.transpose());
+        let h_p = h * self.p;
+        let innovation = h_p * h.transpose() + Matrix3::identity() * variance;
+        let inverse = innovation.try_inverse().expect("velocity innovation singular");
+        if residual.dot(&(inverse * residual)) > CHI_SQUARED_3_DOF_99 {
+            return false;
+        }
+        let gain = h_p.transpose() * inverse;
+        let step = gain * residual;
+        self.p -= gain * h_p;
+        self.x.advance(&step, 1.0);
+        true
+    }
 }
 
 /// How a scan's points are matched to the map and weighed.

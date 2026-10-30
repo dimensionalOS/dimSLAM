@@ -52,6 +52,8 @@ struct PointLioEngine {
     /// rad^2; until set, by config or by the camera's focal length, turns are not taken.
     rotation_variance: Option<f64>,
     newest: Option<OdometryEstimate>,
+    /// An odometry source's last stamp and pose, the start of its next step.
+    last_source_pose: Option<(i64, Isometry3<f64>)>,
 }
 
 impl PointLioEngine {
@@ -68,6 +70,7 @@ impl PointLioEngine {
             last_turn: None,
             rotation_variance: config.visual_rotation_variance,
             newest: None,
+            last_source_pose: None,
         }
     }
 
@@ -111,6 +114,25 @@ impl PointLioEngine {
         }
         self.last_turn = Some((t, rotation));
         true
+    }
+
+    /// An odometry source's step since its last message, over the interval, as a measurement of
+    /// the body's velocity in its own frame at the step's middle.
+    fn step_velocity(&mut self, source: &OdometryEstimate) {
+        let (t, pose) = (source.timestamp_ns, source.pose);
+        if let Some((t0, pose0)) = self.last_source_pose {
+            let dt = (t - t0) as f64 / 1e9;
+            if dt > 0.0 {
+                let turn = (pose0.rotation.inverse() * pose.rotation).scaled_axis();
+                let middle = pose0.rotation * UnitQuaternion::from_scaled_axis(turn / 2.0);
+                let velocity = middle.inverse_transform_vector(
+                    &(pose.translation.vector - pose0.translation.vector),
+                ) / dt;
+                self.odometry
+                    .push_body_velocity((t0 + t) as f64 / 2e9, velocity);
+            }
+        }
+        self.last_source_pose = Some((t, pose));
     }
 }
 
@@ -363,8 +385,23 @@ impl DimSlamCore {
         self.fusion.handle_cloud(scan, &base_from_lidar);
     }
 
-    /// An external odometry source's estimate, told apart by the transform it carries.
+    /// An external odometry source's estimate, told apart by the transform it carries. With the
+    /// point_lio engine, its steps are the body's velocity, so its pose must be the output frame's.
     pub fn handle_source(&mut self, msg: &OdometryEstimate) {
+        if let Some(lio) = &mut self.point_lio {
+            if msg.child_frame_id != self.output_frame_id {
+                warn_throttled!(
+                    std::time::Duration::from_secs(10),
+                    child_frame = %msg.child_frame_id,
+                    output_frame = %self.output_frame_id,
+                    "odometry source dropped: the point_lio engine needs it carried to the output frame",
+                );
+                return;
+            }
+            lio.step_velocity(msg);
+            lio.drain(&self.odom_frame_id, &self.output_frame_id);
+            return;
+        }
         self.fusion.handle_source(msg);
     }
 
