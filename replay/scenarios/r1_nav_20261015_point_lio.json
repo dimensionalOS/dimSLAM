@@ -1,0 +1,44 @@
+{
+ "name": "r1_nav_20261015_point_lio",
+ "description": "R1 29 m drive: standalone Rust Point-LIO on the raw Mid-360 lidar + IMU",
+ "recording": "r1/cloud/r1_nav_20261015.db",
+ "mode": "point_lio",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom"
+ ],
+ "imus": [
+  {
+   "stream": "imu_raw",
+   "frame_id": "imu_link"
+  }
+ ],
+ "lidars": [
+  {
+   "stream": "lidar_raw"
+  }
+ ],
+ "reference": {
+  "stream": "pointlio_odometry"
+ },
+ "config": {
+  "output_frame_id": "imu_link"
+ },
+ "variants": {
+  "default": {}
+ },
+ "rest": {
+  "stream": "pointlio_odometry",
+  "speed": 0.05,
+  "angular_speed": 0.05,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ },
+ "expect": {
+  "default": {
+   "ate_xy_mm_mean": {
+    "max": 7.0
+   }
+  }
+ }
+}
