@@ -1,0 +1,147 @@
+{
+ "name": "depth_nav_test_stereo",
+ "description": "R1 depth-nav test, 199 s: the recorded Point-LIO (which jumped ~13 m at ~88 s from a 6 s processing lag on the Orin) fused with head stereo. The head cameras in this recording are not synchronized (left/right median 14 ms apart, only 54 of 3346 pairs within cuVSLAM's 1 ms), so stereo barely contributes, and no wheel odometry was recorded. Scored against the recorded Point-LIO; judge against depth_nav_test_point_lio's offline track. Recording: `dtk data to_db depth_nav_test.mcap`, then shift the imu and lidar_raw rows' ts by +1790700293.2618 s so they interleave with the host-clock streams.",
+ "recording": "r1/depth_nav_test.db",
+ "mode": "slam",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom"
+ ],
+ "sources": [
+  {
+   "stream": "pointlio_odometry",
+   "frame_id": "pointlio_odom",
+   "carry_to": "base_link"
+  }
+ ],
+ "reference": {
+  "stream": "pointlio_odometry",
+  "carry_to": "base_link"
+ },
+ "config": {
+  "odom_frame_id": "odom",
+  "output_frame_id": "base_link",
+  "publish_rate": 50.0,
+  "replay_buffer_seconds": 0.5,
+  "outlier_rejection_allowed_variance": 25.0,
+  "max_position_m": 10000.0,
+  "imus": [],
+  "initial_gravity_estimate": 9.8,
+  "initial_stds": {
+   "position": 0.01,
+   "velocity": 0.1,
+   "rotation": 0.05,
+   "angular_velocity": 0.1,
+   "bias": 0.05
+  },
+  "process_noise": {
+   "linear_acceleration": 2.0,
+   "angular_acceleration": 1.0
+  },
+  "planar": true,
+  "zero_velocity_variances": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "odom_sources": [
+   {
+    "parent_frame_id": "pointlio_odom",
+    "child_frame_id": "base_link",
+    "kind": "pose",
+    "pose_variances": [
+     0.0002,
+     0.0002,
+     0,
+     0,
+     0,
+     3.3e-05
+    ],
+    "twist_variances": [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   }
+  ],
+  "camera_mode": "stereo",
+  "cameras": [
+   {
+    "frame_id": "camera_head_left_link",
+    "rectified": false
+   },
+   {
+    "frame_id": "camera_head_right_link",
+    "rectified": false
+   }
+  ],
+  "use_gpu": true,
+  "visual_odom_pose_variances": [
+   0.01,
+   0.01,
+   0.0,
+   0.05,
+   0.05,
+   0.05
+  ],
+  "covariance_gate_translation_std": 0.0,
+  "speed_gate_max_linear": 5.0,
+  "speed_gate_max_angular": 12.0
+ },
+ "variants": {
+  "pl_stereo": {}
+ },
+ "expect": {},
+ "baseline": {
+  "note": "beta3 = 4a65da1 with realign_after_seconds 1.0 and the frozen still flag",
+  "beta3": {
+   "rest_p2p_mm_mean": 2.89,
+   "error_mm_mean": 6.04,
+   "error_mm_p95": 14.82,
+   "moving_roughness_rms_mm": 2.27
+  },
+  "fixes": {
+   "rest_p2p_mm_mean": 15.82,
+   "error_mm_mean": 5.84,
+   "error_mm_p95": 14.68
+  },
+  "imm": {
+   "rest_p2p_mm_mean": 2.37,
+   "error_mm_mean": 6.07,
+   "error_mm_p95": 15.31
+  }
+ },
+ "images": [
+  {
+   "stream": "head_left_color",
+   "frame_id": "camera_head_left_link"
+  },
+  {
+   "stream": "head_right_color",
+   "frame_id": "camera_head_right_link"
+  }
+ ],
+ "camera_infos": [
+  {
+   "stream": "head_left_info",
+   "frame_id": "camera_head_left_link"
+  },
+  {
+   "stream": "head_right_info",
+   "frame_id": "camera_head_right_link"
+  }
+ ],
+ "rest": {
+  "stream": "pointlio_odometry",
+  "speed": 0.05,
+  "angular_speed": 0.05,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ }
+}

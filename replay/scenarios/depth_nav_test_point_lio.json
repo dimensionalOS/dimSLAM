@@ -1,0 +1,39 @@
+{
+ "name": "depth_nav_test_point_lio",
+ "description": "R1 depth-nav test, 199 s: the live Point-LIO fell behind (6 s processing lag on the Orin) and jumped ~13 m at ~88 s. Standalone Rust Point-LIO rerun offline on the same Mid-360 lidar + IMU (device clock, shifted onto the host clock); the recorded, diverged Point-LIO is the baseline.",
+ "recording": "r1/depth_nav_test.db",
+ "mode": "point_lio",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom"
+ ],
+ "imus": [
+  {
+   "stream": "imu",
+   "frame_id": "imu_link",
+   "time_offset_seconds": 1790700293.2618
+  }
+ ],
+ "lidars": [
+  {
+   "stream": "lidar_raw",
+   "time_offset_seconds": 1790700293.2618
+  }
+ ],
+ "reference": {
+  "stream": "pointlio_odometry"
+ },
+ "config": {
+  "output_frame_id": "imu_link"
+ },
+ "variants": {
+  "default": {}
+ },
+ "rest": {
+  "stream": "pointlio_odometry",
+  "speed": 0.05,
+  "angular_speed": 0.05,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ }
+}

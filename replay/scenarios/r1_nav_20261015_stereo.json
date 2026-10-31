@@ -1,0 +1,204 @@
+{
+ "name": "r1_nav_20261015_stereo",
+ "description": "R1 driving 29 m with two rests: head stereo (cuVSLAM on the raw rational-polynomial images, recording tf, uncalibrated right-eye aim) + wheels, with and without Point-LIO as a third source; scored against Point-LIO",
+ "recording": "r1/cloud/r1_nav_20261015.db",
+ "mode": "slam",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom"
+ ],
+ "sources": [
+  {
+   "stream": "pointlio_odometry",
+   "frame_id": "pointlio_odom",
+   "carry_to": "base_link"
+  },
+  {
+   "stream": "odometry",
+   "frame_id": "wheel_odom"
+  }
+ ],
+ "reference": {
+  "stream": "pointlio_odometry",
+  "carry_to": "base_link"
+ },
+ "rest": {
+  "stream": "odometry",
+  "speed": 0.001,
+  "angular_speed": 0.001,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ },
+ "config": {
+  "odom_frame_id": "odom",
+  "output_frame_id": "base_link",
+  "publish_rate": 50.0,
+  "replay_buffer_seconds": 0.5,
+  "outlier_rejection_allowed_variance": 25.0,
+  "max_position_m": 10000.0,
+  "imus": [],
+  "initial_gravity_estimate": 9.8,
+  "initial_stds": {
+   "position": 0.01,
+   "velocity": 0.1,
+   "rotation": 0.05,
+   "angular_velocity": 0.1,
+   "bias": 0.05
+  },
+  "process_noise": {
+   "linear_acceleration": 2.0,
+   "angular_acceleration": 1.0
+  },
+  "planar": true,
+  "zero_velocity_variances": [
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0,
+   0.0
+  ],
+  "odom_sources": [
+   {
+    "parent_frame_id": "pointlio_odom",
+    "child_frame_id": "base_link",
+    "kind": "pose",
+    "pose_variances": [
+     0.0002,
+     0.0002,
+     0,
+     0,
+     0,
+     3.3e-05
+    ],
+    "twist_variances": [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   {
+    "parent_frame_id": "wheel_odom",
+    "child_frame_id": "base_link",
+    "kind": "twist",
+    "pose_variances": [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "twist_variances": [
+     0.0005,
+     0.0005,
+     0,
+     0,
+     0,
+     0.0006
+    ],
+    "still_variance": 1e-06,
+    "still_speed": 0.001,
+    "still_angular_speed": 0.001
+   }
+  ],
+  "camera_mode": "stereo",
+  "cameras": [
+   {
+    "frame_id": "camera_head_left_link",
+    "rectified": false
+   },
+   {
+    "frame_id": "camera_head_right_link",
+    "rectified": false
+   }
+  ],
+  "use_gpu": true,
+  "visual_odom_pose_variances": [
+   0.01,
+   0.01,
+   0.0,
+   0.05,
+   0.05,
+   0.05
+  ],
+  "covariance_gate_translation_std": 0.0,
+  "speed_gate_max_linear": 5.0,
+  "speed_gate_max_angular": 12.0
+ },
+ "variants": {
+  "all_three": {},
+  "stereo_wheels": {
+   "/odom_sources": [
+    {
+     "parent_frame_id": "wheel_odom",
+     "child_frame_id": "base_link",
+     "kind": "twist",
+     "pose_variances": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "twist_variances": [
+      0.0005,
+      0.0005,
+      0,
+      0,
+      0,
+      0.0006
+     ],
+     "still_variance": 1e-06,
+     "still_speed": 0.001,
+     "still_angular_speed": 0.001
+    }
+   ]
+  }
+ },
+ "expect": {
+  "all_three": {
+   "error_mm_mean": {
+    "max": 6.5
+   },
+   "error_mm_p95": {
+    "max": 16.5
+   },
+   "error_mm_max": {
+    "max": 80
+   }
+  },
+  "stereo_wheels": {
+   "error_mm_max": {
+    "max": 800
+   },
+   "error_mm_final": {
+    "max": 600
+   }
+  }
+ },
+ "baseline": {
+  "all_three": {
+   "error_mm_mean": 5.85,
+   "error_mm_p95": 15.58,
+   "error_mm_max": 67.54
+  },
+  "stereo_wheels": {
+   "error_mm_max": 691.38,
+   "error_mm_final": 509.07
+  },
+  "note": "2026-10-30 Mac metal; wheels alone 682/492, Point-LIO + wheels 67.5 max / 5.83 mean"
+ },
+ "images": [
+  "head_left_color",
+  "head_right_color"
+ ],
+ "camera_infos": [
+  "head_left_info",
+  "head_right_info"
+ ]
+}

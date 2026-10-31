@@ -1,0 +1,106 @@
+{
+ "name": "depth_nav_test_vio_lio",
+ "description": "R1 depth-nav test, 199 s, where the live Point-LIO jumped ~13 m at ~88 s (6 s processing lag on the Orin). dimSLAM's own point_lio engine on the raw Mid-360 lidar + IMU (device clock shifted onto the host clock; the .db's imu/lidar_raw row ts must be shifted by the same offset so streams interleave), with and without head stereo turn rates. Scored against the recorded, diverged Point-LIO; the lio variant reproduces depth_nav_test_point_lio's offline track exactly. Stereo barely contributes: the cameras are not synchronized in this recording.",
+ "recording": "r1/depth_nav_test.db",
+ "mode": "slam",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom"
+ ],
+ "static_tf": [
+  {
+   "parent": "imu_link",
+   "child": "lidar_pointlio_link",
+   "translation": [
+    -0.011,
+    -0.02329,
+    0.04412
+   ]
+  }
+ ],
+ "imus": [
+  {
+   "stream": "imu",
+   "frame_id": "imu_link",
+   "time_offset_seconds": 1790700293.2618
+  }
+ ],
+ "lidars": [
+  {
+   "stream": "lidar_raw",
+   "time_offset_seconds": 1790700293.2618
+  }
+ ],
+ "images": [
+  {
+   "stream": "head_left_color",
+   "frame_id": "camera_head_left_link"
+  },
+  {
+   "stream": "head_right_color",
+   "frame_id": "camera_head_right_link"
+  }
+ ],
+ "camera_infos": [
+  {
+   "stream": "head_left_info",
+   "frame_id": "camera_head_left_link"
+  },
+  {
+   "stream": "head_right_info",
+   "frame_id": "camera_head_right_link"
+  }
+ ],
+ "reference": {
+  "stream": "pointlio_odometry"
+ },
+ "rest": {
+  "stream": "pointlio_odometry",
+  "speed": 0.05,
+  "angular_speed": 0.05,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ },
+ "config": {
+  "odom_frame_id": "odom",
+  "output_frame_id": "imu_link",
+  "publish_rate": 50.0,
+  "imus": [
+   {
+    "frame_id": "imu_link",
+    "gyro_noise_density": 0.01,
+    "gyro_random_walk": 0.0001,
+    "accel_noise_density": 0.15,
+    "accel_random_walk": 0.001,
+    "init_gyro_limit": 0.3,
+    "accel_saturation": 39.2,
+    "gyro_saturation": 34.9
+   }
+  ],
+  "lidars": [
+   {
+    "frame_id": "lidar_pointlio_link"
+   }
+  ],
+  "camera_mode": "stereo",
+  "cameras": [
+   {
+    "frame_id": "camera_head_left_link",
+    "rectified": false
+   },
+   {
+    "frame_id": "camera_head_right_link",
+    "rectified": false
+   }
+  ],
+  "use_gpu": true,
+  "point_lio": {}
+ },
+ "variants": {
+  "vio_lio": {},
+  "lio": {
+   "/cameras": []
+  }
+ },
+ "expect": {}
+}
