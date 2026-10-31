@@ -5,7 +5,7 @@
 // solution of a x + b y + c z = -1 by column-pivoting Householder QR in f32, with sums ordered
 // as Eigen's fixed-size (SIMD) and dynamic-size reductions order them.
 
-use super::lidar::SurfacePoint;
+use super::scan_points::SurfacePoint;
 
 /// Points each plane is fitted through.
 pub const PLANE_POINTS: usize = 5;

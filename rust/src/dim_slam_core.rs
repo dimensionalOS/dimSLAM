@@ -13,7 +13,7 @@ use crate::cuvslam_odometry::{CameraConfig, CuvslamCore, CuvslamOdometryConfig};
 use crate::odometry_fusion::lio_odometry::{LioConfig, LioOdometry};
 use crate::odometry_fusion::{header_seconds, STANDARD_GRAVITY};
 use crate::odometry_fusion::{
-    FusionCore, ImuConfig, InitialStds, LidarConfig, LidarMapConfig, OdometryFusionConfig, ProcessNoise, SourceConfig,
+    FusionCore, ImuConfig, InitialStds, OdometryFusionConfig, ProcessNoise, SourceConfig,
     SourceKind,
 };
 use crate::types::{
@@ -187,13 +187,11 @@ pub struct DimSlamCoreConfig {
     pub no_imu_blend: bool,
     /// See [`OdometryFusionConfig::imm`].
     pub imm: bool,
-    /// See [`OdometryFusionConfig::lidars`].
-    pub lidars: Vec<LidarConfig>,
-    pub lidar_map: LidarMapConfig,
     /// See [`OdometryFusionConfig::imu_as_measurement`].
     pub imu_as_measurement: bool,
     /// Set, Point-LIO is the lidar-inertial filter (fed the raw IMU, in its own frame, and
-    /// the scans) and the fusion core's lidar and IMU settings are unused.
+    /// the scans) and the fusion core's IMU settings are unused. Lidar needs it: it is the only
+    /// lidar path.
     pub point_lio: Option<PointLioEngineConfig>,
 }
 
@@ -228,8 +226,6 @@ impl Default for DimSlamCoreConfig {
             zero_velocity_variances: fusion.zero_velocity_variances,
             no_imu_blend: fusion.no_imu_blend,
             imm: fusion.imm,
-            lidars: fusion.lidars,
-            lidar_map: fusion.lidar_map,
             imu_as_measurement: fusion.imu_as_measurement,
             point_lio: None,
         }
@@ -291,8 +287,6 @@ impl DimSlamCore {
             zero_velocity_variances: config.zero_velocity_variances,
             no_imu_blend: config.no_imu_blend,
             imm: config.imm,
-            lidars: config.lidars,
-            lidar_map: config.lidar_map,
             imu_as_measurement: config.imu_as_measurement,
         };
         Ok(Self {
@@ -369,23 +363,18 @@ impl DimSlamCore {
         self.fusion.handle_imu(sample, &base_from_imu);
     }
 
-    /// A no-op for a frame with no `lidars` entry. The mount is read off `tf`, so the scan's
-    /// frame must be placed in the output frame.
-    pub fn handle_cloud(&mut self, scan: &LidarScan, tf: &dyn TfLookup) {
-        if let Some(lio) = &mut self.point_lio {
-            lio.odometry.push_scan(scan);
-            lio.drain(&self.odom_frame_id, &self.output_frame_id);
-            return;
-        }
-        let Some(base_from_lidar) = tf.latest(&self.output_frame_id, &scan.frame_id) else {
+    /// Point-LIO's input; dropped without the point_lio engine, the only lidar path.
+    pub fn handle_cloud(&mut self, scan: &LidarScan) {
+        let Some(lio) = &mut self.point_lio else {
             warn_throttled!(
                 std::time::Duration::from_secs(10),
                 lidar_frame = %scan.frame_id,
-                "scan dropped: tf does not place the lidar in the output frame",
+                "scan dropped: lidar needs the point_lio engine (set `point_lio`)",
             );
             return;
         };
-        self.fusion.handle_cloud(scan, &base_from_lidar);
+        lio.odometry.push_scan(scan);
+        lio.drain(&self.odom_frame_id, &self.output_frame_id);
     }
 
     /// An external odometry source's estimate, told apart by the transform it carries. With the

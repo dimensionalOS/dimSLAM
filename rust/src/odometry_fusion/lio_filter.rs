@@ -9,7 +9,7 @@
 
 use nalgebra::{Const, DMatrix, DVector, Dyn, Matrix3, OMatrix, SMatrix, SVector, Vector3};
 
-use super::lidar::SurfacePoint;
+use super::scan_points::SurfacePoint;
 use super::plane_fit::{fit_plane, PLANE_POINTS};
 use super::point_map::{to_world, PointMap};
 

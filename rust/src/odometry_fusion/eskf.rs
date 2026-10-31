@@ -6,8 +6,6 @@
 // cloned pose. theta is a right (body-frame) perturbation: q_true = q_est * Exp(theta).
 
 use nalgebra::{DMatrix, DVector, Matrix3, UnitQuaternion, Vector3};
-#[cfg(test)]
-use nalgebra::{Matrix6, Vector6};
 
 use super::{InitialStds, ProcessNoise};
 
@@ -32,8 +30,6 @@ pub struct Layout {
     /// The IMU is a measurement of angular velocity and specific-force states rather than the
     /// process input.
     pub imu_states: bool,
-    /// Lidar mount corrections estimated, one rotation each.
-    pub mounts: usize,
     /// Gravity is a world-frame vector state, not fixed straight down: a tilt between the IMU
     /// and whatever the map is built from then shows up as gravity leaning in the map frame,
     /// rather than as a drift up or down with every meter moved.
@@ -84,18 +80,13 @@ impl Layout {
         self.clone_position_col(slot) + 3
     }
 
-    /// The 3 columns of mount correction `slot`.
-    pub fn mount_col(&self, slot: usize) -> usize {
-        self.clones_start() + 6 * self.clones + 3 * slot
-    }
-
     pub fn gravity_col(&self) -> Option<usize> {
         self.gravity_state
-            .then(|| self.clones_start() + 6 * self.clones + 3 * self.mounts)
+            .then(|| self.clones_start() + 6 * self.clones)
     }
 
     pub fn dim(&self) -> usize {
-        self.clones_start() + 6 * self.clones + 3 * self.mounts + 3 * usize::from(self.gravity_state)
+        self.clones_start() + 6 * self.clones + 3 * usize::from(self.gravity_state)
     }
 
     /// The dimensions a planar body cannot move in: z, roll, pitch and their rates.
@@ -164,9 +155,6 @@ pub struct State {
     pub biases: Vec<ImuBias>,
     pub input: Option<ImuInput>,
     pub clones: Vec<Option<PoseClone>>,
-    /// Per estimated lidar mount, the rotation correcting its tf mount, about the lidar origin
-    /// in the body frame.
-    pub mounts: Vec<UnitQuaternion<f64>>,
     /// World-frame gravity, m/s^2; a state only with `Layout::gravity_state`.
     pub gravity: Vector3<f64>,
 }
@@ -183,7 +171,6 @@ impl Default for State {
             biases: Vec::new(),
             input: None,
             clones: Vec::new(),
-            mounts: Vec::new(),
             gravity: Vector3::zeros(),
         }
     }
@@ -203,8 +190,6 @@ pub struct Filter {
     pub log_likelihood: f64,
     pub x: State,
     pub p_cov: Cov,
-    /// Per estimated mount, its initial rotation std (rad).
-    pub mount_stds: Vec<f64>,
 }
 
 impl Filter {
@@ -227,7 +212,6 @@ impl Filter {
             biases,
             input,
             clones: vec![None; self.layout.clones],
-            mounts: vec![UnitQuaternion::identity(); self.layout.mounts],
             gravity: Vector3::new(0.0, 0.0, -self.gravity),
             ..State::default()
         };
@@ -247,9 +231,6 @@ impl Filter {
         for imu in 0..self.layout.imus {
             blocks.push((self.layout.gyro_bias_col(imu), stds.bias));
             blocks.push((self.layout.accel_bias_col(imu), stds.bias));
-        }
-        for (slot, std) in self.mount_stds.iter().enumerate().take(self.layout.mounts) {
-            blocks.push((self.layout.mount_col(slot), *std));
         }
         if let Some(col) = self.layout.gravity_col() {
             blocks.push((col, stds.gravity));
@@ -666,62 +647,6 @@ impl Filter {
         true
     }
 
-    /// A batch of scalar measurements on the columns `cols` alone (position and rotation, and
-    /// any mount correction), given as information (see `lidar::PlaneEvidence`), linearized at
-    /// the current state. Through the Woodbury identity the gain needs only a k x k inverse,
-    /// (I + G P_cols)^-1 for k columns, whatever the number of rows, and that stays invertible
-    /// where planar mode has pinned P_cols singular.
-    ///
-    /// Iterated: `prior` and `prior_cov` are the state and covariance before this measurement;
-    /// the current state may already have moved off the prior by an earlier iteration, and the
-    /// correction is then re-taken from the prior with the residuals moved to it (r + H dx).
-    /// Only the last iteration (`settle`) shrinks the covariance and scores the likelihood.
-    #[allow(clippy::too_many_arguments)]
-    pub fn update_pose_information(
-        &mut self,
-        prior: &State,
-        prior_cov: &Cov,
-        cols: &[usize],
-        information: &Cov,
-        weighted_residual: &DVector<f64>,
-        weighted_residual_sq: f64,
-        log_det_noise: f64,
-        rows: usize,
-        settle: bool,
-    ) {
-        let k = cols.len();
-        let dim = self.dim();
-        let linearized = std::mem::replace(&mut self.x, prior.clone());
-        let moved_full = self.difference(&linearized);
-        let moved = DVector::from_fn(k, |r, _| moved_full[cols[r]]);
-        let original = weighted_residual;
-        let weighted_residual = original + information * &moved;
-        let weighted_residual_sq = weighted_residual_sq
-            + 2.0 * moved.dot(original)
-            + moved.dot(&(information * &moved));
-        let block = Cov::from_fn(k, k, |r, c| prior_cov[(cols[r], cols[c])]);
-        let Some(inverse) = (Cov::identity(k, k) + information * &block).try_inverse() else {
-            self.x = linearized;
-            return;
-        };
-        // M = (I + G P)^-1 G and v = (I + G P)^-1 g are H^T S^-1 H and H^T S^-1 r.
-        let pulled = &inverse * &weighted_residual;
-        let cross = Cov::from_fn(dim, k, |r, c| prior_cov[(r, cols[c])]);
-        let dx: DVector<f64> = &cross * &pulled;
-        self.inject(&dx);
-        if settle {
-            // r^T S^-1 r = r^T R^-1 r - g^T (I + P G)^-1 P g, and det S = det R det(I + P G).
-            let mahalanobis_sq = weighted_residual_sq - pulled.dot(&(&block * &weighted_residual));
-            let log_det = log_det_noise - inverse.determinant().ln();
-            self.log_likelihood -= 0.5
-                * (mahalanobis_sq + log_det + rows as f64 * (2.0 * std::f64::consts::PI).ln());
-            let shrink = &inverse * information;
-            self.p_cov = prior_cov - &cross * shrink * cross.transpose();
-            self.p_cov = (&self.p_cov + self.p_cov.transpose()) * 0.5;
-        }
-        self.constrain();
-    }
-
     /// The error vector that takes `self.x` to `other`: `other = self.x [+] difference`.
     fn difference(&self, other: &State) -> DVector<f64> {
         let layout = self.layout;
@@ -749,10 +674,6 @@ impl Filter {
         if let Some(col) = layout.gravity_col() {
             dx.fixed_rows_mut::<3>(col)
                 .copy_from(&(other.gravity - self.x.gravity));
-        }
-        for (slot, (mine, theirs)) in self.x.mounts.iter().zip(&other.mounts).enumerate() {
-            dx.fixed_rows_mut::<3>(layout.mount_col(slot))
-                .copy_from(&(theirs * mine.inverse()).scaled_axis());
         }
         for (slot, (mine, theirs)) in self.x.clones.iter().zip(&other.clones).enumerate() {
             if let (Some(mine), Some(theirs)) = (mine, theirs) {
@@ -806,11 +727,6 @@ impl Filter {
         }
         if let Some(col) = layout.gravity_col() {
             self.x.gravity += dx.fixed_rows::<3>(col);
-        }
-        for (slot, mount) in self.x.mounts.iter_mut().enumerate() {
-            *mount = UnitQuaternion::from_scaled_axis(
-                dx.fixed_rows::<3>(layout.mount_col(slot)).into_owned(),
-            ) * *mount;
         }
         for (slot, clone) in self.x.clones.iter_mut().enumerate() {
             if let Some(clone) = clone {
@@ -902,7 +818,6 @@ mod tests {
                 imus: 0,
                 clones,
                 imu_states: false,
-                mounts: 0,
                 gravity_state: false,
             },
             process_noise: ProcessNoise {
@@ -952,7 +867,6 @@ mod tests {
             imus: 0,
             clones: 1,
             imu_states: false,
-            mounts: 0,
             gravity_state: false,
         };
         assert_eq!(without.angular_velocity_col(), Some(9));
@@ -962,7 +876,6 @@ mod tests {
             imus: 2,
             clones: 1,
             imu_states: false,
-            mounts: 0,
             gravity_state: false,
         };
         assert_eq!(with.angular_velocity_col(), None);
@@ -1048,69 +961,6 @@ mod tests {
             0.0
         ));
         assert!(filter.x.position.x > 0.9);
-    }
-
-    /// Scalar rows over position and rotation fused as information land where the dense update
-    /// does, covariance and likelihood included, in full 3D and with planar's singular P.
-    #[test]
-    fn a_pose_information_update_matches_the_dense_update() {
-        for planar in [false, true] {
-            let mut dense = level_filter();
-            dense.planar = planar;
-            dense.constrain();
-            advance(&mut dense, 3, 10);
-            let mut batched = dense.clone();
-            let rows = [
-                ([1.0, 0.0, 0.0, 0.0, 0.2, -0.1], 0.3, 1e-3),
-                ([0.0, 1.0, 0.0, 0.1, 0.0, 0.4], -0.2, 2e-3),
-                ([0.0, 0.0, 1.0, -0.3, 0.1, 0.0], 0.05, 1e-3),
-                ([0.6, 0.8, 0.0, 0.0, 0.0, 1.0], 0.1, 5e-3),
-            ];
-            let dim = dense.dim();
-            let cols = [0, 1, 2, 6, 7, 8];
-            let mut jacobian = Jacobian::zeros(rows.len(), dim);
-            let mut residual = DVector::zeros(rows.len());
-            let mut variance = DVector::zeros(rows.len());
-            let mut information = Matrix6::zeros();
-            let mut weighted = Vector6::zeros();
-            let (mut weighted_sq, mut log_det) = (0.0, 0.0);
-            for (i, (row, r, noise)) in rows.iter().enumerate() {
-                let h = Vector6::from_row_slice(row);
-                for (k, col) in cols.iter().enumerate() {
-                    jacobian[(i, *col)] = h[k];
-                }
-                residual[i] = *r;
-                variance[i] = *noise;
-                information += h * h.transpose() / *noise;
-                weighted += h * (*r / *noise);
-                weighted_sq += r * r / noise;
-                log_det += noise.ln();
-            }
-            if planar {
-                for col in dense.layout.pinned_cols() {
-                    jacobian.column_mut(col).fill(0.0);
-                }
-            }
-            assert!(dense.update(&residual, &jacobian, &variance, 0.0));
-            let (prior, prior_cov) = (batched.x.clone(), batched.p_cov.clone());
-            batched.update_pose_information(
-                &prior,
-                &prior_cov,
-                &cols,
-                &Cov::from_column_slice(6, 6, information.as_slice()),
-                &DVector::from_column_slice(weighted.as_slice()),
-                weighted_sq,
-                log_det,
-                rows.len(),
-                true,
-            );
-            assert!((dense.x.position - batched.x.position).norm() < 1e-9, "planar {planar}");
-            assert!(dense.x.q.angle_to(&batched.x.q) < 1e-9, "planar {planar}");
-            assert!((&dense.p_cov - &batched.p_cov).amax() < 1e-9, "planar {planar}");
-            if !planar {
-                assert!((dense.log_likelihood - batched.log_likelihood).abs() < 1e-6);
-            }
-        }
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 
 use nalgebra::{Matrix3, Vector3};
 
-use super::lidar::{surface_points, voxel_centroids, SurfacePoint};
+use super::scan_points::{surface_points, voxel_centroids, SurfacePoint};
 use super::lio_filter::{
     initial_covariance, process_noise, ImuMeasurement, LidarMeasurement, LioFilter, LioState,
     PointGroup, StateMatrix,
