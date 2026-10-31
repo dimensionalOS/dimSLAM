@@ -1,6 +1,6 @@
 {
  "name": "huge_loop_realsense_vio_lio",
- "description": "Handheld Mid-360 + RealSense rig, ~1 h, 3 km loop. DimSlamCore (slam mode): cuVSLAM mono on the RealSense color camera, its frame-to-frame turn fused as angular velocity into the in-filter lidar-inertial odometry (point_lio engine: Point-LIO, Mid-360 4 g accel clip; a turn weighted by the camera's one-pixel ray angle, (1/fx)^2, and carried to the state's instant by the state's own change in angular velocity) with the Mid-360 IMU. Mid-360 streams rebuilt from the pcap (host clock). Scored against Point-LIO + AprilTag loop closures (v5) and on AprilTag revisits. Variant vio_lio_fusion_filter: the fusion core's own lidar filter instead.",
+ "description": "Handheld Mid-360 + RealSense rig, ~1 h, 3 km loop. DimSlamCore (slam mode): cuVSLAM mono on the RealSense color camera, its frame-to-frame turn fused as angular velocity into the in-filter lidar-inertial odometry (point_lio engine: Point-LIO, Mid-360 4 g accel clip; a turn weighted by the camera's one-pixel ray angle, (1/fx)^2, and carried to the state's instant by the state's own change in angular velocity) with the Mid-360 IMU. Mid-360 streams rebuilt from the pcap (host clock). Scored against Point-LIO + AprilTag loop closures (v5) and on AprilTag revisits.",
  "recording": "mid360_recordings/2026-06-04_12-57pm-PST__huge_loop_realsense/mem2.db",
  "mode": "slam",
  "tf_stream": "tf",
@@ -69,18 +69,7 @@
   }
  },
  "variants": {
-  "vio_lio": {},
-  "vio_lio_fusion_filter": {
-   "/point_lio": null,
-   "/visual_odom_pose_variances": [
-    0.0,
-    0.0,
-    0.0,
-    0.001,
-    0.001,
-    0.001
-   ]
-  }
+  "vio_lio": {}
  },
  "tags": {
   "stream": "raw_april_tags",

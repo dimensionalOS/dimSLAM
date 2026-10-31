@@ -20,16 +20,6 @@ pub enum Mode {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct LioSource {
-    /// The frame its poses are in: the source's `parent_frame_id`.
-    pub frame_id: String,
-    /// g; the accelerometer's clip, when not Point-LIO's 3 g.
-    #[serde(default)]
-    pub accel_clip_g: Option<f64>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OdometryStream {
     pub stream: String,
     /// Overrides the message's frame_id / child_frame_id, as a blueprint's remapping would.
@@ -164,14 +154,9 @@ pub struct Scenario {
     pub sources: Vec<OdometryStream>,
     #[serde(default)]
     pub imus: Vec<SensorStream>,
-    /// PointCloud2 scans fed to the core as lidar measurements.
+    /// PointCloud2 scans: Point-LIO's (point_lio mode, or slam mode's point_lio engine).
     #[serde(default)]
     pub lidars: Vec<SensorStream>,
-    /// Runs `LioOdometry` on the IMU and lidar streams and hands each of its poses to the core
-    /// as an odometry message from this frame (configure it under the config's `sources`); the
-    /// lidar then goes to it alone, not to the core.
-    #[serde(default)]
-    pub lio_source: Option<LioSource>,
     #[serde(default)]
     pub images: Vec<SensorStream>,
     #[serde(default)]
