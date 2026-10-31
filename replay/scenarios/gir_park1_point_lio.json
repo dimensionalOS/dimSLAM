@@ -109,6 +109,9 @@
   "output_frame_id": "mid360_imu"
  },
  "variants": {
-  "default": {}
+  "default": {},
+  "4g": {
+   "/accel_clip_g": 4.0
+  }
  }
 }

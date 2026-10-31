@@ -71,5 +71,12 @@
  },
  "variants": {
   "default": {}
+ },
+ "expect": {
+  "default": {
+   "tag_revisit_mm_mean": {
+    "max": 13.1
+   }
+  }
  }
 }

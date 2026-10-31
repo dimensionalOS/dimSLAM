@@ -127,6 +127,21 @@
   "use_gpu": true
  },
  "variants": {
-  "default": {}
+  "default": {},
+  "4g": {
+   "/imus/0/accel_clip_g": 4.0
+  }
+ },
+ "expect": {
+  "default": {
+   "tag_revisit_mm_mean": {
+    "max": 45.2
+   }
+  },
+  "4g": {
+   "tag_revisit_mm_mean": {
+    "max": 3650
+   }
+  }
  }
 }

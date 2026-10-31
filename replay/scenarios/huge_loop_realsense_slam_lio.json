@@ -67,5 +67,12 @@
  },
  "lidars": [
   "livox_lidar"
- ]
+ ],
+ "expect": {
+  "default": {
+   "tag_revisit_mm_mean": {
+    "max": 3307
+   }
+  }
+ }
 }
