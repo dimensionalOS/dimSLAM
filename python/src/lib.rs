@@ -1,8 +1,8 @@
 // Copyright 2026 Dimensional Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Python bindings over the `dim_slam` crate: `CuvslamOdometry` wraps the cuVSLAM
-//! front end, `OdometryFusion` the error-state Kalman fuser. Everything is
+//! Python bindings over the `dim_slam` crate: `DimSlam` wraps the whole odometry filter,
+//! `CuvslamOdometry` the cuVSLAM front end alone. Everything is
 //! synchronous and driven by the caller's data stamps, so a replay is deterministic.
 //!
 //! Transforms cross the boundary as `((x, y, z), (qx, qy, qz, qw))`.
@@ -13,7 +13,7 @@ use dim_slam::types::{
     ImuSample as RsImuSample, OdometryEstimate as RsOdometryEstimate, PointCloud as RsPointCloud,
     Twist as RsTwist,
 };
-use dim_slam::{CuvslamCore, FusionCore};
+use dim_slam::{CuvslamCore, DimSlamCore};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -450,44 +450,61 @@ impl CuvslamOdometry {
     }
 }
 
-/// The error-state Kalman fuser. `config` mirrors the Rust `OdometryFusionConfig`
-/// as a dict; `odom_sources` entries name their parent_frame_id, child_frame_id and
-/// kind ("pose", "twist" or "pose_delta"). Unknown keys are refused.
-#[pyclass]
-struct OdometryFusion {
-    core: FusionCore,
+/// Odometry from any set of sensors fused in one filter. `config` mirrors the Rust
+/// `DimSlamCoreConfig` as a dict (unknown keys are refused); `tf` answers rigid-mount
+/// lookups, placing every sensor relative to the output frame.
+#[pyclass(unsendable)]
+struct DimSlam {
+    core: DimSlamCore,
+    tf: Py<PyAny>,
+}
+
+impl DimSlam {
+    fn with_tf<R>(
+        &mut self,
+        py: Python<'_>,
+        run: impl FnOnce(&mut DimSlamCore, &PyTf<'_>) -> R,
+    ) -> PyResult<R> {
+        let tf = PyTf {
+            func: &self.tf,
+            py,
+            error: std::cell::RefCell::new(None),
+        };
+        let out = run(&mut self.core, &tf);
+        tf.rethrow()?;
+        Ok(out)
+    }
 }
 
 #[pymethods]
-impl OdometryFusion {
+impl DimSlam {
     #[new]
-    #[pyo3(signature = (config=None))]
-    fn new(config: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
-        Ok(Self {
-            core: FusionCore::new(config_from_dict(config)?),
-        })
+    #[pyo3(signature = (config=None, *, tf))]
+    fn new(config: Option<&Bound<'_, PyDict>>, tf: Py<PyAny>) -> PyResult<Self> {
+        let config = config_from_dict(config)?;
+        let core = DimSlamCore::new(config).map_err(PyValueError::new_err)?;
+        Ok(Self { core, tf })
     }
 
-    #[pyo3(signature = (imu, base_from_imu))]
-    fn handle_imu(&mut self, imu: &ImuSample, base_from_imu: PyTransform) {
-        self.core
-            .handle_imu(&imu.inner, &iso_from_py(base_from_imu));
+    fn handle_camera_info(&mut self, py: Python<'_>, info: CameraModel) -> PyResult<()> {
+        self.with_tf(py, |core, tf| core.handle_camera_info(info.inner, tf))
     }
 
-    fn handle_source(&mut self, estimate: &OdometryEstimate) {
-        self.core.handle_source(&estimate.inner);
+    fn handle_image(&mut self, py: Python<'_>, image: ImageFrame) -> PyResult<()> {
+        self.with_tf(py, |core, tf| core.handle_image(image.inner, tf))
     }
 
-    /// The fused estimate, else None. Without `now_ns`: at the newest input's stamp once
-    /// the publish period has elapsed (call after each input). With it: predicted to that
-    /// time, whenever it is past the last output (call on a timer).
-    #[pyo3(signature = (now_ns=None))]
-    fn maybe_publish(&mut self, now_ns: Option<i64>) -> Option<OdometryEstimate> {
-        match now_ns {
-            Some(now_ns) => self.core.maybe_publish_at(now_ns),
-            None => self.core.maybe_publish(),
-        }
-        .map(|inner| OdometryEstimate { inner })
+    fn handle_imu(&mut self, py: Python<'_>, imu: &ImuSample) -> PyResult<()> {
+        self.with_tf(py, |core, tf| core.handle_imu(&imu.inner, tf))
+    }
+
+    fn handle_source(&mut self, py: Python<'_>, estimate: &OdometryEstimate) -> PyResult<()> {
+        self.with_tf(py, |core, tf| core.handle_source(&estimate.inner, tf))
+    }
+
+    /// The newest pose the filter has published since the last call, else None.
+    fn maybe_publish(&mut self) -> Option<OdometryEstimate> {
+        self.core.maybe_publish().map(|inner| OdometryEstimate { inner })
     }
 
     fn report(&self) {
@@ -532,7 +549,7 @@ fn dim_odom(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<OdometryEstimate>()?;
     m.add_class::<PointCloud>()?;
     m.add_class::<CuvslamOdometry>()?;
-    m.add_class::<OdometryFusion>()?;
+    m.add_class::<DimSlam>()?;
     m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     m.add_function(wrap_pyfunction!(compose, m)?)?;
     m.add_function(wrap_pyfunction!(invert, m)?)?;

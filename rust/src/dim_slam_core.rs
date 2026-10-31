@@ -47,9 +47,10 @@ pub struct DimSlamCoreConfig {
     /// Stamp spread one frame set may span, milliseconds; 0 keeps cuVSLAM's 1 ms contract.
     pub max_skew_ms: f64,
     /// Noise of the tracker's frame-to-frame motion, [x y z roll pitch yaw], fused as a
-    /// `pose_delta` source: <0 the message covariance, >0 fixed, 0 drops a translation axis
-    /// and gives a rotation axis the camera's own (a feature located to one pixel turns the
-    /// ray by 1/fx).
+    /// `pose_delta` source: <0 the tracker's own covariance (the default: a lost or
+    /// uninitialized tracker reports it enormous), >0 fixed, 0 drops a translation axis and
+    /// gives a rotation axis the camera's own (a feature located to one pixel turns the ray by
+    /// 1/fx). A mono camera's translation has no scale and is never fused.
     pub visual_odom_pose_variances: [f64; 6],
 
     /// Frame the output is stamped in.
@@ -80,7 +81,7 @@ impl Default for DimSlamCoreConfig {
             speed_gate_max_linear: cuvslam.speed_gate_max_linear,
             speed_gate_max_angular: cuvslam.speed_gate_max_angular,
             max_skew_ms: cuvslam.max_skew_ms,
-            visual_odom_pose_variances: [0.0; 6],
+            visual_odom_pose_variances: [-1.0; 6],
             odom_frame_id: "odom".to_string(),
             output_frame_id: "base_link".to_string(),
             imus: Vec::new(),
@@ -115,11 +116,14 @@ pub struct DimSlamCore {
     sources: Vec<SourceState>,
     /// rad^2: one frame's rotation variance from the camera's focal length, once known.
     focal_variance: Option<f64>,
+    /// A mono tracker's translation has no scale.
+    mono: bool,
     newest: Option<OdometryEstimate>,
 }
 
 impl DimSlamCore {
     pub fn new(config: DimSlamCoreConfig) -> Result<Self, String> {
+        let mono = config.camera_mode == "mono";
         let visual_odometry = CuvslamCore::new(CuvslamOdometryConfig {
             camera_mode: config.camera_mode,
             cameras: config.cameras,
@@ -148,16 +152,30 @@ impl DimSlamCore {
                 measurement.gyro_variance = imu.gyro_variance;
                 measurement.accel_variance = imu.accel_variance;
                 measurement.clip = (imu.gyro_clip > 0.0 || imu.accel_clip_g > 0.0).then_some((
-                    if imu.gyro_clip > 0.0 { imu.gyro_clip } else { f64::INFINITY },
-                    if imu.accel_clip_g > 0.0 { imu.accel_clip_g } else { f64::INFINITY },
+                    if imu.gyro_clip > 0.0 {
+                        imu.gyro_clip
+                    } else {
+                        f64::INFINITY
+                    },
+                    if imu.accel_clip_g > 0.0 {
+                        imu.accel_clip_g
+                    } else {
+                        f64::INFINITY
+                    },
                 ));
-                (measurement, [imu.gyro_bias_random_walk, imu.accel_bias_random_walk])
+                (
+                    measurement,
+                    [imu.gyro_bias_random_walk, imu.accel_bias_random_walk],
+                )
             })
             .collect();
         let mut sources: Vec<SourceState> = config
             .odom_sources
             .into_iter()
-            .map(|config| SourceState { config, ..Default::default() })
+            .map(|config| SourceState {
+                config,
+                ..Default::default()
+            })
             .collect();
         sources.push(SourceState {
             config: SourceConfig {
@@ -171,13 +189,26 @@ impl DimSlamCore {
         });
         Ok(Self {
             visual_odometry,
-            odometry: Box::new(LioOdometry::new(lio, imus, config.lidars.len())),
+            odometry: Box::new(LioOdometry::new(
+                lio,
+                imus,
+                config
+                    .lidars
+                    .iter()
+                    .map(|lidar| lidar.point_variance)
+                    .collect(),
+            )),
             output_frame_id: config.output_frame_id,
             odom_frame_id: config.odom_frame_id,
             imus: config.imus.into_iter().map(|imu| imu.frame_id).collect(),
-            lidars: config.lidars.into_iter().map(|lidar| lidar.frame_id).collect(),
+            lidars: config
+                .lidars
+                .into_iter()
+                .map(|lidar| lidar.frame_id)
+                .collect(),
             sources,
             focal_variance: None,
+            mono,
             newest: None,
         })
     }
@@ -202,7 +233,11 @@ impl DimSlamCore {
 
     /// The tracker's estimate for an image without fusing it, and the tracking segment it
     /// belongs to: with `handle_tracked`, lets a caller record the tracker and replay it later.
-    pub fn track_image(&mut self, img: ImageFrame, tf: &dyn TfLookup) -> (Option<OdometryEstimate>, u64) {
+    pub fn track_image(
+        &mut self,
+        img: ImageFrame,
+        tf: &dyn TfLookup,
+    ) -> (Option<OdometryEstimate>, u64) {
         let tracked = self.visual_odometry.handle_image(img, tf);
         (tracked, self.visual_odometry.segment())
     }
@@ -210,9 +245,14 @@ impl DimSlamCore {
     /// Fuses an estimate `track_image` returned, in this run or a recorded one.
     pub fn handle_tracked(&mut self, tracked: Option<OdometryEstimate>, segment: u64) {
         // A tracker's first estimate can come back unstamped.
-        let Some(estimate) = tracked.filter(|e| e.timestamp_ns != 0) else { return };
+        let Some(estimate) = tracked.filter(|e| e.timestamp_ns != 0) else {
+            return;
+        };
         let visual = self.sources.len() - 1;
         let mut variances = self.sources[visual].config.pose_variances;
+        if self.mono {
+            variances[..3].fill(0.0);
+        }
         for variance in &mut variances[3..] {
             if *variance == 0.0 {
                 *variance = self.focal_variance.unwrap_or(0.0);
@@ -241,7 +281,9 @@ impl DimSlamCore {
             return;
         };
         if !self.odometry.imu_mounted(imu) {
-            let Some(mount) = self.mount(&sample.frame_id, tf) else { return };
+            let Some(mount) = self.mount(&sample.frame_id, tf) else {
+                return;
+            };
             self.odometry.set_imu_mount(imu, mount.0, mount.1);
         }
         self.odometry.push_imu(
@@ -264,7 +306,9 @@ impl DimSlamCore {
             return;
         };
         if !self.odometry.lidar_mounted(lidar) {
-            let Some(mount) = self.mount(&scan.frame_id, tf) else { return };
+            let Some(mount) = self.mount(&scan.frame_id, tf) else {
+                return;
+            };
             self.odometry.set_lidar_mount(lidar, mount.0, mount.1);
         }
         self.odometry.push_scan(lidar, scan);
@@ -329,6 +373,23 @@ impl DimSlamCore {
             late_points = self.odometry.late_points(),
             "odometry counters"
         );
+        for (index, source) in self.sources.iter().enumerate() {
+            for (kind, at) in [("velocity or pose", 2 * index), ("rate", 2 * index + 1)] {
+                let Some([taken, refused]) = self.odometry.taken().get(at).copied() else {
+                    continue;
+                };
+                if taken + refused > 0 {
+                    tracing::info!(
+                        source = %source.config.parent_frame_id,
+                        kind,
+                        taken,
+                        refused,
+                        scale = self.odometry.noise_scale(at),
+                        "source counters"
+                    );
+                }
+            }
+        }
     }
 
     /// output_from_frame: a sensor's mount.
@@ -345,10 +406,17 @@ impl DimSlamCore {
         if frame == self.output_frame_id {
             return Some((Matrix3::identity(), Vector3::zeros()));
         }
-        Some((
-            output_from_frame.rotation.to_rotation_matrix().into_inner(),
+        let (rotation, translation) = (
+            output_from_frame.rotation,
             output_from_frame.translation.vector,
-        ))
+        );
+        tracing::info!(
+            frame = %frame,
+            translation = ?translation.as_slice(),
+            rotation_deg = ?rotation.scaled_axis().map(f64::to_degrees).as_slice(),
+            "sensor mounted"
+        );
+        Some((rotation.to_rotation_matrix().into_inner(), translation))
     }
 
     /// frame_from_output, identity for the output frame itself.
@@ -360,7 +428,13 @@ impl DimSlamCore {
     }
 
     /// A source's twist, read in its child frame and carried to the output frame's origin.
-    fn twist(&mut self, index: usize, stamp: f64, msg: &OdometryEstimate, child_from_output: &Isometry3<f64>) {
+    fn twist(
+        &mut self,
+        index: usize,
+        stamp: f64,
+        msg: &OdometryEstimate,
+        child_from_output: &Isometry3<f64>,
+    ) {
         let config = &self.sources[index].config;
         let (linear, angular) = (msg.twist.linear, msg.twist.angular);
         let to_output = child_from_output.rotation.inverse();
@@ -369,23 +443,43 @@ impl DimSlamCore {
             && angular.norm() <= config.still_angular_speed
         {
             let still = Vector3::repeat(config.still_variance);
-            self.odometry.push_body_velocity(2 * index, stamp, Vector3::zeros(), still);
-            self.odometry.push_rate(2 * index + 1, stamp, Vector3::zeros(), still);
+            self.odometry
+                .push_body_velocity(2 * index, stamp, Vector3::zeros(), still);
+            self.odometry
+                .push_rate(2 * index + 1, stamp, Vector3::zeros(), still);
             return;
         }
-        let variances: [f64; 6] =
-            std::array::from_fn(|i| resolve_variance(config.twist_variances[i], msg.twist_covariance[(i, i)]));
+        let variances: [f64; 6] = std::array::from_fn(|i| {
+            resolve_variance(config.twist_variances[i], msg.twist_covariance[(i, i)])
+        });
         let velocity = to_output * (linear + angular.cross(&child_from_output.translation.vector));
-        self.odometry.push_body_velocity(2 * index, stamp, velocity, Vector3::new(variances[0], variances[1], variances[2]));
-        self.odometry.push_rate(2 * index + 1, stamp, to_output * angular, Vector3::new(variances[3], variances[4], variances[5]));
+        self.odometry.push_body_velocity(
+            2 * index,
+            stamp,
+            velocity,
+            Vector3::new(variances[0], variances[1], variances[2]),
+        );
+        self.odometry.push_rate(
+            2 * index + 1,
+            stamp,
+            to_output * angular,
+            Vector3::new(variances[3], variances[4], variances[5]),
+        );
     }
 
     /// A drifting pose's step since the source's previous message (within one tracking
     /// segment), as the body's velocity and angular velocity at the step's middle.
-    fn step(&mut self, index: usize, segment: u64, carried: &OdometryEstimate, pose_variances: &[f64; 6]) {
+    fn step(
+        &mut self,
+        index: usize,
+        segment: u64,
+        carried: &OdometryEstimate,
+        pose_variances: &[f64; 6],
+    ) {
         let (t, pose) = (carried.timestamp_ns, carried.pose);
         let previous = self.sources[index].previous.replace((segment, t, pose));
-        let Some((_, t0, pose0)) = previous.filter(|(last_segment, ..)| *last_segment == segment) else {
+        let Some((_, t0, pose0)) = previous.filter(|(last_segment, ..)| *last_segment == segment)
+        else {
             return;
         };
         let dt = (t - t0) as f64 / 1e9;
@@ -397,34 +491,47 @@ impl DimSlamCore {
         });
         let turn = (pose0.rotation.inverse() * pose.rotation).scaled_axis();
         let middle = pose0.rotation * UnitQuaternion::from_scaled_axis(turn / 2.0);
-        let velocity = middle.inverse_transform_vector(&(pose.translation.vector - pose0.translation.vector)) / dt;
+        let velocity = middle
+            .inverse_transform_vector(&(pose.translation.vector - pose0.translation.vector))
+            / dt;
         let stamp = (t0 + t) as f64 / 2e9;
         if variances[..3].iter().any(|v| *v > 0.0) {
-            self.odometry.push_body_velocity(2 * index, stamp, velocity, Vector3::new(variances[0], variances[1], variances[2]));
+            self.odometry.push_body_velocity(
+                2 * index,
+                stamp,
+                velocity,
+                Vector3::new(variances[0], variances[1], variances[2]),
+            );
         }
         if variances[3..].iter().any(|v| *v > 0.0) {
-            self.odometry.push_rate(2 * index + 1, stamp, turn / dt, Vector3::new(variances[3], variances[4], variances[5]));
+            self.odometry.push_rate(
+                2 * index + 1,
+                stamp,
+                turn / dt,
+                Vector3::new(variances[3], variances[4], variances[5]),
+            );
         }
     }
 
-    /// A non-drifting pose: its first message, once the filter runs, aligns the source's world
-    /// to the filter's; later ones are measurements of the body's pose.
+    /// A non-drifting pose: its first message aligns the source's world to the filter's (at
+    /// the filter's pose then, its origin if it has not started); every message, that one
+    /// too, is a measurement of the body's pose.
     fn pose(&mut self, index: usize, stamp: f64, carried: &OdometryEstimate) {
         let source = &mut self.sources[index];
-        let Some(world_from_source) = source.world_from_source else {
-            if self.odometry.started() {
-                let x = self.odometry.state();
-                let body = Isometry3::from_parts(
-                    Translation3::from(x.position),
-                    UnitQuaternion::from_matrix(&x.rotation),
-                );
-                source.world_from_source = Some(body * carried.pose.inverse());
-            }
-            return;
-        };
+        let world_from_source = *source.world_from_source.get_or_insert_with(|| {
+            let x = self.odometry.state();
+            let body = Isometry3::from_parts(
+                Translation3::from(x.position),
+                UnitQuaternion::from_matrix(&x.rotation),
+            );
+            body * carried.pose.inverse()
+        });
         let measured = world_from_source * carried.pose;
         let variances: [f64; 6] = std::array::from_fn(|i| {
-            resolve_variance(source.config.pose_variances[i], carried.pose_covariance[(i, i)])
+            resolve_variance(
+                source.config.pose_variances[i],
+                carried.pose_covariance[(i, i)],
+            )
         });
         self.odometry.push_pose(
             2 * index,
@@ -462,10 +569,103 @@ fn estimate(pose: &LioPose, odom_frame_id: &str, output_frame_id: &str) -> Odome
 
 /// <0 takes the message's, 0 drops; a non-finite or non-positive result drops too.
 fn resolve_variance(configured: f64, from_message: f64) -> f64 {
-    let variance = if configured < 0.0 { from_message } else { configured };
+    let variance = if configured < 0.0 {
+        from_message
+    } else {
+        configured
+    };
     if variance.is_finite() && variance > 0.0 {
         variance
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_tf(_: &str, _: &str) -> Option<Isometry3<f64>> {
+        None
+    }
+
+    #[test]
+    fn a_cameras_translation_moves_the_filter() {
+        let mut slam = DimSlamCore::new(DimSlamCoreConfig {
+            visual_odom_pose_variances: [1e-4, 1e-4, 1e-4, 0.0, 0.0, 0.0],
+            ..Default::default()
+        })
+        .expect("a usable config");
+        // The tracker walks 0.5 m/s along x for two seconds at 30 Hz.
+        for frame in 0..=60i64 {
+            let t = frame as f64 / 30.0;
+            slam.handle_tracked(
+                Some(OdometryEstimate {
+                    timestamp_ns: 1_000_000_000 + (t * 1e9) as i64,
+                    pose: Isometry3::translation(0.5 * t, 0.0, 0.0),
+                    ..Default::default()
+                }),
+                0,
+            );
+        }
+        let estimate = slam.maybe_publish().expect("the camera moved the filter");
+        assert!(
+            (estimate.pose.translation.x - 1.0).abs() < 0.05,
+            "{}",
+            estimate.pose.translation.x
+        );
+        assert!(
+            (estimate.twist.linear.x - 0.5).abs() < 0.05,
+            "{}",
+            estimate.twist.linear.x
+        );
+    }
+
+    #[test]
+    fn wheels_mounted_behind_the_body_move_it_with_no_imu() {
+        // The wheel odometry reports base_link; the body is an IMU 0.2 m ahead of it.
+        let tf = |parent: &str, child: &str| {
+            (parent == "base_link" && child == "imu").then(|| Isometry3::translation(0.2, 0.0, 0.0))
+        };
+        let mut slam = DimSlamCore::new(DimSlamCoreConfig {
+            output_frame_id: "imu".into(),
+            odom_sources: vec![SourceConfig {
+                parent_frame_id: "wheel_odom".into(),
+                child_frame_id: "base_link".into(),
+                kind: SourceKind::Twist,
+                twist_variances: [1e-4; 6],
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .expect("a usable config");
+        // Turning in place at 1 rad/s: the body, ahead of the wheels' center, moves sideways.
+        for step in 0..=50i64 {
+            slam.handle_source(
+                &OdometryEstimate {
+                    timestamp_ns: 1_000_000_000 + step * 20_000_000,
+                    frame_id: "wheel_odom".into(),
+                    child_frame_id: "base_link".into(),
+                    twist: Twist {
+                        linear: Vector3::zeros(),
+                        angular: Vector3::new(0.0, 0.0, 1.0),
+                    },
+                    ..Default::default()
+                },
+                &tf,
+            );
+        }
+        let estimate = slam.maybe_publish().expect("the wheels moved the filter");
+        assert!(
+            (estimate.twist.angular.z - 1.0).abs() < 0.05,
+            "{}",
+            estimate.twist.angular.z
+        );
+        assert!(
+            (estimate.twist.linear - Vector3::new(0.0, 0.2, 0.0)).norm() < 0.03,
+            "{}",
+            estimate.twist.linear
+        );
+        assert!(slam.mount("nowhere", &no_tf).is_none());
     }
 }

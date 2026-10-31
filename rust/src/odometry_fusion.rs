@@ -90,10 +90,21 @@ impl Default for ImuConfig {
 }
 
 /// One lidar: the frame its scans carry, placed relative to the output frame by tf.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LidarConfig {
     pub frame_id: String,
+    /// m^2: variance of one point's distance to its plane. The default is Point-LIO's.
+    pub point_variance: f64,
+}
+
+impl Default for LidarConfig {
+    fn default() -> Self {
+        Self {
+            frame_id: String::new(),
+            point_variance: 0.01,
+        }
+    }
 }
 
 /// How fast the body's motion can change unannounced: random-walk variances, per s^2, of the

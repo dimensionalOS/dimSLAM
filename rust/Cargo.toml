@@ -6,7 +6,7 @@ name = "dim_slam"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Visual-inertial odometry: a cuVSLAM front end and an error-state Kalman fuser"
+description = "Odometry from any set of IMUs, lidars, cameras (cuVSLAM) and odometry sources, fused in one filter"
 repository = "https://github.com/dimensionalOS/dimSLAM"
 
 
