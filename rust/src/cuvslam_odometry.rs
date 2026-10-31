@@ -241,7 +241,11 @@ struct RigCamera {
     frame: String,
     rig_from_camera: Isometry3<f64>,
     info: CameraModel,
+    /// This camera's image in the frame set being tracked.
     image: Option<ImageFrame>,
+    /// Images not yet in a frame set, oldest first: the cameras' streams interleave out of
+    /// step, so a set is matched by stamp rather than by arrival.
+    queued: VecDeque<ImageFrame>,
     /// Multisensor only: this camera's depth image, already aligned to it.
     depth: Option<ImageFrame>,
     /// Scratch for mixed-unit conversion to float32 metres.
@@ -428,6 +432,7 @@ impl CuvslamCore {
                 rig_from_camera,
                 info: info.clone(),
                 image: None,
+                queued: VecDeque::new(),
                 depth: None,
                 depth_meters: Vec::new(),
             });
@@ -546,8 +551,77 @@ impl CuvslamCore {
             );
             return None;
         };
-        self.cameras[index].image = Some(img);
+        self.cameras[index].queued.push_back(img);
+        if !self.match_frame_set() {
+            return None;
+        }
         self.try_track(tf)
+    }
+
+    /// Stereo stamps within this of each other are one frame set (cuVSLAM's Track() contract,
+    /// unless the config widens it).
+    fn skew_limit_ns(&self) -> i64 {
+        if self.config.max_skew_ms > 0.0 {
+            (self.config.max_skew_ms * 1.0e6).round() as i64
+        } else {
+            MAX_PAIR_SKEW_NS
+        }
+    }
+
+    /// Fills each camera's `image` with the newest set of queued images whose stamps agree,
+    /// dropping what that set supersedes and what can no longer find partners. False when no
+    /// camera has a partner yet.
+    fn match_frame_set(&mut self) -> bool {
+        let limit = self.skew_limit_ns();
+        // Each stream arrives in order, so an image older than every other camera's newest
+        // (by more than the limit) has missed its partner for good.
+        let newest: Vec<Option<i64>> = self
+            .cameras
+            .iter()
+            .map(|camera| camera.queued.back().map(|image| image.timestamp_ns))
+            .collect();
+        for index in 0..self.cameras.len() {
+            let others = (0..self.cameras.len())
+                .filter(|other| *other != index)
+                .map(|other| newest[other])
+                .collect::<Option<Vec<i64>>>();
+            if let Some(horizon) = others.and_then(|others| others.into_iter().min()) {
+                let queued = &mut self.cameras[index].queued;
+                while queued
+                    .front()
+                    .is_some_and(|image| image.timestamp_ns < horizon - limit)
+                {
+                    queued.pop_front();
+                }
+            }
+        }
+        let anchor = &self.cameras[0].queued;
+        let matched = anchor.iter().rev().find_map(|image| {
+            let stamp = image.timestamp_ns;
+            let partners = self.cameras[1..]
+                .iter()
+                .map(|camera| {
+                    camera
+                        .queued
+                        .iter()
+                        .position(|other| (other.timestamp_ns - stamp).abs() <= limit)
+                })
+                .collect::<Option<Vec<usize>>>()?;
+            Some((stamp, partners))
+        });
+        let Some((stamp, partners)) = matched else {
+            return false;
+        };
+        let at = self.cameras[0]
+            .queued
+            .iter()
+            .position(|image| image.timestamp_ns == stamp)
+            .expect("found above");
+        let positions = std::iter::once(at).chain(partners);
+        for (camera, position) in self.cameras.iter_mut().zip(positions) {
+            camera.image = camera.queued.drain(..=position).last();
+        }
+        true
     }
 
     pub fn handle_depth_image(
@@ -909,11 +983,7 @@ impl CuvslamCore {
             .collect();
         let oldest = *stamps.iter().min().expect("nonempty");
         let newest = *stamps.iter().max().expect("nonempty");
-        let skew_limit_ns = if self.config.max_skew_ms > 0.0 {
-            (self.config.max_skew_ms * 1.0e6).round() as i64
-        } else {
-            MAX_PAIR_SKEW_NS
-        };
+        let skew_limit_ns = self.skew_limit_ns();
         if newest - oldest > skew_limit_ns {
             self.skew_rejects += 1;
             warn_throttled!(
