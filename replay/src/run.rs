@@ -4,12 +4,10 @@
 use std::time::Instant;
 
 use dim_slam::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion, Vector3};
-use dim_slam::odometry_fusion::lio_odometry::{LioConfig, LioOdometry};
+use dim_slam::nalgebra::Matrix3;
+use dim_slam::odometry_fusion::lio_odometry::{point_lio_imu, LioConfig, LioOdometry};
 use dim_slam::odometry_fusion::{header_seconds, STANDARD_GRAVITY};
-use dim_slam::{
-    DimSlamCore, DimSlamCoreConfig, FusionCore, ImuSample, LidarScan, OdometryEstimate,
-    OdometryFusionConfig, TfLookup,
-};
+use dim_slam::{DimSlamCore, DimSlamCoreConfig, ImuSample, LidarScan, OdometryEstimate, TfLookup};
 
 use crate::db::Recording;
 use crate::lcm;
@@ -34,33 +32,28 @@ pub struct Run {
     pub dropped: Vec<String>,
 }
 
+/// Both publish as their inputs move them: each pose lands in `Run::fused` as it comes.
 enum Core {
-    Fusion(Box<FusionCore>),
     Slam(Box<DimSlamCore>),
-    /// Publishes at its own scans, not the timer: each pose lands in `Run::fused` as it comes.
-    Lio(Box<LioOdometry>),
+    /// Point-LIO alone: the first IMU and the lidar in the output frame, the lidar placed by tf.
+    Lio(Box<LioOdometry>, String),
 }
 
 impl Core {
     fn source(&mut self, msg: &OdometryEstimate, tf: &TfBuffer) {
-        match self {
-            Core::Fusion(core) => core.handle_source(msg),
-            Core::Slam(core) => core.handle_source(msg, tf),
-            Core::Lio(..) => {}
+        if let Core::Slam(core) = self {
+            core.handle_source(msg, tf);
         }
     }
 
-    fn publish(&mut self, now_ns: i64) -> Option<OdometryEstimate> {
-        match self {
-            Core::Fusion(core) => core.maybe_publish_at(now_ns),
-            Core::Slam(core) => core.maybe_publish_at(now_ns),
-            Core::Lio(..) => None,
-        }
-    }
-
-    /// Point-LIO's poses since the last call, as the module drains after every message.
+    /// The poses published since the last call, as the module drains after every message.
     fn drain(&mut self, fused: &mut Vec<(i64, Isometry3<f64>)>) {
-        if let Core::Lio(lio) = self {
+        if let Core::Slam(core) = self {
+            if let Some(msg) = core.maybe_publish() {
+                fused.push((msg.timestamp_ns, msg.pose));
+            }
+        }
+        if let Core::Lio(lio, _) = self {
             while let Some(published) = lio.step() {
                 if let Some(pose) = published {
                     let [x, y, z, w] = pose.quaternion;
@@ -77,8 +70,9 @@ impl Core {
     }
 
     fn imu(&mut self, sample: &ImuSample) {
-        if let Core::Lio(lio) = self {
+        if let Core::Lio(lio, _) = self {
             lio.push_imu(
+                0,
                 header_seconds(sample.timestamp_ns),
                 sample.angular_velocity,
                 sample.linear_acceleration / STANDARD_GRAVITY,
@@ -90,6 +84,7 @@ impl Core {
     fn cloud(
         &mut self,
         scan: &LidarScan,
+        tf: &TfBuffer,
         scans_before: u64,
         perturb: Option<(u64, u64)>,
     ) -> Result<(), String> {
@@ -99,22 +94,40 @@ impl Core {
         };
         let scan = perturbed.as_ref().unwrap_or(scan);
         match self {
-            Core::Fusion(_) => {
-                return Err("lidar: the fusion core takes none; use slam mode's point_lio engine".into())
+            Core::Slam(core) => core.handle_cloud(scan, tf),
+            Core::Lio(lio, output_frame) => {
+                if !lio.lidar_mounted(0) {
+                    let mount = tf
+                        .latest(output_frame, &scan.frame_id)
+                        .ok_or(format!("lidar: tf has no {output_frame} -> {}", scan.frame_id))?;
+                    lio.set_lidar_mount(
+                        0,
+                        mount.rotation.to_rotation_matrix().into_inner(),
+                        mount.translation.vector,
+                    );
+                }
+                lio.push_scan(0, scan);
             }
-            Core::Slam(core) => core.handle_cloud(scan),
-            Core::Lio(lio) => lio.push_scan(scan),
         }
         Ok(())
     }
 
     fn report(&self) {
-        match self {
-            Core::Fusion(core) => core.report(),
-            Core::Slam(core) => core.report(),
-            Core::Lio(..) => {}
+        if let Core::Slam(core) = self {
+            core.report();
         }
     }
+}
+
+/// Keeps the points whose index is `k` modulo `n`, with their per-point fields.
+fn keep_every(scan: &mut LidarScan, k: usize, n: usize) {
+    fn keep<T: Copy>(values: &mut Vec<T>, k: usize, n: usize) {
+        *values = values.iter().enumerate().filter(|(i, _)| i % n == k).map(|(_, v)| *v).collect();
+    }
+    keep(&mut scan.points, k, n);
+    keep(&mut scan.offsets_ns, k, n);
+    keep(&mut scan.tags, k, n);
+    keep(&mut scan.intensities, k, n);
 }
 
 fn drop_point(scan: &LidarScan, seed: u64) -> LidarScan {
@@ -176,18 +189,12 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
     let datasets = options.datasets.as_path();
     let config = scenario.variant_config(variant)?;
     let path = scenario.recording_path(datasets);
-    let (mut core, publish_rate, output_frame) = match scenario.mode {
-        Mode::Fusion => {
-            let config: OdometryFusionConfig =
-                serde_json::from_value(config).map_err(|e| format!("config: {e}"))?;
-            let (rate, frame) = (config.publish_rate, config.output_frame_id.clone());
-            (Core::Fusion(Box::new(FusionCore::new(config))), rate, frame)
-        }
+    let (mut core, output_frame) = match scenario.mode {
         Mode::Slam => {
             let config: DimSlamCoreConfig =
                 serde_json::from_value(config).map_err(|e| format!("config: {e}"))?;
-            let (rate, frame) = (config.publish_rate, config.output_frame_id.clone());
-            (Core::Slam(Box::new(DimSlamCore::new(config)?)), rate, frame)
+            let frame = config.output_frame_id.clone();
+            (Core::Slam(Box::new(DimSlamCore::new(config)?)), frame)
         }
         Mode::PointLio => {
             let frame = config
@@ -195,16 +202,20 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
                 .and_then(|v| v.as_str())
                 .unwrap_or("mid360_imu")
                 .to_string();
-            let mut lio = LioConfig::default();
+            let mut imu = point_lio_imu();
             // The sensor's clip levels, when they differ from Point-LIO's defaults.
             if let Some(clip) = config.get("accel_clip_g").and_then(|v| v.as_f64()) {
-                lio.imu.clip = lio.imu.clip.map(|(gyro, _)| (gyro, clip));
+                imu.clip = imu.clip.map(|(gyro, _)| (gyro, clip));
             }
             if let Some(clip) = config.get("gyro_clip").and_then(|v| v.as_f64()) {
-                lio.imu.clip = lio.imu.clip.map(|(_, accel)| (clip, accel));
+                imu.clip = imu.clip.map(|(_, accel)| (clip, accel));
             }
-            let odometry = LioOdometry::new(lio);
-            (Core::Lio(Box::new(odometry)), 50.0, frame)
+            let lio = LioConfig::default();
+            let walks = [lio.process[3], lio.process[4]];
+            let point_variance = lio.lidar.point_variance;
+            let mut odometry = LioOdometry::new(lio, vec![(imu, walks)], vec![point_variance]);
+            odometry.set_imu_mount(0, Matrix3::identity(), Vector3::zeros());
+            (Core::Lio(Box::new(odometry), frame.clone()), frame)
         }
     };
 
@@ -290,7 +301,6 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
         scenario.duration_seconds,
     )?;
 
-    let period_ns = (1.0e9 / publish_rate) as i64;
     let mut run = Run {
         variant: variant.to_string(),
         fused: Vec::new(),
@@ -331,10 +341,8 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
         track.sort_by_key(|(t, _)| *t);
     }
     run.rest.sort_by_key(|(t, _)| *t);
-    let mut next_tick: Option<i64> = None;
     let (mut first_ts, mut last_ts) = (f64::NAN, f64::NAN);
-    let recording_end_ns = (recording.last_ts * 1e9) as i64;
-    let mut turns = TurnCache::open(&scenario.name, !scenario.images.is_empty(), options)?;
+    let mut turns = TurnCache::open(&scenario.name, variant, !scenario.images.is_empty(), options)?;
     let mut scans_given = 0u64;
     let started = Instant::now();
     while let Some(record) = recording.next_record()? {
@@ -343,39 +351,6 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
         }
         last_ts = record.ts;
         for role in roles[record.stream].clone() {
-            let stamp = match role {
-                Role::Source(index) => {
-                    lcm::odometry(&record.data)?.timestamp_ns + scenario.sources[index].offset_ns()
-                }
-                Role::Reference | Role::Baseline(_) | Role::Rest => 0,
-                Role::Imu(index) => {
-                    lcm::imu(&record.data)?.timestamp_ns + scenario.imus[index].offset_ns()
-                }
-                Role::Lidar(index) => {
-                    lcm::lidar_stamp(&record.data)? + scenario.lidars[index].offset_ns()
-                }
-                Role::Image(index) => {
-                    (record.ts * 1e9) as i64 + scenario.images[index].offset_ns()
-                }
-                Role::CameraInfo(index) => {
-                    (record.ts * 1e9) as i64 + scenario.camera_infos[index].offset_ns()
-                }
-            };
-            // A stamp past the end of the time the recording covers is on another clock (a
-            // driver glitch) and must not drag the publish timer with it; the core decides what
-            // to do with it.
-            let off_clock = stamp > recording_end_ns;
-            // Publish every tick the data clock has passed, as the live module's timer would.
-            if !off_clock && !matches!(role, Role::Reference | Role::Baseline(_) | Role::Rest) {
-                let tick = next_tick.get_or_insert(stamp);
-                while *tick <= stamp {
-                    if let Some(msg) = core.publish(*tick) {
-                        // Scored at the instant the pose is of, which a filter may set past the tick.
-                        run.fused.push((msg.timestamp_ns, msg.pose));
-                    }
-                    *tick += period_ns;
-                }
-            }
             match role {
                 Role::Source(index) => {
                     match remap(&scenario.sources[index], lcm::odometry(&record.data)?, &tf) {
@@ -408,11 +383,24 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
                     if let Some(frame_id) = scenario.lidars[index].frame_id() {
                         scan.frame_id = frame_id.to_string();
                     }
-                    if let Err(why) = core.cloud(&scan, scans_given, options.perturb) {
+                    if let Some([k, n]) = scenario.lidars[index].every() {
+                        keep_every(&mut scan, k, n);
+                    }
+                    if let Some(frame) = scenario.lidars[index].points_in() {
+                        let to = tf.latest(frame, &scan.frame_id).ok_or(format!(
+                            "lidar: tf has no {frame} -> {}",
+                            scan.frame_id
+                        ))?;
+                        for p in &mut scan.points {
+                            let moved = to * dim_slam::nalgebra::Point3::new(p[0] as f64, p[1] as f64, p[2] as f64);
+                            *p = [moved.x as f32, moved.y as f32, moved.z as f32];
+                        }
+                        scan.frame_id = frame.to_string();
+                    }
+                    if let Err(why) = core.cloud(&scan, &tf, scans_given, options.perturb) {
                         run.dropped.push(why);
                     }
                     scans_given += 1;
-                    core.drain(&mut run.fused);
                 }
                 Role::Imu(index) => {
                     let mut sample = lcm::imu(&record.data)?;
@@ -421,38 +409,29 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
                         sample.frame_id = frame_id.to_string();
                     }
                     match &mut core {
-                        Core::Fusion(core) => match tf.latest(&output_frame, &sample.frame_id) {
-                            Some(mount) => core.handle_imu(&sample, &mount),
-                            None => run.dropped.push(format!(
-                                "imu: tf has no {output_frame} -> {}",
-                                sample.frame_id
-                            )),
-                        },
                         Core::Slam(core) => core.handle_imu(&sample, &tf),
-                        Core::Lio(..) => {
-                            core.imu(&sample);
-                            core.drain(&mut run.fused);
-                        }
+                        Core::Lio(..) => core.imu(&sample),
                     }
                 }
                 Role::Image(index) => {
                     if let Core::Slam(core) = &mut core {
-                        if let Some(played) = turns.played.as_mut() {
-                            let (tracked, segment) = played
+                        let (tracked, segment) = match turns.played.as_mut() {
+                            Some(played) => played
                                 .pop_front()
-                                .ok_or("the turn cache has fewer frames than the recording")?;
-                            core.handle_tracked(tracked, segment);
-                            continue;
-                        }
-                        let mut image = lcm::image(&record.data)?;
-                        image.timestamp_ns += scenario.images[index].offset_ns();
-                        if let Some(frame_id) = scenario.images[index].frame_id() {
-                            image.frame_id = frame_id.to_string();
-                        }
-                        let (tracked, segment) = core.track_image(image, &tf);
-                        if let Some(recorded) = turns.recorded.as_mut() {
-                            recorded.push(turn_line(tracked.as_ref(), segment));
-                        }
+                                .ok_or("the turn cache has fewer frames than the recording")?,
+                            None => {
+                                let mut image = lcm::image(&record.data)?;
+                                image.timestamp_ns += scenario.images[index].offset_ns();
+                                if let Some(frame_id) = scenario.images[index].frame_id() {
+                                    image.frame_id = frame_id.to_string();
+                                }
+                                let (tracked, segment) = core.track_image(image, &tf);
+                                if let Some(recorded) = turns.recorded.as_mut() {
+                                    recorded.push(turn_line(tracked.as_ref(), segment));
+                                }
+                                (tracked, segment)
+                            }
+                        };
                         core.handle_tracked(tracked, segment);
                     }
                 }
@@ -470,6 +449,7 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
                     }
                 }
             }
+            core.drain(&mut run.fused);
         }
     }
     turns.finish()?;
@@ -488,10 +468,11 @@ struct TurnCache {
 }
 
 impl TurnCache {
-    /// A scenario without images has nothing to cache.
-    fn open(scenario: &str, has_images: bool, options: &ReplayOptions) -> Result<Self, String> {
+    /// A scenario without images has nothing to cache. Each variant has its own: one may
+    /// configure other cameras, or none.
+    fn open(scenario: &str, variant: &str, has_images: bool, options: &ReplayOptions) -> Result<Self, String> {
         let file = |dir: &Option<std::path::PathBuf>| {
-            dir.as_ref().map(|dir| dir.join(format!("{scenario}.jsonl")))
+            dir.as_ref().map(|dir| dir.join(format!("{scenario}.{variant}.jsonl")))
         };
         let played = match file(&options.turns_play).filter(|_| has_images) {
             Some(path) => {
@@ -519,11 +500,14 @@ impl TurnCache {
     }
 }
 
-/// Only what a turn reads: the stamp, the rotation and the segment.
+/// What the filter reads of a tracked frame: the stamp, the pose, its covariance's diagonal
+/// and the segment.
 fn turn_line(tracked: Option<&OdometryEstimate>, segment: u64) -> String {
     let estimate = tracked.map(|estimate| {
         let q = estimate.pose.rotation.quaternion();
-        serde_json::json!([estimate.timestamp_ns, q.w, q.i, q.j, q.k])
+        let t = estimate.pose.translation.vector;
+        let c: Vec<f64> = (0..6).map(|i| estimate.pose_covariance[(i, i)]).collect();
+        serde_json::json!([estimate.timestamp_ns, q.w, q.i, q.j, q.k, t.x, t.y, t.z, c])
     });
     serde_json::json!({ "segment": segment, "estimate": estimate }).to_string()
 }
@@ -532,16 +516,29 @@ fn parse_turn_line(line: &str) -> Result<(Option<OdometryEstimate>, u64), String
     let value: serde_json::Value =
         serde_json::from_str(line).map_err(|e| format!("turn cache line: {e}"))?;
     let segment = value["segment"].as_u64().ok_or("turn cache line: no segment")?;
-    let estimate = value["estimate"].as_array().map(|fields| {
-        let at = |i: usize| fields[i].as_f64().unwrap_or(0.0);
-        OdometryEstimate {
-            timestamp_ns: fields[0].as_i64().unwrap_or(0),
-            pose: Isometry3::from_parts(
-                Translation3::identity(),
-                UnitQuaternion::new_unchecked(Quaternion::new(at(1), at(2), at(3), at(4))),
-            ),
-            ..Default::default()
+    let estimate = match value["estimate"].as_array() {
+        None => None,
+        Some(fields) if fields.len() < 9 => {
+            return Err("turn cache line: no translation (recorded before cameras were fused \
+                        as a whole pose); record it again"
+                .into())
         }
-    });
+        Some(fields) => {
+            let at = |i: usize| fields[i].as_f64().unwrap_or(0.0);
+            let mut pose_covariance = dim_slam::nalgebra::Matrix6::zeros();
+            for (i, c) in fields[8].as_array().into_iter().flatten().enumerate().take(6) {
+                pose_covariance[(i, i)] = c.as_f64().unwrap_or(0.0);
+            }
+            Some(OdometryEstimate {
+                timestamp_ns: fields[0].as_i64().unwrap_or(0),
+                pose: Isometry3::from_parts(
+                    Translation3::new(at(5), at(6), at(7)),
+                    UnitQuaternion::new_unchecked(Quaternion::new(at(1), at(2), at(3), at(4))),
+                ),
+                pose_covariance,
+                ..Default::default()
+            })
+        }
+    };
     Ok((estimate, segment))
 }

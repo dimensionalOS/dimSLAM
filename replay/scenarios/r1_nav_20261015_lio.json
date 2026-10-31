@@ -1,6 +1,6 @@
 {
  "name": "r1_nav_20261015_lio",
- "description": "R1 driving 29 m: dimSLAM's point_lio engine on the raw Mid-360 lidar + IMU, with and without wheel odometry, scored against the recorded live Point-LIO",
+ "description": "R1 driving 29 m: dimSLAM's one filter on the raw Mid-360 lidar + IMU, then with wheel odometry, then with the head stereo cameras too (their tf is uncalibrated), scored against the recorded live Point-LIO The head cameras are fused loose: their tf is uncalibrated, so their own (tight) covariance would trust a misplaced camera.",
  "recording": "r1/cloud/r1_nav_20261015.db",
  "mode": "slam",
  "tf_stream": "tf",
@@ -42,17 +42,9 @@
  "config": {
   "odom_frame_id": "odom",
   "output_frame_id": "imu_link",
-  "publish_rate": 50.0,
   "imus": [
    {
-    "frame_id": "imu_link",
-    "gyro_noise_density": 0.01,
-    "gyro_random_walk": 0.0001,
-    "accel_noise_density": 0.15,
-    "accel_random_walk": 0.001,
-    "init_gyro_limit": 0.3,
-    "accel_saturation": 39.2,
-    "gyro_saturation": 34.9
+    "frame_id": "imu_link"
    }
   ],
   "lidars": [
@@ -61,7 +53,6 @@
    }
   ],
   "use_gpu": true,
-  "point_lio": {},
   "odom_sources": [
    {
     "parent_frame_id": "wheel_odom",
@@ -76,24 +67,50 @@
      0.0
     ],
     "twist_variances": [
-     0.0005,
-     0.0005,
+     0.002,
+     0.002,
      0,
      0,
      0,
-     0.0006
+     0.0024
     ],
     "still_variance": 1e-06,
     "still_speed": 0.001,
     "still_angular_speed": 0.001
    }
+  ],
+  "camera_mode": "stereo",
+  "cameras": [
+   {
+    "frame_id": "camera_head_left_link",
+    "rectified": false
+   },
+   {
+    "frame_id": "camera_head_right_link",
+    "rectified": false
+   }
+  ],
+  "covariance_gate_translation_std": 0.0,
+  "speed_gate_max_linear": 5.0,
+  "speed_gate_max_angular": 12.0,
+  "visual_odom_pose_variances": [
+   0.01,
+   0.01,
+   0.0,
+   0.05,
+   0.05,
+   0.05
   ]
  },
  "variants": {
-  "lio_wheels": {},
   "lio": {
-   "/odom_sources": []
-  }
+   "/odom_sources": [],
+   "/cameras": []
+  },
+  "lio_wheels": {
+   "/cameras": []
+  },
+  "all": {}
  },
  "expect": {
   "lio": {
@@ -110,6 +127,14 @@
    },
    "rest_p2p_mm_mean": {
     "max": 10.0
+   },
+   "moving_path_m": {
+    "max": 32.0
+   }
+  },
+  "all": {
+   "ate_xy_mm_mean": {
+    "max": 9.0
    },
    "moving_path_m": {
     "max": 32.0
@@ -132,5 +157,13 @@
    "ate_xy_mm_mean": 7.26,
    "rest_p2p_mm_mean": 6.16
   }
- }
+ },
+ "images": [
+  "head_left_color",
+  "head_right_color"
+ ],
+ "camera_infos": [
+  "head_left_info",
+  "head_right_info"
+ ]
 }

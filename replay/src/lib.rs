@@ -30,10 +30,12 @@ pub struct ReplayOptions {
     /// (scan index, seed): that scan, counted from 0, loses one point the seed picks. A run
     /// that differs by nothing physical, to see how far a chaotic filter's outcome spreads.
     pub perturb: Option<(u64, u64)>,
-    /// Writes the tracker's output per image to `<dir>/<scenario>.jsonl` (kept if it exists).
+    /// Writes the tracker's output per image to `<dir>/<scenario>.<variant>.jsonl` (kept if it
+    /// exists).
     pub turns_record: Option<PathBuf>,
-    /// Feeds `<dir>/<scenario>.jsonl` back in place of the images: reruns the fusion without
-    /// the tracker, which is slow, needs its SDK, and is not repeatable run to run.
+    /// Feeds `<dir>/<scenario>.<variant>.jsonl` back in place of the images: reruns the
+    /// filter without the tracker, which is slow, needs its SDK, and is not repeatable run to
+    /// run.
     pub turns_play: Option<PathBuf>,
 }
 

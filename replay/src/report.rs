@@ -113,7 +113,7 @@ pub fn html(
 <script src="https://cdn.jsdelivr.net/npm/plotly.js-dist-min@2.35.2/plotly.min.js"></script>
 <style>:root{{--bg:#fff;--fg:#222;--line:#ccc}} @media (prefers-color-scheme: dark){{:root{{--bg:#111;--fg:#ddd;--line:#444}}}}
 body{{font-family:system-ui;margin:16px;background:var(--bg);color:var(--fg)}} .wrap{{overflow-x:auto}} table{{border-collapse:collapse;font-size:13px}} td,th{{border:1px solid var(--line);padding:3px 7px;text-align:right}} td:first-child{{text-align:left}} tr.ref{{opacity:.7}} .plot{{height:440px}} .pass{{color:#2aa876}} .fail{{color:#e1572a}}</style></head><body>
-<h2>{title}</h2>{verdict}<p>Grey bands: the rest stream reads still. rest p2p = the output's extent within a band; moving roughness = rms second difference between publish ticks; error = distance from the reference aligned at the first sample.</p>
+<h2>{title}</h2>{verdict}<p>Grey bands: the rest stream reads still. rest p2p = the output's extent within a band; moving roughness = rms second difference of the output at the reference's instants; error = distance from the reference aligned at the first sample.</p>
 <div class=wrap><table><tr><th>variant</th>{header}</tr>{rows}</table></div>
 <div id=x class=plot></div><div id=err class=plot></div><div id=path class=plot></div>
 <script>

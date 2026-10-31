@@ -2,7 +2,7 @@
  "name": "r1_nav_20261015",
  "description": "R1 driving 29 m with two rests, Point-LIO + wheels, no IMU or cameras (r1pro_fused_odometry)",
  "recording": "r1/cloud/r1_nav_20261015.db",
- "mode": "fusion",
+ "mode": "slam",
  "tf_stream": "tf",
  "tf_ignored_parents": [
   "odom"
@@ -32,32 +32,7 @@
  "config": {
   "odom_frame_id": "odom",
   "output_frame_id": "base_link",
-  "publish_rate": 50.0,
-  "replay_buffer_seconds": 0.5,
-  "outlier_rejection_allowed_variance": 25.0,
-  "max_position_m": 10000.0,
   "imus": [],
-  "initial_gravity_estimate": 9.8,
-  "initial_stds": {
-   "position": 0.01,
-   "velocity": 0.1,
-   "rotation": 0.05,
-   "angular_velocity": 0.1,
-   "bias": 0.05
-  },
-  "process_noise": {
-   "linear_acceleration": 2.0,
-   "angular_acceleration": 1.0
-  },
-  "planar": true,
-  "zero_velocity_variances": [
-   0.0,
-   0.0,
-   0.0,
-   0.0,
-   0.0,
-   0.0
-  ],
   "odom_sources": [
    {
     "parent_frame_id": "pointlio_odom",
@@ -66,9 +41,9 @@
     "pose_variances": [
      0.0002,
      0.0002,
-     0,
-     0,
-     0,
+     0.0002,
+     3.3e-05,
+     3.3e-05,
      3.3e-05
     ],
     "twist_variances": [
@@ -93,70 +68,50 @@
      0.0
     ],
     "twist_variances": [
-     0.0005,
-     0.0005,
-     0,
-     0,
-     0,
-     0.0006
+     0.002,
+     0.002,
+     0.002,
+     0.0024,
+     0.0024,
+     0.0024
     ],
     "still_variance": 1e-06,
     "still_speed": 0.001,
     "still_angular_speed": 0.001
    }
-  ]
+  ],
+  "process_noise": {
+   "velocity": 2.0,
+   "angular_velocity": 30.0,
+   "specific_force": 500.0
+  }
  },
  "variants": {
-  "fixes": {},
-  "imm": {
-   "/imm": true,
-   "/odom_sources/1/still_variance": 0.0
-  }
+  "fixes": {}
  },
  "expect": {
   "fixes": {
    "error_mm_mean": {
-    "max": 6.5
+    "max": 9.5
    },
    "error_mm_p95": {
-    "max": 16.0
+    "max": 24.0
    },
    "moving_roughness_rms_mm": {
-    "max": 2.4
-   }
-  },
-  "imm": {
+    "max": 36.5
+   },
    "rest_p2p_mm_mean": {
-    "max": 3.0
-   },
-   "error_mm_mean": {
     "max": 6.5
-   },
-   "error_mm_p95": {
-    "max": 16.5
-   },
-   "moving_roughness_rms_mm": {
-    "max": 2.4
    }
   }
  },
  "baseline": {
-  "note": "beta3 = 4a65da1 with realign_after_seconds 1.0 and the frozen still flag",
-  "beta3": {
-   "rest_p2p_mm_mean": 2.89,
-   "error_mm_mean": 6.04,
-   "error_mm_p95": 14.82,
-   "moving_roughness_rms_mm": 2.27
-  },
+  "note": "2026-10-31 Mac, one filter: error is distance from the recorded Point-LIO this run fuses (the old ESKF tracked it closer: 5.83 mean; on the reference-instant roughness it scored 30.06)",
   "fixes": {
-   "rest_p2p_mm_mean": 15.82,
-   "error_mm_mean": 5.84,
-   "error_mm_p95": 14.68
-  },
-  "imm": {
-   "rest_p2p_mm_mean": 2.37,
-   "error_mm_mean": 6.07,
-   "error_mm_p95": 15.31
+   "error_mm_mean": 9.0,
+   "error_mm_p95": 22.94,
+   "moving_roughness_rms_mm": 34.98,
+   "rest_p2p_mm_mean": 5.76
   }
  }
 }

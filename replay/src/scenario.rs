@@ -10,9 +10,7 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
-    /// `FusionCore` alone: odometry sources and IMUs, no cameras.
-    Fusion,
-    /// `DimSlamCore`: cuVSLAM on the images, fused with the sources.
+    /// `DimSlamCore`: every stream the scenario names, fused in its one filter.
     Slam,
     /// `LioOdometry`: lidar and IMU in Point-LIO's schedule, each scan's pose published.
     PointLio,
@@ -71,6 +69,14 @@ pub enum SensorStream {
         /// camera_info only: the lens model, for a recording that mislabels it.
         #[serde(default)]
         distortion_model: Option<String>,
+        /// Lidar only: [k, n] keeps the points whose index is k modulo n, so one scan can be
+        /// split between several streams.
+        #[serde(default)]
+        every: Option<[usize; 2]>,
+        /// Lidar only: re-expresses the points in this frame (placed by tf) and stamps the
+        /// scan with it: the scan as a lidar mounted there would have taken it.
+        #[serde(default)]
+        points_in: Option<String>,
     },
 }
 
@@ -86,6 +92,20 @@ impl SensorStream {
         match self {
             SensorStream::Name(_) => None,
             SensorStream::Spec { frame_id, .. } => frame_id.as_deref(),
+        }
+    }
+
+    pub fn every(&self) -> Option<[usize; 2]> {
+        match self {
+            SensorStream::Name(_) => None,
+            SensorStream::Spec { every, .. } => *every,
+        }
+    }
+
+    pub fn points_in(&self) -> Option<&str> {
+        match self {
+            SensorStream::Name(_) => None,
+            SensorStream::Spec { points_in, .. } => points_in.as_deref(),
         }
     }
 
@@ -154,7 +174,7 @@ pub struct Scenario {
     pub sources: Vec<OdometryStream>,
     #[serde(default)]
     pub imus: Vec<SensorStream>,
-    /// PointCloud2 scans: Point-LIO's (point_lio mode, or slam mode's point_lio engine).
+    /// PointCloud2 scans, each stream's frame one of the config's `lidars`.
     #[serde(default)]
     pub lidars: Vec<SensorStream>,
     #[serde(default)]
@@ -172,7 +192,7 @@ pub struct Scenario {
     #[serde(default)]
     pub tags: Option<crate::tags::TagSpec>,
     pub rest: Rest,
-    /// The core's config: `OdometryFusionConfig` for fusion, `DimSlamCoreConfig` for slam.
+    /// The core's config: `DimSlamCoreConfig` for slam.
     pub config: Value,
     /// Variant name -> JSON pointer -> value set on `config`; null removes the key.
     pub variants: BTreeMap<String, BTreeMap<String, Value>>,

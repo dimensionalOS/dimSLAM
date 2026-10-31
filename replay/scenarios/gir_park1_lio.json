@@ -1,6 +1,6 @@
 {
  "name": "gir_park1_lio",
- "description": "Go2 (SF Mid-360 mount, pitched 60 deg down) walking a 782 m park loop with tag revisits, 28 min; Mid-360 streams rebuilt from the pcap (host clock), the camera ends at 20 min. DimSlamCore with the point_lio engine (Point-LIO, 4 g accel clip): lidar + IMU only. Scored on AprilTag revisits and against Point-LIO + tag loop closures.",
+ "description": "Go2 (SF Mid-360 mount, pitched 60 deg down) walking a 782 m park loop with tag revisits, 28 min; Mid-360 streams rebuilt from the pcap (host clock), the camera ends at 20 min. DimSlamCore with the point_lio engine (Point-LIO): lidar + IMU only. Scored on AprilTag revisits and against Point-LIO + tag loop closures.",
  "recording": "gir_park1/mem2.db",
  "mode": "slam",
  "tf_stream": "tf",
@@ -108,17 +108,9 @@
  "config": {
   "odom_frame_id": "odom",
   "output_frame_id": "mid360_imu",
-  "publish_rate": 50.0,
   "imus": [
    {
-    "frame_id": "mid360_imu",
-    "gyro_noise_density": 0.01,
-    "gyro_random_walk": 0.0001,
-    "accel_noise_density": 0.15,
-    "accel_random_walk": 0.001,
-    "init_gyro_limit": 0.3,
-    "accel_saturation": 39.2,
-    "gyro_saturation": 34.9
+    "frame_id": "mid360_imu"
    }
   ],
   "lidars": [
@@ -132,15 +124,9 @@
     "frame_id": "camera_optical"
    }
   ],
-  "use_gpu": true,
-  "point_lio": {
-   "accel_clip_g": 4.0
-  }
+  "use_gpu": true
  },
  "variants": {
-  "default": {},
-  "clip3": {
-   "/point_lio/accel_clip_g": null
-  }
+  "default": {}
  }
 }

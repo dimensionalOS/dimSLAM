@@ -56,13 +56,9 @@
   "trim_seconds": 0.3
  },
  "config": {
-  "output_frame_id": "mid360_imu",
-  "accel_clip_g": 4.0
+  "output_frame_id": "mid360_imu"
  },
  "variants": {
-  "default": {},
-  "clip3": {
-   "/accel_clip_g": null
-  }
+  "default": {}
  }
 }

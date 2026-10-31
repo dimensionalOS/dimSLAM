@@ -34,14 +34,10 @@
   "time_offset_seconds": -3216587.785
  },
  "config": {
-  "output_frame_id": "imu_frame",
-  "accel_clip_g": 4.0
+  "output_frame_id": "imu_frame"
  },
  "variants": {
-  "default": {},
-  "clip3": {
-   "/accel_clip_g": null
-  }
+  "default": {}
  },
  "tags": {
   "stream": "raw_april_tags",

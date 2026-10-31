@@ -36,33 +36,19 @@
  "config": {
   "odom_frame_id": "odom",
   "output_frame_id": "imu_frame",
-  "publish_rate": 50.0,
   "imus": [
    {
-    "frame_id": "imu_frame",
-    "gyro_noise_density": 0.01,
-    "gyro_random_walk": 0.0001,
-    "accel_noise_density": 0.15,
-    "accel_random_walk": 0.001,
-    "init_gyro_limit": 0.3,
-    "accel_saturation": 29.4,
-    "gyro_saturation": 34.9
+    "frame_id": "imu_frame"
    }
   ],
   "lidars": [
    {
     "frame_id": "mid360_link"
    }
-  ],
-  "point_lio": {
-   "accel_clip_g": 4.0
-  }
+  ]
  },
  "variants": {
-  "default": {},
-  "clip3": {
-   "/point_lio/accel_clip_g": null
-  }
+  "default": {}
  },
  "tags": {
   "stream": "raw_april_tags",

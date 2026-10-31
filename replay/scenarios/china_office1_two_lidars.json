@@ -1,0 +1,146 @@
+{
+ "name": "china_office1_two_lidars",
+ "description": "Go2 office loop, 20 min, with two lidars made from the Mid-360: its even points as one, its odd points re-expressed in a second frame (turned a quarter about z, 0.25 m forward, 0.1 m right, 0.05 m up of it) as another, each placed by tf. Both sweep at once, so every scan of one is merged with the other's. Scored on AprilTag revisits against the Mid-360 alone. (The recording's Go2 L1 cloud is not a raw scan: ~26k points per cloud at 7 Hz with no per-point times, already in the body frame.)",
+ "recording": "mid360_recordings/2026-06-12_03-26am-PST__china_office1/mem2.db",
+ "mode": "slam",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom",
+  "map",
+  "world"
+ ],
+ "static_tf": [
+  {
+   "parent": "mid360_imu",
+   "child": "mid360_link",
+   "translation": [
+    -0.011,
+    -0.02329,
+    0.04412
+   ]
+  },
+  {
+   "parent": "mid360_link",
+   "child": "mid360_even",
+   "translation": [
+    0.0,
+    0.0,
+    0.0
+   ]
+  },
+  {
+   "parent": "mid360_link",
+   "child": "virtual_lidar",
+   "translation": [
+    0.25,
+    -0.1,
+    0.05
+   ],
+   "rotation": [
+    0.0,
+    0.0,
+    0.7071067811865476,
+    0.7071067811865476
+   ]
+  }
+ ],
+ "imus": [
+  {
+   "stream": "livox_imu_pcap3",
+   "frame_id": "mid360_imu"
+  }
+ ],
+ "lidars": [
+  "livox_lidar",
+  {
+   "stream": "livox_lidar",
+   "frame_id": "mid360_even",
+   "every": [
+    0,
+    2
+   ]
+  },
+  {
+   "stream": "livox_lidar",
+   "every": [
+    1,
+    2
+   ],
+   "points_in": "virtual_lidar"
+  }
+ ],
+ "reference": {
+  "stream": "pointlio_odometry_corrected"
+ },
+ "baselines": [
+  {
+   "stream": "pointlio_odometry"
+  }
+ ],
+ "tags": {
+  "stream": "raw_april_tags",
+  "camera_frame": "camera_optical",
+  "max_distance_m": 1.5,
+  "max_reproj_px": 3.5,
+  "min_tag_px": 12,
+  "max_lin_speed": 1.5,
+  "max_ang_speed": 150,
+  "visit_gap_seconds": 20,
+  "min_sharpness": 25
+ },
+ "rest": {
+  "stream": "pointlio_odometry",
+  "speed": 0.05,
+  "angular_speed": 0.05,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ },
+ "config": {
+  "odom_frame_id": "odom",
+  "output_frame_id": "mid360_imu",
+  "imus": [
+   {
+    "frame_id": "mid360_imu"
+   }
+  ],
+  "lidars": [
+   {
+    "frame_id": "mid360_link"
+   }
+  ]
+ },
+ "variants": {
+  "mid360_lidar": {},
+  "two_lidars": {
+   "/lidars": [
+    {
+     "frame_id": "mid360_even"
+    },
+    {
+     "frame_id": "virtual_lidar"
+    }
+   ]
+  }
+ },
+ "expect": {
+  "mid360_lidar": {
+   "tag_revisit_mm_mean": {
+    "max": 13.8
+   }
+  },
+  "two_lidars": {
+   "tag_revisit_mm_mean": {
+    "max": 15.0
+   }
+  }
+ },
+ "baseline": {
+  "note": "2026-10-31 Mac; two_lidars bound = 1.1x the Mid-360 alone (13.66 mm), which matches standalone Point-LIO",
+  "mid360_lidar": {
+   "tag_revisit_mm_mean": 13.66
+  },
+  "two_lidars": {
+   "tag_revisit_mm_mean": 13.31
+  }
+ }
+}

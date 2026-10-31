@@ -45,5 +45,16 @@
     "max": 15.0
    }
   }
- }
+ },
+ "static_tf": [
+  {
+   "parent": "imu_link",
+   "child": "lidar_pointlio_link",
+   "translation": [
+    -0.011,
+    -0.02329,
+    0.04412
+   ]
+  }
+ ]
 }

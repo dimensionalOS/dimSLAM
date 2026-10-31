@@ -21,32 +21,7 @@
  "config": {
   "odom_frame_id": "odom",
   "output_frame_id": "base_link",
-  "publish_rate": 50.0,
-  "replay_buffer_seconds": 0.5,
-  "outlier_rejection_allowed_variance": 25.0,
-  "max_position_m": 10000.0,
   "imus": [],
-  "initial_gravity_estimate": 9.8,
-  "initial_stds": {
-   "position": 0.01,
-   "velocity": 0.1,
-   "rotation": 0.05,
-   "angular_velocity": 0.1,
-   "bias": 0.05
-  },
-  "process_noise": {
-   "linear_acceleration": 2.0,
-   "angular_acceleration": 1.0
-  },
-  "planar": true,
-  "zero_velocity_variances": [
-   0.0,
-   0.0,
-   0.0,
-   0.0,
-   0.0,
-   0.0
-  ],
   "odom_sources": [
    {
     "parent_frame_id": "pointlio_odom",
@@ -55,9 +30,9 @@
     "pose_variances": [
      0.0002,
      0.0002,
-     0,
-     0,
-     0,
+     0.0002,
+     3.3e-05,
+     3.3e-05,
      3.3e-05
     ],
     "twist_variances": [
@@ -82,6 +57,14 @@
    }
   ],
   "use_gpu": true,
+  "covariance_gate_translation_std": 0.0,
+  "speed_gate_max_linear": 5.0,
+  "speed_gate_max_angular": 12.0,
+  "process_noise": {
+   "velocity": 2.0,
+   "angular_velocity": 30.0,
+   "specific_force": 500.0
+  },
   "visual_odom_pose_variances": [
    0.01,
    0.01,
@@ -89,10 +72,7 @@
    0.05,
    0.05,
    0.05
-  ],
-  "covariance_gate_translation_std": 0.0,
-  "speed_gate_max_linear": 5.0,
-  "speed_gate_max_angular": 12.0
+  ]
  },
  "variants": {
   "pl_stereo": {}

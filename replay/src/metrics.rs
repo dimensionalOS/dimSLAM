@@ -167,8 +167,18 @@ pub fn score(run: &Run, segments: &[(i64, i64)]) -> Metrics {
         );
     }
     let xy = |p: &Isometry3<f64>| p.translation.vector.xy();
+    // Steps and second differences are taken at the reference's instants (the output's own
+    // without one), so outputs published at different cadences are compared alike.
+    let sampled: Vec<(i64, Isometry3<f64>)> = if run.reference.is_empty() {
+        run.fused.clone()
+    } else {
+        run.reference
+            .iter()
+            .filter_map(|(t, _)| interpolate(&run.fused, *t).map(|p| (*t, p)))
+            .collect()
+    };
     let (mut rest_steps, mut moving_second, mut path) = (Vec::new(), Vec::new(), 0.0);
-    for window in run.fused.windows(3) {
+    for window in sampled.windows(3) {
         let (a, b, c) = (xy(&window[0].1), xy(&window[1].1), xy(&window[2].1));
         let step = (b - a).norm();
         if at_rest(window[1].0) {
