@@ -13,8 +13,8 @@ use super::scan_points::SurfacePoint;
 use super::plane_fit::{fit_plane, PLANE_POINTS};
 use super::point_map::{to_world, PointMap};
 
-/// The 99% quantile of a chi-squared distribution with 3 degrees of freedom.
-const CHI_SQUARED_3_DOF_99: f64 = 11.345;
+/// The 99% quantiles of a chi-squared distribution with 1 to 6 degrees of freedom.
+const CHI_SQUARED_99: [f64; 6] = [6.635, 9.210, 11.345, 13.277, 15.086, 16.812];
 
 pub const STATE_DIM: usize = 30;
 pub type StateVector = SVector<f64, STATE_DIM>;
@@ -251,10 +251,18 @@ pub fn initial_covariance() -> StateMatrix {
     p
 }
 
+/// Point-LIO's 30 states, plus states it does not have (each further IMU's gyro then accel
+/// bias) carried jointly with them: `p_extra` is their covariance with the 30, `p_extra_extra`
+/// among themselves. With none, every operation is Point-LIO's own.
 #[derive(Clone, Debug)]
 pub struct LioFilter {
     pub x: LioState,
     pub p: StateMatrix,
+    pub extra: DVector<f64>,
+    pub p_extra: OMatrix<f64, Const<STATE_DIM>, Dyn>,
+    pub p_extra_extra: DMatrix<f64>,
+    /// Random-walk variances of the extra states, scaled by dt^2 as Point-LIO scales its own.
+    pub q_extra: DVector<f64>,
 }
 
 impl Default for LioFilter {
@@ -262,6 +270,10 @@ impl Default for LioFilter {
         Self {
             x: LioState::default(),
             p: StateMatrix::identity(),
+            extra: DVector::zeros(0),
+            p_extra: OMatrix::<f64, Const<STATE_DIM>, Dyn>::zeros(0),
+            p_extra_extra: DMatrix::zeros(0, 0),
+            q_extra: DVector::zeros(0),
         }
     }
 }
@@ -297,7 +309,46 @@ impl LioFilter {
             }
             transition += transition_rates * dt;
             self.p = transition * self.p * transition.transpose() + q * (dt * dt);
+            if !self.extra.is_empty() {
+                self.p_extra = transition * &self.p_extra;
+                for i in 0..self.extra.len() {
+                    self.p_extra_extra[(i, i)] += self.q_extra[i] * (dt * dt);
+                }
+            }
         }
+    }
+
+    /// Adds extra states, independent of the rest, with these values and variances and
+    /// random-walk variances.
+    pub fn add_extra(&mut self, values: &[f64], variances: &[f64], random_walks: &[f64]) {
+        let (n, added) = (self.extra.len(), values.len());
+        self.extra = self.extra.clone().insert_rows(n, added, 0.0);
+        self.q_extra = self.q_extra.clone().insert_rows(n, added, 0.0);
+        self.p_extra = self.p_extra.clone().insert_columns(n, added, 0.0);
+        self.p_extra_extra = self.p_extra_extra.clone().insert_rows(n, added, 0.0).insert_columns(n, added, 0.0);
+        for i in 0..added {
+            self.extra[n + i] = values[i];
+            self.q_extra[n + i] = random_walks[i];
+            self.p_extra_extra[(n + i, n + i)] = variances[i];
+        }
+    }
+
+    /// After an update that observed only the 30 states (from `before`, `before_p`), carries
+    /// its effect to the extra states through their covariance with the 30: the same as had
+    /// the update been made over all of them, since the gain on an unobserved state is its
+    /// regression on the observed ones times theirs.
+    pub fn carry_extra(&mut self, before: &LioState, before_p: &StateMatrix) {
+        if self.extra.is_empty() || self.p == *before_p {
+            return;
+        }
+        let Some(inverse) = before_p.try_inverse() else {
+            return;
+        };
+        let regression = self.p_extra.transpose() * inverse;
+        let step = self.x.difference(before);
+        self.extra += &regression * step;
+        self.p_extra_extra -= &regression * (before_p - self.p) * regression.transpose();
+        self.p_extra = self.p * inverse * &self.p_extra;
     }
 }
 
@@ -363,49 +414,227 @@ impl LioFilter {
     }
 }
 
+/// Where an IMU sits on the body and what the body's rotation is doing there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImuMount {
+    /// body_from_imu.
+    pub rotation: Matrix3<f64>,
+    /// m: the IMU's origin in the body frame.
+    pub lever: Vector3<f64>,
+    /// rad/s^2, body frame: the angular acceleration, which turns into linear acceleration
+    /// away from the body's origin.
+    pub angular_acceleration: Vector3<f64>,
+}
+
+impl ImuMount {
+    /// The IMU is the body: Point-LIO's own case.
+    pub fn is_body(&self) -> bool {
+        self.rotation == Matrix3::identity() && self.lever == Vector3::zeros()
+    }
+}
+
+/// Rows over the 30 states, one per measured axis.
+pub type CoreRows = OMatrix<f64, Dyn, Const<STATE_DIM>>;
+
+/// Where a reading's bias lives: the 30 states' own (the first IMU), or the extra states at
+/// this index (gyro, then accel).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BiasAt {
+    Core,
+    Extra(usize),
+}
+
 impl LioFilter {
-    /// A direct measurement of the body's angular velocity (rad/s, body frame), such as a
-    /// camera's frame-to-frame rotation over its interval, with `variance` per axis.
-    /// False, and the state untouched, when the rate is beyond the 99% bound of its predicted
-    /// spread: a frozen or lost tracker, not a turn.
-    pub fn update_angular_velocity(&mut self, rate: &Vector3<f64>, variance: f64) -> bool {
-        let residual = rate - self.x.angular_velocity;
-        let p_ht = self.p.fixed_view::<STATE_DIM, 3>(0, 15).into_owned();
-        let innovation =
-            self.p.fixed_view::<3, 3>(15, 15).into_owned() + Matrix3::identity() * variance;
-        let inverse = innovation.try_inverse().expect("rate innovation singular");
-        if residual.dot(&(inverse * residual)) > CHI_SQUARED_3_DOF_99 {
+    /// An IMU sample (`gyro` rad/s, `accel` in the accelerometer's unit) at `mount`: its gyro
+    /// reads the body's angular velocity and its accelerometer the specific force at its own
+    /// origin, both turned into its axes, each with its bias added.
+    pub fn update_mounted_imu(
+        &mut self,
+        gyro: &Vector3<f64>,
+        accel: &Vector3<f64>,
+        m: &ImuMeasurement,
+        mount: &ImuMount,
+        bias: BiasAt,
+    ) {
+        if bias == BiasAt::Core && mount.is_body() {
+            return self.update_imu(gyro, accel, m);
+        }
+        let x = &self.x;
+        let to_imu = mount.rotation.transpose();
+        let r = mount.lever;
+        let w = x.angular_velocity;
+        let at_lever = w.cross(&w.cross(&r)) + mount.angular_acceleration.cross(&r);
+        let mut predicted = SVector::<f64, 6>::zeros();
+        predicted.fixed_rows_mut::<3>(0).copy_from(&(to_imu * w));
+        predicted.fixed_rows_mut::<3>(3).copy_from(&(to_imu * (x.specific_force + at_lever)));
+        let mut h = CoreRows::zeros(6);
+        h.fixed_view_mut::<3, 3>(0, 15).copy_from(&to_imu);
+        h.fixed_view_mut::<3, 3>(3, 18).copy_from(&to_imu);
+        // d(w x (w x r))/dw = (w.r) I + w r^T - 2 r w^T.
+        let centripetal = Matrix3::identity() * w.dot(&r) + w * r.transpose() - 2.0 * r * w.transpose();
+        h.fixed_view_mut::<3, 3>(3, 15).copy_from(&(to_imu * centripetal));
+        let (bias_gyro, bias_accel) = match bias {
+            BiasAt::Core => {
+                h.fixed_view_mut::<3, 3>(0, 24).copy_from(&Matrix3::identity());
+                h.fixed_view_mut::<3, 3>(3, 27).copy_from(&Matrix3::identity());
+                (x.gyro_bias, x.accel_bias)
+            }
+            BiasAt::Extra(at) => (
+                self.extra.fixed_rows::<3>(at).into_owned(),
+                self.extra.fixed_rows::<3>(at + 3).into_owned(),
+            ),
+        };
+        let mut residual = DVector::zeros(6);
+        let mut variances = DVector::zeros(6);
+        for axis in 0..3 {
+            residual[axis] = gyro[axis] - predicted[axis] - bias_gyro[axis];
+            residual[3 + axis] = accel[axis] * m.accel_scale - predicted[3 + axis] - bias_accel[axis];
+            variances[axis] = m.gyro_variance;
+            // The angular acceleration is a difference of two gyro readings.
+            variances[3 + axis] = m.accel_variance + 2.0 * m.gyro_variance * r.norm_squared();
+        }
+        if let Some((gyro_clip, accel_clip)) = m.clip {
+            for axis in 0..3 {
+                for (row, reading, clip) in [(axis, gyro[axis], gyro_clip), (3 + axis, accel[axis], accel_clip)] {
+                    if reading.abs() >= 0.99 * clip {
+                        h.row_mut(row).fill(0.0);
+                        residual[row] = 0.0;
+                    }
+                }
+            }
+        }
+        match bias {
+            BiasAt::Core => {
+                self.update_rows(&h, &residual, &variances, false);
+            }
+            BiasAt::Extra(at) => {
+                let mut h_extra = DMatrix::zeros(6, self.extra.len());
+                for row in 0..6 {
+                    if h.row(row).iter().any(|v| *v != 0.0) {
+                        h_extra[(row, at + row)] = 1.0;
+                    }
+                }
+                self.update_joint(&h, &h_extra, &residual, &variances);
+            }
+        }
+    }
+
+    /// Rows observing the 30 states only: `residual` and per-row `variances`. With `gate`,
+    /// false and the state untouched when the residual is beyond the 99% bound of its
+    /// predicted spread. Joseph form: the plain P - KHP went indefinite on R1 wheel odometry
+    /// and then stepped away from each reading.
+    pub fn update_rows(
+        &mut self,
+        h: &CoreRows,
+        residual: &DVector<f64>,
+        variances: &DVector<f64>,
+        gate: bool,
+    ) -> bool {
+        let rows = residual.len();
+        if rows == 0 {
             return false;
         }
-        let gain = p_ht * inverse;
-        let step = gain * residual;
-        self.p -= gain * self.p.fixed_view::<3, STATE_DIM>(15, 0);
-        self.x.advance(&step, 1.0);
+        let h_p = h * self.p;
+        let mut innovation = &h_p * h.transpose();
+        for i in 0..rows {
+            innovation[(i, i)] += variances[i];
+        }
+        let Some(inverse) = innovation.try_inverse() else {
+            return false;
+        };
+        if gate && residual.dot(&(&inverse * residual)) > CHI_SQUARED_99[rows.min(6) - 1] {
+            return false;
+        }
+        let (before, before_p) = (self.x.clone(), self.p);
+        let gain = h_p.transpose() * &inverse;
+        let step = &gain * residual;
+        let keep = StateMatrix::identity() - &gain * h;
+        self.p = keep * self.p * keep.transpose()
+            + &gain * DMatrix::from_diagonal(variances) * gain.transpose();
+        self.x.advance(&StateVector::from(step), 1.0);
+        self.carry_extra(&before, &before_p);
         true
     }
 
-    /// The body's own velocity (m/s, body frame), such as legged or wheeled odometry over its
-    /// interval, with `variance` per axis. Same 99% gate as a rate.
-    pub fn update_body_velocity(&mut self, velocity: &Vector3<f64>, variance: f64) -> bool {
-        let body = self.x.rotation.transpose() * self.x.velocity;
-        let residual = velocity - body;
-        // Rotation on the right turns the measured vector the other way: d(R^T v)/dtheta = [R^T v]x.
-        let mut h = SMatrix::<f64, 3, STATE_DIM>::zeros();
-        h.fixed_view_mut::<3, 3>(0, 3).copy_from(&hat(&body));
-        h.fixed_view_mut::<3, 3>(0, 12).copy_from(&self.x.rotation.transpose());
-        let h_p = h * self.p;
-        let innovation = h_p * h.transpose() + Matrix3::identity() * variance;
-        let inverse = innovation.try_inverse().expect("velocity innovation singular");
-        if residual.dot(&(inverse * residual)) > CHI_SQUARED_3_DOF_99 {
-            return false;
+    /// Rows observing the 30 states (`h`) and the extra ones (`h_extra`) together.
+    fn update_joint(
+        &mut self,
+        h: &CoreRows,
+        h_extra: &DMatrix<f64>,
+        residual: &DVector<f64>,
+        variances: &DVector<f64>,
+    ) {
+        let p_ht = self.p * h.transpose() + &self.p_extra * h_extra.transpose();
+        let p_ht_extra = self.p_extra.transpose() * h.transpose() + &self.p_extra_extra * h_extra.transpose();
+        let mut innovation = h * &p_ht + h_extra * &p_ht_extra;
+        for i in 0..residual.len() {
+            innovation[(i, i)] += variances[i];
         }
-        let gain = h_p.transpose() * inverse;
-        let step = gain * residual;
-        // Joseph form: plain P - KHP went indefinite on R1 wheels and stepped away from the reading.
-        let keep = StateMatrix::identity() - gain * h;
-        self.p = keep * self.p * keep.transpose() + gain * gain.transpose() * variance;
-        self.x.advance(&step, 1.0);
-        true
+        let Some(inverse) = innovation.try_inverse() else {
+            return;
+        };
+        let gain = &p_ht * &inverse;
+        let gain_extra = &p_ht_extra * &inverse;
+        let step = &gain * residual;
+        self.x.advance(&StateVector::from(step), 1.0);
+        self.extra += &gain_extra * residual;
+        self.p -= &gain * p_ht.transpose();
+        self.p_extra -= &gain * p_ht_extra.transpose();
+        self.p_extra_extra -= &gain_extra * p_ht_extra.transpose();
+    }
+
+    /// Per-axis variances: zero leaves that axis unmeasured.
+    fn measured_axes(variances: &[f64]) -> Vec<usize> {
+        (0..variances.len()).filter(|&i| variances[i] > 0.0).collect()
+    }
+
+    /// The body's angular velocity (rad/s, body frame), such as a camera's frame-to-frame
+    /// rotation over its interval. False, and the state untouched, beyond the 99% bound of its
+    /// predicted spread: a frozen or lost tracker, not a turn.
+    pub fn update_angular_velocity(&mut self, rate: &Vector3<f64>, variances: &Vector3<f64>) -> bool {
+        let axes = Self::measured_axes(variances.as_slice());
+        let mut h = CoreRows::zeros(axes.len());
+        let residual = DVector::from_iterator(axes.len(), axes.iter().map(|&a| rate[a] - self.x.angular_velocity[a]));
+        for (row, &a) in axes.iter().enumerate() {
+            h[(row, 15 + a)] = 1.0;
+        }
+        let variances = DVector::from_iterator(axes.len(), axes.iter().map(|&a| variances[a]));
+        self.update_rows(&h, &residual, &variances, true)
+    }
+
+    /// The body's own velocity (m/s, body frame), such as wheeled odometry over its interval.
+    /// Same 99% gate as a rate.
+    pub fn update_body_velocity(&mut self, velocity: &Vector3<f64>, variances: &Vector3<f64>) -> bool {
+        let body = self.x.rotation.transpose() * self.x.velocity;
+        // Rotation on the right turns the measured vector the other way: d(R^T v)/dtheta = [R^T v]x.
+        let turn = hat(&body);
+        let to_body = self.x.rotation.transpose();
+        let axes = Self::measured_axes(variances.as_slice());
+        let mut h = CoreRows::zeros(axes.len());
+        for (row, &a) in axes.iter().enumerate() {
+            for c in 0..3 {
+                h[(row, 3 + c)] = turn[(a, c)];
+                h[(row, 12 + c)] = to_body[(a, c)];
+            }
+        }
+        let residual = DVector::from_iterator(axes.len(), axes.iter().map(|&a| velocity[a] - body[a]));
+        let variances = DVector::from_iterator(axes.len(), axes.iter().map(|&a| variances[a]));
+        self.update_rows(&h, &residual, &variances, true)
+    }
+
+    /// The body's pose in the filter's world: position along the world axes, rotation about
+    /// the body's own [roll pitch yaw], with per-axis variances. Same 99% gate.
+    pub fn update_pose(&mut self, position: &Vector3<f64>, rotation: &Matrix3<f64>, variances: &[f64; 6]) -> bool {
+        let turn = log(&(self.x.rotation.transpose() * rotation));
+        let axes = Self::measured_axes(variances);
+        let mut h = CoreRows::zeros(axes.len());
+        let mut residual = DVector::zeros(axes.len());
+        for (row, &a) in axes.iter().enumerate() {
+            h[(row, a)] = 1.0;
+            residual[row] = if a < 3 { position[a] - self.x.position[a] } else { turn[a - 3] };
+        }
+        let variances = DVector::from_iterator(axes.len(), axes.iter().map(|&a| variances[a]));
+        self.update_rows(&h, &residual, &variances, true)
     }
 }
 
