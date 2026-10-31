@@ -619,9 +619,26 @@ impl LioFilter {
         let step = &gain * residual;
         self.x.advance(&StateVector::from(step), 1.0);
         self.extra += &gain_extra * residual;
-        self.p -= &gain * p_ht.transpose();
-        self.p_extra -= &gain * p_ht_extra.transpose();
-        self.p_extra_extra -= &gain_extra * p_ht_extra.transpose();
+        // Joseph form over the whole joint covariance, as `update_rows`: a reading far more
+        // certain than the state otherwise leaves it indefinite.
+        let (n, extra) = (STATE_DIM, self.extra.len());
+        let mut joint = DMatrix::zeros(n + extra, n + extra);
+        joint.view_mut((0, 0), (n, n)).copy_from(&self.p);
+        joint.view_mut((0, n), (n, extra)).copy_from(&self.p_extra);
+        joint.view_mut((n, 0), (extra, n)).copy_from(&self.p_extra.transpose());
+        joint.view_mut((n, n), (extra, extra)).copy_from(&self.p_extra_extra);
+        let mut h_joint = DMatrix::zeros(residual.len(), n + extra);
+        h_joint.view_mut((0, 0), (residual.len(), n)).copy_from(h);
+        h_joint.view_mut((0, n), (residual.len(), extra)).copy_from(h_extra);
+        let mut gain_joint = DMatrix::zeros(n + extra, residual.len());
+        gain_joint.view_mut((0, 0), (n, residual.len())).copy_from(&gain);
+        gain_joint.view_mut((n, 0), (extra, residual.len())).copy_from(&gain_extra);
+        let keep = DMatrix::identity(n + extra, n + extra) - &gain_joint * &h_joint;
+        let joint = &keep * joint * keep.transpose()
+            + &gain_joint * DMatrix::from_diagonal(variances) * gain_joint.transpose();
+        self.p.copy_from(&joint.view((0, 0), (n, n)));
+        self.p_extra.copy_from(&joint.view((0, n), (n, extra)));
+        self.p_extra_extra.copy_from(&joint.view((n, n), (extra, extra)));
     }
 
     /// Per-axis variances: zero leaves that axis unmeasured.
