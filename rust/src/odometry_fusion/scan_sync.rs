@@ -37,14 +37,35 @@ pub struct Level {
     pub specific_force: Vector3<f64>,
 }
 
-/// A scan taken with the IMU samples that reach it.
+/// A scan taken with the IMU samples that reach it, merged with every other lidar's scan that
+/// began before it ended: each lidar's points, timed from `begin`.
 #[derive(Clone, Debug)]
 pub struct SyncedScan {
     pub begin: f64,
     pub end: f64,
-    pub points: Vec<SurfacePoint>,
+    pub parts: Vec<(usize, Vec<SurfacePoint>)>,
     /// Set on the scan that levelled the filter.
     pub level: Option<Level>,
+}
+
+/// One lidar's timing, learned from its scans: what tells a lidar that has gone quiet from
+/// one whose next scan is merely still in flight.
+#[derive(Clone, Copy, Debug, Default)]
+struct LidarTiming {
+    newest_end: f64,
+    scans: u32,
+    /// s: mean begin-to-begin interval, and mean time from a scan's end to its arrival, as
+    /// the newest IMU stamp measures it.
+    mean_period: f64,
+    mean_lag: f64,
+    newest_begin: f64,
+}
+
+impl LidarTiming {
+    /// Its next scan is a whole interval later than its usual timing allows.
+    fn overdue(&self, now: f64) -> bool {
+        self.scans >= 2 && now > self.newest_end + 2.0 * self.mean_period + self.mean_lag
+    }
 }
 
 /// Seconds rounded to the nanosecond, as a ROS time holds them.
@@ -65,8 +86,11 @@ pub fn header_seconds(stamp_ns: i64) -> f64 {
 
 #[derive(Debug, Default)]
 pub struct ScanSync {
-    scans: VecDeque<(f64, Vec<SurfacePoint>)>,
-    newest_scan: f64,
+    /// Per lidar, its scans' begin and points, oldest first.
+    scans: Vec<VecDeque<(f64, Vec<SurfacePoint>)>>,
+    timing: Vec<LidarTiming>,
+    /// Without an IMU a scan is ready as it arrives and nothing levels.
+    pub inertial: bool,
     /// Samples not yet taken: the filter's update loop reads them from here once levelled.
     pub imus: VecDeque<StampedImu>,
     newest_imu: f64,
@@ -87,12 +111,18 @@ pub struct ScanSync {
 }
 
 impl ScanSync {
-    pub fn new() -> Self {
+    pub fn new(inertial: bool) -> Self {
         Self {
             mean_accel: Vector3::new(0.0, 0.0, -1.0),
             counted: 1,
+            inertial,
+            levelled: !inertial,
             ..Self::default()
         }
+    }
+
+    pub fn newest_imu(&self) -> f64 {
+        self.newest_imu
     }
 
     /// `stamp` in seconds; samples older than the newest are dropped.
@@ -109,14 +139,27 @@ impl ScanSync {
         self.newest_imu = stamp;
     }
 
-    /// `start_ns` the scan's stamp; scans older than the newest are dropped.
-    pub fn push_scan(&mut self, start_ns: u64, points: Vec<SurfacePoint>) {
+    /// `start_ns` the scan's stamp; a lidar's scans older than its newest are dropped.
+    pub fn push_scan(&mut self, lidar: usize, start_ns: u64, points: Vec<SurfacePoint>) {
+        if self.scans.len() <= lidar {
+            self.scans.resize_with(lidar + 1, VecDeque::new);
+            self.timing.resize(lidar + 1, LidarTiming::default());
+        }
         let stamp = ros_seconds(start_ns as f64 / 1e9);
-        if stamp < self.newest_scan {
+        let timing = &mut self.timing[lidar];
+        if timing.scans > 0 && stamp < timing.newest_begin {
             return;
         }
-        self.newest_scan = stamp;
-        self.scans.push_back((stamp, points));
+        let end = stamp + latest_ms(&points) as f64 / 1000.0;
+        if timing.scans > 0 {
+            let n = timing.scans as f64;
+            timing.mean_period += (stamp - timing.newest_begin - timing.mean_period) / n;
+            timing.mean_lag += ((self.newest_imu - end).max(0.0) - timing.mean_lag) / n;
+        }
+        timing.scans += 1;
+        timing.newest_begin = stamp;
+        timing.newest_end = timing.newest_end.max(end);
+        self.scans[lidar].push_back((stamp, points));
     }
 
     /// The map has its first points: from here the filter takes the samples itself.
@@ -125,33 +168,48 @@ impl ScanSync {
     }
 
     pub fn pending_scans(&self) -> usize {
-        self.scans.len()
+        self.scans.iter().map(VecDeque::len).sum()
+    }
+
+    /// The lidar whose oldest pending scan began first.
+    fn head(&self) -> Option<usize> {
+        (0..self.scans.len())
+            .filter(|&l| !self.scans[l].is_empty())
+            .min_by(|&a, &b| self.scans[a][0].0.total_cmp(&self.scans[b][0].0))
     }
 
     /// The next scan whose samples have all arrived, if any. A scan before levelling comes
     /// back without points: it only fed the mean.
     pub fn next_scan(&mut self) -> Option<SyncedScan> {
-        if self.scans.is_empty() || self.imus.is_empty() {
+        let lead = self.head()?;
+        if self.inertial && self.imus.is_empty() {
             return None;
         }
         if self.taken.is_none() {
-            let (begin, points) = &self.scans[0];
+            let (begin, points) = &self.scans[lead][0];
             if points.is_empty() {
-                self.scans.pop_front();
+                self.scans[lead].pop_front();
                 return None;
             }
-            // The scan ends at its latest point, the last one counting first.
-            let last = points[points.len() - 1].time_ms;
-            let latest = points
-                .iter()
-                .fold(last, |m, p| if p.time_ms > m { p.time_ms } else { m });
-            self.taken = Some(begin + latest as f64 / 1000.0);
+            self.taken = Some(begin + latest_ms(points) as f64 / 1000.0);
         }
         let end = self.taken.expect("taken above");
-        if self.newest_imu < end {
+        let now = if self.inertial { self.newest_imu } else { end };
+        if self.inertial && self.newest_imu < end {
             return None;
         }
-        if !self.levelled || !self.map_ready {
+        // Another lidar may still deliver a scan that began before this one ended.
+        let waiting = (0..self.scans.len()).any(|l| {
+            let timing = &self.timing[l];
+            l != lead
+                && timing.scans >= 2
+                && timing.newest_begin + timing.mean_period < end
+                && !timing.overdue(now)
+        });
+        if waiting && self.inertial {
+            return None;
+        }
+        if self.inertial && (!self.levelled || !self.map_ready) {
             let mut stamp = self.imus[0].stamp;
             while !self.imus.is_empty() && stamp < end {
                 stamp = self.imus[0].stamp;
@@ -164,16 +222,44 @@ impl ScanSync {
                 self.imu_after = sample;
             }
         }
-        let (begin, points) = self.scans.pop_front().expect("checked non-empty");
+        let (begin, points) = self.scans[lead].pop_front().expect("checked non-empty");
         self.taken = None;
+        let mut parts = vec![(lead, points)];
+        for l in 0..self.scans.len() {
+            while l != lead && self.scans[l].front().is_some_and(|(b, _)| *b < end) {
+                let (other_begin, mut points) = self.scans[l].pop_front().expect("checked");
+                let shift = ((other_begin - begin) * 1000.0) as f32;
+                for p in &mut points {
+                    p.time_ms += shift;
+                }
+                parts.push((l, points));
+            }
+        }
         let level = self.level(begin);
-        let points = if self.levelled { points } else { Vec::new() };
+        if !self.levelled {
+            parts.clear();
+        }
         Some(SyncedScan {
             begin,
             end,
-            points,
+            parts,
             level,
         })
+    }
+
+    /// Levels from the samples so far without a scan, for a filter with no lidar: true once
+    /// levelled.
+    pub fn level_without_scans(&mut self) -> Option<Level> {
+        if self.levelled || self.imus.is_empty() {
+            return None;
+        }
+        let newest = self.newest_imu;
+        while let Some(sample) = self.imus.pop_front() {
+            self.batch.push(sample);
+            self.imu_before = self.imu_after;
+            self.imu_after = sample;
+        }
+        self.level(newest)
     }
 
     fn level(&mut self, begin: f64) -> Option<Level> {
@@ -212,6 +298,12 @@ impl ScanSync {
             specific_force: -rotation.transpose() * gravity,
         })
     }
+}
+
+/// ms: a scan's latest point, the last one counting first.
+fn latest_ms(points: &[SurfacePoint]) -> f32 {
+    let Some(last) = points.last() else { return 0.0 };
+    points.iter().fold(last.time_ms, |m, p| if p.time_ms > m { p.time_ms } else { m })
 }
 
 /// The rotation turning `from` onto `onto`'s direction, about their common normal.
@@ -261,7 +353,7 @@ mod tests {
     #[test]
     fn levelling_turns_the_mean_specific_force_onto_up() {
         let tilted = Vector3::new(0.3, -0.5, 0.8).normalize();
-        let mut sync = ScanSync::new();
+        let mut sync = ScanSync::new(true);
         let point = SurfacePoint {
             position: [1.0, 0.0, 0.0],
             reflectivity: 0.0,
@@ -273,7 +365,7 @@ mod tests {
                 let t = scan as f64 * 0.1 + i as f64 * 0.005;
                 sync.push_imu(t, Vector3::zeros(), tilted);
             }
-            sync.push_scan(scan * 100_000_000, vec![point]);
+            sync.push_scan(0, scan * 100_000_000, vec![point]);
             while let Some(synced) = sync.next_scan() {
                 level = level.or(synced.level);
             }
