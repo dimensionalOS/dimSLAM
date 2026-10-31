@@ -401,7 +401,9 @@ impl LioFilter {
         }
         let gain = h_p.transpose() * inverse;
         let step = gain * residual;
-        self.p -= gain * h_p;
+        // Joseph form: plain P - KHP went indefinite on R1 wheels and stepped away from the reading.
+        let keep = StateMatrix::identity() - gain * h;
+        self.p = keep * self.p * keep.transpose() + gain * gain.transpose() * variance;
         self.x.advance(&step, 1.0);
         true
     }
