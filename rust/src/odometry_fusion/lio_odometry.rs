@@ -17,12 +17,12 @@ use std::collections::VecDeque;
 
 use nalgebra::{Matrix3, Vector3};
 
-use super::scan_points::{surface_points, voxel_centroids, SurfacePoint};
 use super::lio_filter::{
-    initial_covariance, process_noise, BiasAt, ImuMeasurement, ImuMount, LidarMeasurement,
-    LioFilter, LioState, PointGroup, StateMatrix,
+    initial_covariance, process_noise, BiasAt, ImuMeasurement, ImuMount, Innovation,
+    LidarMeasurement, LioFilter, LioState, PointGroup, StateMatrix, CHI_SQUARED_MEDIAN,
 };
 use super::point_map::{to_world, PointMap};
+use super::scan_points::{surface_points, voxel_centroids, SurfacePoint};
 use super::scan_sync::{ros_seconds, Level, ScanSync};
 use crate::types::LidarScan;
 
@@ -112,14 +112,17 @@ pub struct LioOdometry {
     imus: Vec<Imu>,
     /// Per lidar, its mount (lidar to body) once tf has said.
     lidars: Vec<Option<(Matrix3<f64>, Vector3<f64>)>>,
+    /// Per lidar, the variance of one point's distance to its plane.
+    point_variances: Vec<f64>,
     map_seed: Vec<SurfacePoint>,
     map_ready: bool,
     first_scan: bool,
     /// When the state, and the covariance, were last moved forward.
     state_at: f64,
     covariance_at: f64,
-    /// The first IMU's sample the filter is between.
+    /// The first IMU's sample the filter is between, and its stamp.
     rate: (Vector3<f64>, Vector3<f64>),
+    rate_at: f64,
     /// Per point slot, across scans.
     pub world: Vec<SurfacePoint>,
     pub neighbors: Vec<Vec<SurfacePoint>>,
@@ -136,10 +139,11 @@ pub struct LioOdometry {
     /// measurement is measured against.
     motion_history: VecDeque<(f64, Vector3<f64>, Vector3<f64>)>,
     measured_pushed: bool,
-    /// Per measuring source, every residual taken against the state over the spread its given
-    /// variances allow, sorted: their median is how much noisier the source is than it was
-    /// said to be.
-    residuals: Vec<Vec<f64>>,
+    /// Per measuring source, every innovation over the chi-squared median its given variances
+    /// predict, sorted: their median is how much noisier the source is than it was said to be.
+    residuals: Vec<RunningMedian>,
+    /// Per measuring source, measurements taken and refused by the gate.
+    taken: Vec<[u64; 2]>,
 }
 
 /// What a sensor other than the first IMU measured.
@@ -164,8 +168,13 @@ struct Measured {
 
 impl LioOdometry {
     /// `imus` in order with their gyro and accel bias random walks, the first driving the
-    /// filter between scans (its random walks replace `config.process`'s); `lidars` how many.
-    pub fn new(mut config: LioConfig, imus: Vec<(ImuMeasurement, [f64; 2])>, lidars: usize) -> Self {
+    /// filter between scans (its random walks replace `config.process`'s); `lidars` in order,
+    /// each its point variance.
+    pub fn new(
+        mut config: LioConfig,
+        imus: Vec<(ImuMeasurement, [f64; 2])>,
+        lidars: Vec<f64>,
+    ) -> Self {
         if let Some((_, walks)) = imus.first() {
             config.process[3] = walks[0];
             config.process[4] = walks[1];
@@ -190,7 +199,12 @@ impl LioOdometry {
                     filter.add_extra(&[0.0; 6], &variances, &[bg, bg, bg, ba, ba, ba]);
                     BiasAt::Extra(at)
                 };
-                Imu { measurement, mount: None, bias, previous: None }
+                Imu {
+                    measurement,
+                    mount: None,
+                    bias,
+                    previous: None,
+                }
             })
             .collect();
         Self {
@@ -200,13 +214,15 @@ impl LioOdometry {
             filter,
             noise: process_noise(v, w, a, bg, ba),
             imus,
-            lidars: vec![None; lidars],
+            lidars: vec![None; lidars.len()],
+            point_variances: lidars,
             map_seed: Vec::new(),
             map_ready: false,
             first_scan: true,
             state_at: 0.0,
             covariance_at: 0.0,
             rate: (Vector3::zeros(), Vector3::zeros()),
+            rate_at: 0.0,
             world: Vec::new(),
             neighbors: Vec::new(),
             used: Vec::new(),
@@ -218,6 +234,7 @@ impl LioOdometry {
             motion_history: VecDeque::new(),
             measured_pushed: false,
             residuals: Vec::new(),
+            taken: Vec::new(),
         }
     }
 
@@ -235,7 +252,12 @@ impl LioOdometry {
     }
 
     /// Where lidar `lidar` sits: body_from_lidar rotation and its origin in the body frame.
-    pub fn set_lidar_mount(&mut self, lidar: usize, rotation: Matrix3<f64>, translation: Vector3<f64>) {
+    pub fn set_lidar_mount(
+        &mut self,
+        lidar: usize,
+        rotation: Matrix3<f64>,
+        translation: Vector3<f64>,
+    ) {
         self.lidars[lidar] = Some((rotation, translation));
     }
 
@@ -254,19 +276,38 @@ impl LioOdometry {
 
     /// An angular velocity source `source` measured at `stamp` (s), body frame, with its
     /// per-axis variances (the floor of its learned spread; zero leaves an axis unmeasured).
-    pub fn push_rate(&mut self, source: usize, stamp: f64, rate: Vector3<f64>, variances: Vector3<f64>) {
+    pub fn push_rate(
+        &mut self,
+        source: usize,
+        stamp: f64,
+        rate: Vector3<f64>,
+        variances: Vector3<f64>,
+    ) {
         self.push_measured(stamp, source, Motion::Rate(rate, variances));
     }
 
     /// The body's velocity source `source` measured at `stamp` (s), m/s in the body frame
     /// (legged or wheeled odometry, a camera's step), with per-axis variances as for a rate.
-    pub fn push_body_velocity(&mut self, source: usize, stamp: f64, velocity: Vector3<f64>, variances: Vector3<f64>) {
+    pub fn push_body_velocity(
+        &mut self,
+        source: usize,
+        stamp: f64,
+        velocity: Vector3<f64>,
+        variances: Vector3<f64>,
+    ) {
         self.push_measured(stamp, source, Motion::Velocity(velocity, variances));
     }
 
     /// The body's pose in the filter's world source `source` measured at `stamp` (s), with
     /// [x y z roll pitch yaw] variances as for a rate.
-    pub fn push_pose(&mut self, source: usize, stamp: f64, position: Vector3<f64>, rotation: Matrix3<f64>, variances: [f64; 6]) {
+    pub fn push_pose(
+        &mut self,
+        source: usize,
+        stamp: f64,
+        position: Vector3<f64>,
+        rotation: Matrix3<f64>,
+        variances: [f64; 6],
+    ) {
         self.push_measured(stamp, source, Motion::Pose(position, rotation, variances));
     }
 
@@ -282,7 +323,14 @@ impl LioOdometry {
     /// Sensors interleave out of order; each one's own order is kept.
     fn push_measured(&mut self, stamp: f64, source: usize, motion: Motion) {
         let at = self.measured.partition_point(|m| m.stamp <= stamp);
-        self.measured.insert(at, Measured { stamp, source, motion });
+        self.measured.insert(
+            at,
+            Measured {
+                stamp,
+                source,
+                motion,
+            },
+        );
         self.measured_pushed = true;
     }
 
@@ -295,7 +343,11 @@ impl LioOdometry {
             Some(i) => {
                 let (t0, w0, v0) = self.motion_history[i - 1];
                 let (t1, w1, v1) = self.motion_history[i];
-                let along = if t1 > t0 { (stamp - t0) / (t1 - t0) } else { 1.0 };
+                let along = if t1 > t0 {
+                    (stamp - t0) / (t1 - t0)
+                } else {
+                    1.0
+                };
                 Some((w0 + (w1 - w0) * along, v0 + (v1 - v0) * along))
             }
             None => self.motion_history.back().map(|(_, w, v)| (*w, *v)),
@@ -306,23 +358,37 @@ impl LioOdometry {
         self.filter.x.rotation.transpose() * self.filter.x.velocity
     }
 
-    /// Variances scaled by how much noisier than them `source` has proven: its residuals'
-    /// median absolute value (x1.4826 for a normal's sigma), so outliers don't set it, and
-    /// never below the given ones.
-    fn learned<const N: usize>(&mut self, source: usize, residual: &[f64; N], variances: &[f64; N]) -> [f64; N] {
-        let measured: Vec<usize> = (0..N).filter(|&a| variances[a] > 0.0).collect();
-        if measured.is_empty() {
-            return *variances;
+    /// How much noisier than its given variances `source` has proven: the median of its
+    /// innovations against the spread those variances predict, over what that median is when
+    /// they are right (a median, so outliers don't set it), and never below one.
+    pub fn noise_scale(&self, source: usize) -> f64 {
+        self.scale(source)
+    }
+
+    fn scale(&self, source: usize) -> f64 {
+        self.residuals
+            .get(source)
+            .and_then(RunningMedian::median)
+            .map_or(1.0, |median| median.max(1.0))
+    }
+
+    /// Per measuring source: measurements taken, and refused by the gate.
+    pub fn taken(&self) -> &[[u64; 2]] {
+        &self.taken
+    }
+
+    fn learn(&mut self, source: usize, innovation: Option<Innovation>) {
+        let Some(innovation) = innovation else { return };
+        if self.taken.len() <= source {
+            self.taken.resize(source + 1, [0, 0]);
         }
-        let normalized = (measured.iter().map(|&a| residual[a] * residual[a] / variances[a]).sum::<f64>()
-            / measured.len() as f64)
-            .sqrt();
+        self.taken[source][usize::from(!innovation.accepted)] += 1;
         if self.residuals.len() <= source {
-            self.residuals.resize_with(source + 1, Vec::new);
+            self.residuals
+                .resize_with(source + 1, RunningMedian::default);
         }
-        let median = insert_sorted_median(&mut self.residuals[source], normalized);
-        let scale = (1.4826 * median).powi(2).max(1.0);
-        variances.map(|v| v * scale)
+        self.residuals[source]
+            .insert(innovation.squared / CHI_SQUARED_MEDIAN[innovation.dof.min(6) - 1]);
     }
 
     /// Runs an update that observes the 30 states only, carrying it to any extra states.
@@ -360,14 +426,21 @@ impl LioOdometry {
                 .push_back((self.state_at, self.filter.x.angular_velocity, body));
         }
         while self.measured.front().is_some_and(|m| m.stamp < until) {
-            let Measured { stamp: measured_at, source, motion } =
-                self.measured.pop_front().expect("checked");
+            let Measured {
+                stamp: measured_at,
+                source,
+                motion,
+            } = self.measured.pop_front().expect("checked");
             if self.first_scan {
                 continue;
             }
             let late = measured_at < self.state_at;
             let late_from = late.then(|| self.motion_at(measured_at)).flatten();
-            while self.motion_history.get(1).is_some_and(|(t, _, _)| *t <= measured_at) {
+            while self
+                .motion_history
+                .get(1)
+                .is_some_and(|(t, _, _)| *t <= measured_at)
+            {
                 self.motion_history.pop_front();
             }
             let stamp = measured_at.max(self.state_at);
@@ -389,40 +462,46 @@ impl LioOdometry {
                 if let Some((then, _)) = late_from {
                     rate += self.filter.x.angular_velocity - then;
                 }
-                let residual = rate - self.filter.x.angular_velocity;
-                let variances = Vector3::from(self.learned(source, &residual.into(), &variances.into()));
-                self.filter.update_angular_velocity(&rate, &variances);
+                let scale = self.scale(source);
+                let innovation = self
+                    .filter
+                    .update_angular_velocity(&rate, &variances, scale);
+                self.learn(source, innovation);
             }
             Motion::Velocity(mut velocity, variances) => {
-                let body = self.body_velocity();
                 if let Some((_, then)) = late_from {
-                    velocity += body - then;
+                    velocity += self.body_velocity() - then;
                 }
-                let residual = velocity - body;
-                let variances = Vector3::from(self.learned(source, &residual.into(), &variances.into()));
-                self.filter.update_body_velocity(&velocity, &variances);
+                let scale = self.scale(source);
+                let innovation = self
+                    .filter
+                    .update_body_velocity(&velocity, &variances, scale);
+                self.learn(source, innovation);
             }
             Motion::Pose(mut position, rotation, variances) => {
                 // Carried over the time the state has moved on since it was measured.
                 position += self.filter.x.velocity * (stamp - measured_at);
-                let x = &self.filter.x;
-                let turn = super::lio_filter::log(&(x.rotation.transpose() * rotation));
-                let offset = position - x.position;
-                let residual = [offset[0], offset[1], offset[2], turn[0], turn[1], turn[2]];
-                let variances = self.learned(source, &residual, &variances);
-                self.filter.update_pose(&position, &rotation, &variances);
+                let scale = self.scale(source);
+                let innovation = self
+                    .filter
+                    .update_pose(&position, &rotation, &variances, scale);
+                self.learn(source, innovation);
             }
             Motion::Imu(index, gyro, accel) => {
                 let imu = &mut self.imus[index];
                 let (rotation, lever) = imu.mount.expect("pushed once mounted");
-                let angular_acceleration = match imu.previous {
-                    Some((t0, gyro0)) if measured_at > t0 => rotation * (gyro - gyro0) / (measured_at - t0),
-                    _ => Vector3::zeros(),
-                };
+                let measurement = imu.measurement;
+                let mount = angular_motion(
+                    rotation,
+                    lever,
+                    imu.previous,
+                    (measured_at, gyro),
+                    measurement.gyro_variance,
+                );
                 imu.previous = Some((measured_at, gyro));
-                let mount = ImuMount { rotation, lever, angular_acceleration };
-                let (measurement, bias) = (imu.measurement, imu.bias);
-                self.filter.update_mounted_imu(&gyro, &accel, &measurement, &mount, bias);
+                let bias = imu.bias;
+                self.filter
+                    .update_mounted_imu(&gyro, &accel, &measurement, &mount, bias);
             }
         }
     }
@@ -477,7 +556,9 @@ impl LioOdometry {
             specific_force: level.specific_force,
             ..LioState::default()
         };
-        let (rotation, _) = self.imus[0].mount.expect("its samples are only taken once mounted");
+        let (rotation, _) = self.imus[0]
+            .mount
+            .expect("its samples are only taken once mounted");
         if rotation != Matrix3::identity() {
             x.rotation = level.rotation * rotation.transpose();
             x.specific_force = rotation * level.specific_force;
@@ -528,7 +609,13 @@ impl LioOdometry {
             let x = &self.filter.x;
             for (p, &lidar) in self.thinned.iter().zip(&self.thinned_lidar) {
                 let (mount_rotation, mount_translation) = self.lidars[lidar].expect("mounted");
-                self.map_seed.push(to_world(p, &x.rotation, &x.position, &mount_rotation, &mount_translation));
+                self.map_seed.push(to_world(
+                    p,
+                    &x.rotation,
+                    &x.position,
+                    &mount_rotation,
+                    &mount_translation,
+                ));
             }
             if self.map_seed.len() < self.config.map_seed_points {
                 return Some(None);
@@ -561,7 +648,12 @@ impl LioOdometry {
             }
             self.catch_up_imu(now);
             let (mount_rotation, mount_translation) = self.lidars[lidar].expect("mounted");
-            let m = LidarMeasurement { mount_rotation, mount_translation, ..self.config.lidar };
+            let m = LidarMeasurement {
+                mount_rotation,
+                mount_translation,
+                point_variance: self.point_variances[lidar],
+                ..self.config.lidar
+            };
             let mut group = PointGroup {
                 body: &self.thinned[start..start + run],
                 world: &mut self.world[start..start + run],
@@ -596,7 +688,11 @@ impl LioOdometry {
     fn thin(&mut self, parts: Vec<(usize, Vec<SurfacePoint>)>) {
         let mut merged: Vec<(SurfacePoint, usize)> = Vec::new();
         for (lidar, points) in parts {
-            merged.extend(voxel_centroids(&points, self.config.scan_cube).into_iter().map(|p| (p, lidar)));
+            merged.extend(
+                voxel_centroids(&points, self.config.scan_cube)
+                    .into_iter()
+                    .map(|p| (p, lidar)),
+            );
         }
         if merged.iter().any(|(_, l)| *l != merged[0].1) {
             merged.sort_by(|a, b| a.0.time_ms.total_cmp(&b.0.time_ms));
@@ -635,6 +731,7 @@ impl LioOdometry {
                 sync.imu_after = next;
             }
             self.rate = (sync.imu_before.gyro, sync.imu_before.accel_g);
+            self.rate_at = sync.imu_before.stamp;
             self.first_scan = false;
             self.covariance_at = now;
             self.state_at = now;
@@ -643,8 +740,9 @@ impl LioOdometry {
             while now > self.sync.imu_after.stamp {
                 let sample = self.sync.imu_after;
                 self.take_rates(sample.stamp);
-                let previous = (self.state_at, self.rate.0);
+                let previous = (self.rate_at, self.rate.0);
                 self.rate = (sample.gyro, sample.accel_g);
+                self.rate_at = sample.stamp;
                 self.filter
                     .predict(sample.stamp - self.state_at, &self.noise, true, false);
                 self.state_at = sample.stamp;
@@ -681,22 +779,76 @@ impl LioOdometry {
         if rotation == Matrix3::identity() && lever == Vector3::zeros() {
             return self.carrying(|filter| filter.update_imu(&gyro, &accel, &measurement));
         }
-        let dt = self.state_at - previous.0;
-        let angular_acceleration = if dt > 0.0 {
-            rotation * (gyro - previous.1) / dt
-        } else {
-            Vector3::zeros()
-        };
-        let mount = ImuMount { rotation, lever, angular_acceleration };
-        self.carrying(|filter| filter.update_mounted_imu(&gyro, &accel, &measurement, &mount, BiasAt::Core));
+        let mount = angular_motion(
+            rotation,
+            lever,
+            Some(previous),
+            (self.rate_at, gyro),
+            measurement.gyro_variance,
+        );
+        self.carrying(|filter| {
+            filter.update_mounted_imu(&gyro, &accel, &measurement, &mount, BiasAt::Core)
+        });
     }
 }
 
-/// Inserts `value` into the sorted `values` and returns their median.
-fn insert_sorted_median(values: &mut Vec<f64>, value: f64) -> f64 {
-    let at = values.partition_point(|r| *r < value);
-    values.insert(at, value);
-    values[values.len() / 2]
+/// An IMU's mount with the angular acceleration between its `previous` sample and this one
+/// (stamp, gyro): a difference of two gyro readings, so its variance is twice one reading's
+/// over the interval squared.
+fn angular_motion(
+    rotation: Matrix3<f64>,
+    lever: Vector3<f64>,
+    previous: Option<(f64, Vector3<f64>)>,
+    (at, gyro): (f64, Vector3<f64>),
+    gyro_variance: f64,
+) -> ImuMount {
+    let (angular_acceleration, angular_acceleration_variance) = match previous {
+        Some((t0, gyro0)) if at > t0 => {
+            let dt = at - t0;
+            (
+                rotation * (gyro - gyro0) / dt,
+                2.0 * gyro_variance / (dt * dt),
+            )
+        }
+        _ => (Vector3::zeros(), 0.0),
+    };
+    ImuMount {
+        rotation,
+        lever,
+        angular_acceleration,
+        angular_acceleration_variance,
+    }
+}
+
+/// The running median of non-negative values, in two heaps: O(log n) per value.
+#[derive(Debug, Default)]
+struct RunningMedian {
+    /// The lower half (a max-heap) and the upper half (a min-heap), as the values' bits,
+    /// which order as the values do when they are non-negative.
+    lower: std::collections::BinaryHeap<u64>,
+    upper: std::collections::BinaryHeap<std::cmp::Reverse<u64>>,
+}
+
+impl RunningMedian {
+    fn insert(&mut self, value: f64) {
+        let bits = value.max(0.0).to_bits();
+        if self.lower.peek().is_some_and(|top| bits > *top) {
+            self.upper.push(std::cmp::Reverse(bits));
+        } else {
+            self.lower.push(bits);
+        }
+        if self.lower.len() > self.upper.len() + 1 {
+            let moved = self.lower.pop().expect("longer");
+            self.upper.push(std::cmp::Reverse(moved));
+        } else if self.upper.len() > self.lower.len() {
+            let std::cmp::Reverse(moved) = self.upper.pop().expect("longer");
+            self.lower.push(moved);
+        }
+    }
+
+    fn median(&self) -> Option<f64> {
+        self.lower.peek().map(|bits| f64::from_bits(*bits))
+    }
 }
 
 /// The unit quaternion [x, y, z, w] of a rotation matrix (Shoemake's method).
@@ -734,6 +886,103 @@ pub fn quaternion(m: &Matrix3<f64>) -> [f64; 4] {
 mod tests {
     use super::*;
     use crate::odometry_fusion::lio_filter::exp;
+
+    /// A body at the origin, still for a second (to level), then spun up over half a second to
+    /// turn about z at `w` rad/s, read by IMUs at `mounts` (body_from_imu rotation, lever,
+    /// gyro bias), 200 Hz.
+    fn turning(
+        mounts: &[(Matrix3<f64>, Vector3<f64>, Vector3<f64>)],
+        w: f64,
+        seconds: f64,
+    ) -> LioOdometry {
+        let imus = mounts
+            .iter()
+            .map(|_| (point_lio_imu(), [0.0001, 0.0001]))
+            .collect();
+        let mut lio = LioOdometry::new(LioConfig::default(), imus, Vec::new());
+        for (i, (rotation, lever, _)) in mounts.iter().enumerate() {
+            lio.set_imu_mount(i, *rotation, *lever);
+        }
+        let up = Vector3::new(0.0, 0.0, 9.81);
+        for k in 0..(seconds * 200.0) as usize {
+            let t = k as f64 / 200.0;
+            let spin_up = ((t - 1.0) / 0.5).clamp(0.0, 1.0);
+            let rate = Vector3::new(0.0, 0.0, w * spin_up);
+            let acceleration = Vector3::new(
+                0.0,
+                0.0,
+                if spin_up > 0.0 && spin_up < 1.0 {
+                    w / 0.5
+                } else {
+                    0.0
+                },
+            );
+            for (i, (rotation, lever, bias)) in mounts.iter().enumerate() {
+                let specific_force =
+                    up + rate.cross(&rate.cross(lever)) + acceleration.cross(lever);
+                let gyro = rotation.transpose() * rate + bias;
+                let accel = rotation.transpose() * specific_force / 9.81;
+                lio.push_imu(i, t, gyro, accel);
+            }
+            while lio.step().is_some() {}
+        }
+        lio
+    }
+
+    #[test]
+    fn an_imu_away_from_the_body_reads_its_turn_and_its_lever_arm() {
+        // Tilted on every axis and 0.3 m out: turning at 2 rad/s it feels 1.2 m/s^2 inward.
+        let mount = (
+            exp(&Vector3::new(-0.88, 0.88, -1.38)),
+            Vector3::new(0.3, 0.0, 0.0),
+            Vector3::zeros(),
+        );
+        let lio = turning(&[mount], 2.0, 4.0);
+        let x = lio.state();
+        assert!(
+            (x.angular_velocity - Vector3::new(0.0, 0.0, 2.0)).norm() < 0.05,
+            "{}",
+            x.angular_velocity
+        );
+        assert!(
+            x.velocity.norm() < 0.05,
+            "the centripetal pull read as motion: {}",
+            x.velocity
+        );
+        assert!(x.position.norm() < 0.05, "{}", x.position);
+    }
+
+    #[test]
+    fn a_second_imu_learns_how_its_gyro_bias_differs() {
+        let body = (Matrix3::identity(), Vector3::zeros(), Vector3::zeros());
+        let bias = Vector3::new(0.05, -0.03, 0.02);
+        let second = (
+            exp(&Vector3::new(0.0, 0.0, std::f64::consts::FRAC_PI_2)),
+            Vector3::new(0.0, 0.2, 0.0),
+            bias,
+        );
+        let lio = turning(&[body, second], 1.0, 10.0);
+        // Two gyros tell only their biases' difference apart (nothing says which one is
+        // off), so that is what the filter must have found, in the body's axes.
+        let learned = lio.filter.extra.fixed_rows::<3>(0).into_owned();
+        let difference = second.0 * learned - lio.state().gyro_bias;
+        assert!(
+            (difference - second.0 * bias).norm() < 0.005,
+            "{difference}"
+        );
+        // Nor which one to believe, so the turn is off by no more than the bias between them.
+        let turn_error = (lio.state().angular_velocity - Vector3::new(0.0, 0.0, 1.0)).norm();
+        assert!(turn_error < bias.norm(), "{turn_error}");
+    }
+
+    #[test]
+    fn the_running_median_is_the_middle_value() {
+        let mut median = RunningMedian::default();
+        for (value, expected) in [(5.0, 5.0), (1.0, 1.0), (3.0, 3.0), (9.0, 3.0), (7.0, 5.0)] {
+            median.insert(value);
+            assert_eq!(median.median(), Some(expected));
+        }
+    }
 
     #[test]
     fn quaternion_matches_the_rotation_on_both_branches() {

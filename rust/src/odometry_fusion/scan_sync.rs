@@ -302,8 +302,13 @@ impl ScanSync {
 
 /// ms: a scan's latest point, the last one counting first.
 fn latest_ms(points: &[SurfacePoint]) -> f32 {
-    let Some(last) = points.last() else { return 0.0 };
-    points.iter().fold(last.time_ms, |m, p| if p.time_ms > m { p.time_ms } else { m })
+    let Some(last) = points.last() else {
+        return 0.0;
+    };
+    points.iter().fold(
+        last.time_ms,
+        |m, p| if p.time_ms > m { p.time_ms } else { m },
+    )
 }
 
 /// The rotation turning `from` onto `onto`'s direction, about their common normal.
@@ -374,6 +379,30 @@ mod tests {
         let up = level.rotation * tilted;
         assert!((up - Vector3::z()).norm() < 1e-12, "{up}");
         assert_eq!(level.gravity, Vector3::new(0.0, 0.0, -WORLD_GRAVITY));
+    }
+
+    #[test]
+    fn a_second_lidars_overlapping_scan_is_merged_in_time() {
+        let at = |time_ms: f32| SurfacePoint {
+            position: [1.0, 0.0, 0.0],
+            reflectivity: 0.0,
+            time_ms,
+        };
+        let mut sync = ScanSync::new(false);
+        // The first lidar sweeps 0..90 ms; the second, starting 50 ms in, 0..50 ms of its own.
+        sync.push_scan(0, 1_000_000_000, vec![at(0.0), at(90.0)]);
+        sync.push_scan(1, 1_050_000_000, vec![at(0.0), at(50.0)]);
+        sync.push_scan(0, 1_100_000_000, vec![at(0.0), at(90.0)]);
+        let scan = sync.next_scan().expect("ready without an IMU");
+        assert_eq!(scan.begin, 1.0);
+        let times: Vec<(usize, Vec<f32>)> = scan
+            .parts
+            .iter()
+            .map(|(l, p)| (*l, p.iter().map(|p| p.time_ms).collect()))
+            .collect();
+        assert_eq!(times, vec![(0, vec![0.0, 90.0]), (1, vec![50.0, 100.0])]);
+        // The first lidar's next scan began after the second's had: nothing left to merge in.
+        assert_eq!(sync.next_scan().expect("next").parts.len(), 1);
     }
 
     #[test]

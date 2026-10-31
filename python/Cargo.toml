@@ -8,7 +8,7 @@ name = "dim_odom"
 version = "0.5.0-beta.3"
 edition = "2021"
 license = "Apache-2.0"
-description = "Python bindings for dimSLAM: cuVSLAM visual odometry plus error-state Kalman fusion"
+description = "Python bindings for dimSLAM: one odometry filter over IMUs, cameras (cuVSLAM) and odometry sources"
 repository = "https://github.com/dimensionalOS/dimSLAM"
 
 [lib]
