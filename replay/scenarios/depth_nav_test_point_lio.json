@@ -35,5 +35,15 @@
   "angular_speed": 0.05,
   "min_seconds": 1.0,
   "trim_seconds": 0.3
+ },
+ "expect": {
+  "default": {
+   "moving_path_m": {
+    "max": 50.0
+   },
+   "moving_roughness_rms_mm": {
+    "max": 15.0
+   }
+  }
  }
 }

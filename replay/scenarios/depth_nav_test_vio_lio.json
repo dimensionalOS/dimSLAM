@@ -102,5 +102,33 @@
    "/cameras": []
   }
  },
- "expect": {}
+ "expect": {
+  "lio": {
+   "moving_path_m": {
+    "max": 50.0
+   },
+   "moving_roughness_rms_mm": {
+    "max": 15.0
+   }
+  },
+  "vio_lio": {
+   "moving_path_m": {
+    "max": 50.0
+   },
+   "moving_roughness_rms_mm": {
+    "max": 15.0
+   }
+  }
+ },
+ "baseline": {
+  "note": "2026-10-30 CudaLaptop GPU: a run that stays on track walks ~41 m smoothly; the recorded Point-LIO, which jumps, covers 76.8 m with 90.6 mm roughness",
+  "lio": {
+   "moving_path_m": 40.8,
+   "moving_roughness_rms_mm": 9.89
+  },
+  "vio_lio": {
+   "moving_path_m": 40.86,
+   "moving_roughness_rms_mm": 9.9
+  }
+ }
 }
