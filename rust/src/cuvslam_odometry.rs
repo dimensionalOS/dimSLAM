@@ -237,6 +237,52 @@ impl Default for CuvslamOdometryConfig {
     }
 }
 
+/// The newest set of queued images, one per camera, whose stamps agree within `limit` ns,
+/// taken out with everything older; images that can no longer find partners are dropped.
+/// Each queue is one camera's stream, oldest first, and each stream arrives in order.
+fn take_frame_set(queues: &mut [VecDeque<ImageFrame>], limit: i64) -> Option<Vec<ImageFrame>> {
+    // A partner is either still queued or yet to come, so an image older than another
+    // camera's oldest queued one (by more than the limit) has missed its partner for good.
+    let oldest: Vec<Option<i64>> = queues
+        .iter()
+        .map(|queue| queue.front().map(|image| image.timestamp_ns))
+        .collect();
+    for (index, queue) in queues.iter_mut().enumerate() {
+        let horizon = (0..oldest.len())
+            .filter(|other| *other != index)
+            .filter_map(|other| oldest[other])
+            .max();
+        if let Some(horizon) = horizon {
+            while queue
+                .front()
+                .is_some_and(|image| image.timestamp_ns < horizon - limit)
+            {
+                queue.pop_front();
+            }
+        }
+    }
+    let (anchor, others) = queues.split_first()?;
+    let (at, partners) = anchor.iter().enumerate().rev().find_map(|(at, image)| {
+        let partners = others
+            .iter()
+            .map(|queue| {
+                queue
+                    .iter()
+                    .position(|other| (other.timestamp_ns - image.timestamp_ns).abs() <= limit)
+            })
+            .collect::<Option<Vec<usize>>>()?;
+        Some((at, partners))
+    })?;
+    let positions: Vec<usize> = std::iter::once(at).chain(partners).collect();
+    Some(
+        queues
+            .iter_mut()
+            .zip(positions)
+            .map(|(queue, position)| queue.drain(..=position).last().expect("nonempty drain"))
+            .collect(),
+    )
+}
+
 struct RigCamera {
     frame: String,
     rig_from_camera: Isometry3<f64>,
@@ -568,58 +614,22 @@ impl CuvslamCore {
         }
     }
 
-    /// Fills each camera's `image` with the newest set of queued images whose stamps agree,
-    /// dropping what that set supersedes and what can no longer find partners. False when no
-    /// camera has a partner yet.
+    /// Fills each camera's `image` with the newest set of queued images whose stamps agree.
+    /// False when no camera has a partner yet.
     fn match_frame_set(&mut self) -> bool {
         let limit = self.skew_limit_ns();
-        // Each stream arrives in order, so an image older than every other camera's newest
-        // (by more than the limit) has missed its partner for good.
-        let newest: Vec<Option<i64>> = self
+        let mut queues: Vec<VecDeque<ImageFrame>> = self
             .cameras
-            .iter()
-            .map(|camera| camera.queued.back().map(|image| image.timestamp_ns))
+            .iter_mut()
+            .map(|camera| std::mem::take(&mut camera.queued))
             .collect();
-        for index in 0..self.cameras.len() {
-            let others = (0..self.cameras.len())
-                .filter(|other| *other != index)
-                .map(|other| newest[other])
-                .collect::<Option<Vec<i64>>>();
-            if let Some(horizon) = others.and_then(|others| others.into_iter().min()) {
-                let queued = &mut self.cameras[index].queued;
-                while queued
-                    .front()
-                    .is_some_and(|image| image.timestamp_ns < horizon - limit)
-                {
-                    queued.pop_front();
-                }
-            }
+        let matched = take_frame_set(&mut queues, limit);
+        for (camera, queue) in self.cameras.iter_mut().zip(queues) {
+            camera.queued = queue;
         }
-        let anchor = &self.cameras[0].queued;
-        let matched = anchor.iter().rev().find_map(|image| {
-            let stamp = image.timestamp_ns;
-            let partners = self.cameras[1..]
-                .iter()
-                .map(|camera| {
-                    camera
-                        .queued
-                        .iter()
-                        .position(|other| (other.timestamp_ns - stamp).abs() <= limit)
-                })
-                .collect::<Option<Vec<usize>>>()?;
-            Some((stamp, partners))
-        });
-        let Some((stamp, partners)) = matched else {
-            return false;
-        };
-        let at = self.cameras[0]
-            .queued
-            .iter()
-            .position(|image| image.timestamp_ns == stamp)
-            .expect("found above");
-        let positions = std::iter::once(at).chain(partners);
-        for (camera, position) in self.cameras.iter_mut().zip(positions) {
-            camera.image = camera.queued.drain(..=position).last();
+        let Some(set) = matched else { return false };
+        for (camera, image) in self.cameras.iter_mut().zip(set) {
+            camera.image = Some(image);
         }
         true
     }
@@ -1248,6 +1258,46 @@ impl CuvslamCore {
 mod tests {
     use super::*;
     use nalgebra::{Translation3, UnitQuaternion};
+
+    fn stamped(timestamp_ns: i64) -> ImageFrame {
+        ImageFrame { timestamp_ns, ..Default::default() }
+    }
+
+    fn stamps(queue: &VecDeque<ImageFrame>) -> Vec<i64> {
+        queue.iter().map(|image| image.timestamp_ns).collect()
+    }
+
+    #[test]
+    fn a_frame_set_is_matched_by_stamp_when_one_stream_lags() {
+        // The left camera's stream is three frames ahead of the right's.
+        let mut queues = vec![
+            [0, 100, 200, 300].map(stamped).into_iter().collect::<VecDeque<_>>(),
+            VecDeque::new(),
+        ];
+        assert!(take_frame_set(&mut queues, 1).is_none());
+        queues[1].push_back(stamped(0));
+        let set = take_frame_set(&mut queues, 1).expect("both have frame 0");
+        assert_eq!(set.iter().map(|image| image.timestamp_ns).collect::<Vec<_>>(), [0, 0]);
+        assert_eq!(stamps(&queues[0]), [100, 200, 300]);
+        queues[1].push_back(stamped(100));
+        queues[1].push_back(stamped(200));
+        let set = take_frame_set(&mut queues, 1).expect("frame 200 is the newest common");
+        assert_eq!(set.iter().map(|image| image.timestamp_ns).collect::<Vec<_>>(), [200, 200]);
+        assert_eq!(stamps(&queues[0]), [300]);
+        assert!(queues[1].is_empty());
+    }
+
+    #[test]
+    fn an_image_whose_partner_was_dropped_is_dropped_too() {
+        // The right camera lost frame 100; the left's frame 100 can never pair.
+        let mut queues = vec![
+            [100, 200].map(stamped).into_iter().collect::<VecDeque<_>>(),
+            [200].map(stamped).into_iter().collect::<VecDeque<_>>(),
+        ];
+        let set = take_frame_set(&mut queues, 1).expect("frame 200 pairs");
+        assert_eq!(set[0].timestamp_ns, 200);
+        assert!(queues.iter().all(VecDeque::is_empty));
+    }
 
     #[test]
     fn adjoint_of_identity_is_identity() {
