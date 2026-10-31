@@ -1,6 +1,6 @@
 {
  "name": "roscon_multi_imu",
- "description": "Handheld rig at ROSCon, 15.5 min: Mid-360 lidar with two IMUs, the Mid-360's own and a RealSense's (noisier, mounted on the camera, away from the lidar). The body is the Mid-360 IMU's frame; the RealSense IMU is placed by the recording's tf_static (rotation and lever arm). The RealSense IMU's stamps run 3 ms late against the Mid-360's (its gyro, turned into the Mid-360's axes, matches best shifted by -3 ms). Scored against the recorded live Point-LIO (Mid-360 IMU only).",
+ "description": "Handheld rig at ROSCon, 15.5 min: Mid-360 lidar with two IMUs, the Mid-360's own and a RealSense's (noisier, mounted on the camera, away from the lidar). The body is the Mid-360 IMU's frame; the RealSense IMU is placed by the recording's tf_static (rotation and lever arm). The RealSense IMU's stamps run 3 ms late against the Mid-360's (its gyro, turned into the Mid-360's axes, matches best shifted by -3 ms). The RealSense gyro's variance is its own reading noise at rest (~1.5e-4 rad^2/s^2): it also sets how much its lever arm's angular acceleration, a difference of two readings, is trusted. Scored against the recorded live Point-LIO (Mid-360 IMU only).",
  "recording": "roscon/roscon_jpeg.db",
  "mode": "slam",
  "tf_stream": "tf_static",
@@ -39,7 +39,7 @@
    },
    {
     "frame_id": "camera_imu_frame",
-    "gyro_variance": 0.03,
+    "gyro_variance": 0.0002,
     "accel_variance": 0.02,
     "gyro_clip": 17.45,
     "accel_clip_g": 4.0
@@ -64,7 +64,7 @@
    "/imus": [
     {
      "frame_id": "camera_imu_frame",
-     "gyro_variance": 0.03,
+     "gyro_variance": 0.0002,
      "accel_variance": 0.02,
      "gyro_clip": 17.45,
      "accel_clip_g": 4.0
@@ -95,7 +95,10 @@
    "ate_xy_mm_mean": 26.29
   },
   "both_imus": {
-   "ate_xy_mm_mean": 24.64
+   "ate_xy_mm_mean": 26.63
+  },
+  "realsense_imu": {
+   "ate_xy_mm_mean": 20.83
   }
  }
 }
