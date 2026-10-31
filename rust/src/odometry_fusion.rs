@@ -6,11 +6,11 @@
 // source is a measurement of that one state, so the two modes differ only in prediction.
 
 mod eskf;
-mod lidar;
 pub mod lio_filter;
 pub mod lio_odometry;
 pub mod plane_fit;
 mod point_map;
+mod scan_points;
 mod scan_sync;
 
 use std::collections::VecDeque;
@@ -19,12 +19,10 @@ use nalgebra::{DVector, Isometry3, Matrix3, Matrix6, Translation3, UnitQuaternio
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::types::{ImuSample, LidarScan, OdometryEstimate, Twist};
+use crate::types::{ImuSample, OdometryEstimate, Twist};
 use crate::warn_throttled;
 use eskf::{yaw_only, Cov, Filter, ImuBias, ImuInput, Jacobian, State};
-use lidar::{CloudSlice, PlaneEvidence, PlaneMap};
-use nalgebra::DMatrix;
-pub use lidar::{surface_points, voxel_centroids, LidarConfig, LidarMapConfig, Matching, SurfacePoint};
+pub use scan_points::{surface_points, voxel_centroids, SurfacePoint};
 pub use point_map::{to_world, PointMap};
 pub use scan_sync::{header_seconds, Level, ScanSync, SyncedScan, STANDARD_GRAVITY};
 
@@ -216,10 +214,6 @@ pub struct OdometryFusionConfig {
     /// to the moving model within a few messages. How often the body switches between the two
     /// is learned as it runs: the switches it has made, plus one, over the time it has run.
     pub imm: bool,
-    /// One entry per lidar, told apart by the frame_id its scans carry. Each scan's points are
-    /// fused directly as point-to-plane measurements against `lidar_map`, which they also build.
-    pub lidars: Vec<LidarConfig>,
-    pub lidar_map: LidarMapConfig,
     /// With IMUs: angular velocity and specific force become states, each IMU sample a
     /// measurement of them (clipped axes left out), instead of the samples driving the
     /// motion model directly. Robust to a body that shakes or clips its IMU.
@@ -284,8 +278,6 @@ impl Default for OdometryFusionConfig {
             zero_velocity_variances: [0.0; 6],
             no_imu_blend: false,
             imm: false,
-            lidars: Vec::new(),
-            lidar_map: LidarMapConfig::default(),
             imu_as_measurement: false,
         }
     }
@@ -348,7 +340,6 @@ enum EventKind {
     Seed,
     Imu(ImuInput),
     Measurement(Measurement),
-    Cloud(CloudSlice),
 }
 
 /// One filter step and the state it left behind, so a late arrival can replay from its slot.
@@ -363,8 +354,6 @@ struct Event {
     imm: Vec<ImmModel>,
     /// `imm`: how many times the likelier model has changed since init.
     imm_switches: u64,
-    /// A cloud slice's points are in the map.
-    mapped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -385,7 +374,6 @@ impl Event {
             sources: Vec::new(),
             imm: Vec::new(),
             imm_switches: 0,
-            mapped: false,
         }
     }
 }
@@ -446,19 +434,6 @@ pub struct FusionCore {
     realigned: u64,
     replayed: u64,
     too_late: u64,
-    /// Built from settled slices only, so it lives outside the replay history.
-    map: PlaneMap,
-    /// Per lidar, the filter's mount-correction slot when its mount is estimated.
-    mount_slots: Vec<Option<usize>>,
-    /// Slices stamped past the newest IMU sample, waiting for it.
-    pending_slices: VecDeque<(i64, CloudSlice)>,
-    newest_imu_ns: i64,
-    off_clock_scans: u64,
-    /// Matched points on near-horizontal surfaces (floors, ground): what holds height.
-    level_points: u64,
-    slices: u64,
-    matched_points: u64,
-    gated_points: u64,
 }
 
 impl FusionCore {
@@ -476,18 +451,6 @@ impl FusionCore {
             })
             .collect();
         let source_count = config.odom_sources.len();
-        let config_lidar_map = config.lidar_map.clone();
-        let mut mounts = 0;
-        let mount_slots = config
-            .lidars
-            .iter()
-            .map(|lidar| {
-                (lidar.mount_rotation_std > 0.0).then(|| {
-                    mounts += 1;
-                    mounts - 1
-                })
-            })
-            .collect();
         Self {
             config,
             filter: Filter::default(),
@@ -506,15 +469,6 @@ impl FusionCore {
             realigned: 0,
             replayed: 0,
             too_late: 0,
-            map: PlaneMap::new(config_lidar_map),
-            mount_slots,
-            pending_slices: VecDeque::new(),
-            newest_imu_ns: 0,
-            off_clock_scans: 0,
-            level_points: 0,
-            slices: 0,
-            matched_points: 0,
-            gated_points: 0,
         }
     }
 
@@ -648,84 +602,6 @@ impl FusionCore {
         }
         self.insert(Event::empty(ts_ns, EventKind::Imu(input)));
         self.imu_samples += 1;
-        self.newest_imu_ns = self.newest_imu_ns.max(ts_ns);
-        self.release_slices();
-    }
-
-    /// With an IMU, a slice waits until the IMU has reached its stamp, so it lands after the
-    /// samples it needs rather than ahead of them, where each arriving sample would replay it.
-    fn release_slices(&mut self) {
-        let ready = self
-            .pending_slices
-            .partition_point(|(ts_ns, _)| *ts_ns <= self.newest_imu_ns);
-        if ready == 0 {
-            return;
-        }
-        let events = self
-            .pending_slices
-            .drain(..ready)
-            .map(|(ts_ns, slice)| Event::empty(ts_ns, EventKind::Cloud(slice)))
-            .collect();
-        self.insert_all(events);
-    }
-
-    /// `base_from_lidar` carries the scan into the output frame, the filter's body.
-    pub fn handle_cloud(&mut self, scan: &LidarScan, base_from_lidar: &Isometry3<f64>) {
-        let Some(index) = self
-            .config
-            .lidars
-            .iter()
-            .position(|configured| configured.frame_id == scan.frame_id)
-        else {
-            warn_throttled!(
-                std::time::Duration::from_secs(5),
-                frame_id = %scan.frame_id,
-                "scan from an unconfigured frame_id dropped. Add a `lidars` entry with it.",
-            );
-            return;
-        };
-        let slices = lidar::slice_scan(scan, index, &self.config.lidars[index], base_from_lidar);
-        let Some((first_ns, _)) = slices.first() else {
-            return;
-        };
-        if !self.initialized {
-            if self.config.use_imu() {
-                return;
-            }
-            self.check_config();
-            self.initialize(*first_ns, UnitQuaternion::identity(), Vec::new(), None);
-        }
-        // A driver that stamps a sweep on another clock (one glitching to host time, say) would
-        // park its slices past every IMU sample, or, without an IMU, run the filter into the
-        // future: past the replay buffer ahead of the newest input, the stamp is not this clock's.
-        let newest_ns = self.events.back().map_or(*first_ns, |e| e.ts_ns);
-        let ahead = (*first_ns - newest_ns) as f64 / 1.0e9;
-        if self.initialized && ahead > self.config.replay_buffer_seconds {
-            self.off_clock_scans += 1;
-            warn_throttled!(
-                std::time::Duration::from_secs(10),
-                frame_id = %scan.frame_id,
-                ahead_seconds = ahead,
-                dropped = self.off_clock_scans,
-                "scan stamped ahead of every other input dropped: its driver is on another clock",
-            );
-            return;
-        }
-        self.slices += slices.len() as u64;
-        if self.config.use_imu() {
-            for (ts_ns, slice) in slices {
-                let slot = self.pending_slices.partition_point(|(t, _)| *t <= ts_ns);
-                self.pending_slices.insert(slot, (ts_ns, slice));
-            }
-            self.release_slices();
-            return;
-        }
-        self.insert_all(
-            slices
-                .into_iter()
-                .map(|(ts_ns, slice)| Event::empty(ts_ns, EventKind::Cloud(slice)))
-                .collect(),
-        );
     }
 
     pub fn handle_source(&mut self, msg: &OdometryEstimate) {
@@ -870,28 +746,6 @@ impl FusionCore {
                  grows overconfident and gates every source out"
             );
         }
-        for (index, lidar) in self.config.lidars.iter().enumerate() {
-            let frame_id = &lidar.frame_id;
-            assert!(
-                !frame_id.trim().is_empty(),
-                "every `lidars` entry needs its frame_id set"
-            );
-            assert!(
-                self.config.lidars[..index]
-                    .iter()
-                    .all(|other| other.frame_id != *frame_id),
-                "two `lidars` entries share frame_id {frame_id:?}"
-            );
-            assert!(
-                lidar.point_std > 0.0 && lidar.scan_voxel_size > 0.0 && lidar.slice_seconds > 0.0,
-                "lidar {frame_id:?} needs point_std, scan_voxel_size and slice_seconds above zero"
-            );
-        }
-        let map = &self.config.lidar_map;
-        assert!(
-            map.voxel_size > 0.0 && map.max_plane_std > 0.0 && map.min_points_per_plane >= 3,
-            "lidar_map needs voxel_size and max_plane_std above zero and min_points_per_plane >= 3"
-        );
         for (index, imu) in self.config.imus.iter().enumerate() {
             let frame_id = &imu.frame_id;
             assert!(
@@ -943,16 +797,8 @@ impl FusionCore {
         self.filter.planar = self.config.planar;
         self.filter.layout.clones = self.clone_slots.iter().flatten().count();
         self.filter.layout.imu_states = self.config.imu_as_measurement && !biases.is_empty();
-        self.filter.layout.mounts = self.mount_slots.iter().flatten().count();
         self.filter.layout.gravity_state =
             !biases.is_empty() && self.config.initial_stds.gravity > 0.0;
-        self.filter.mount_stds = self
-            .config
-            .lidars
-            .iter()
-            .filter(|lidar| lidar.mount_rotation_std > 0.0)
-            .map(|lidar| lidar.mount_rotation_std)
-            .collect();
         let gyro_bias_norms: Vec<f64> = biases.iter().map(|bias| bias.gyro.norm()).collect();
         self.filter.init(
             timestamp_ns,
@@ -1013,164 +859,12 @@ impl FusionCore {
         true
     }
 
-    /// Inserts events stamped in order, replaying once from the earliest rather than once per
-    /// event: a scan's slices all land behind the IMU samples that arrived during the sweep.
-    fn insert_all(&mut self, events: Vec<Event>) {
-        let oldest = self.events.front().expect("seeded at init").ts_ns;
-        let mut earliest = None;
-        for event in events {
-            if event.ts_ns <= oldest {
-                self.too_late += 1;
-                continue;
-            }
-            let slot = self.events.partition_point(|e| e.ts_ns <= event.ts_ns);
-            self.events.insert(slot, event);
-            earliest = Some(earliest.map_or(slot, |e: usize| e.min(slot)));
-        }
-        let Some(earliest) = earliest else {
-            return;
-        };
-        if earliest + 1 < self.events.len() {
-            self.replayed += 1;
-        }
-        for index in earliest..self.events.len() {
-            self.process_at(index);
-        }
-        // A slice joins the map once, at the pose its first update left: what is ahead of the
-        // body is then matchable within the next slice, as it must be going down stairs. A
-        // replay from a late source re-fuses the slice but cannot move points already mapped.
-        for index in earliest..self.events.len() {
-            if self.events[index].mapped {
-                continue;
-            }
-            self.events[index].mapped = true;
-            if let EventKind::Cloud(slice) = &self.events[index].kind {
-                let (slice, state) = (slice.clone(), self.events[index].state.clone());
-                self.map_slice(&slice, &state);
-            }
-        }
-        self.trim_history();
-    }
-
     /// Drops what has left the replay buffer.
     fn trim_history(&mut self) {
         let horizon = self.events.back().expect("nonempty").ts_ns
             - (self.config.replay_buffer_seconds * 1.0e9) as i64;
         while self.events.len() > 1 && self.events.front().expect("nonempty").ts_ns < horizon {
             self.events.pop_front();
-        }
-    }
-
-    /// A lidar's estimated mount correction in `state`, or none.
-    fn mount_of(&self, lidar: usize, state: &State) -> UnitQuaternion<f64> {
-        self.mount_slots
-            .get(lidar)
-            .copied()
-            .flatten()
-            .and_then(|slot| state.mounts.get(slot).copied())
-            .unwrap_or_else(UnitQuaternion::identity)
-    }
-
-    fn map_slice(&mut self, slice: &CloudSlice, state: &State) {
-        let angular_velocity = self.angular_velocity_of(state);
-        let mount = self.mount_of(slice.lidar, state);
-        for point in &slice.points {
-            let landed = lidar::land(
-                point,
-                &slice.origin,
-                &mount,
-                &state.position,
-                &state.q,
-                &state.velocity,
-                &angular_velocity,
-            );
-            self.map.insert(&landed.world);
-        }
-        self.map.prune(&state.position);
-    }
-
-    /// Body-frame rate of a stored state: its own without an IMU, else its held gyro sample.
-    fn angular_velocity_of(&self, state: &State) -> Vector3<f64> {
-        if self.filter.layout.angular_velocity_col().is_some() {
-            return state.angular_velocity;
-        }
-        state
-            .input
-            .as_ref()
-            .map_or(Vector3::zeros(), |input| input.gyro - state.biases[input.imu].gyro)
-    }
-
-    /// Point-to-plane against the map: an iterated update over the slice's matched points,
-    /// each iteration re-matching the points from where the last one left the pose.
-    fn apply_cloud(&mut self, slice: &CloudSlice) {
-        let prior = self.filter.x.clone();
-        let prior_cov = self.filter.p_cov.clone();
-        let (angular_velocity, _) = self.filter.angular_velocity();
-        let mount_slot = self.mount_slots.get(slice.lidar).copied().flatten();
-        let mut cols = vec![0, 1, 2, 6, 7, 8];
-        if let Some(slot) = mount_slot {
-            let col = self.filter.layout.mount_col(slot);
-            cols.extend(col..col + 3);
-        }
-        let block = DMatrix::from_fn(cols.len(), cols.len(), |r, c| prior_cov[(cols[r], cols[c])]);
-        let point_variance = self.config.lidars[slice.lidar].point_std.powi(2);
-        let gate = self.map.config().point_gate;
-        let iterations = self.map.config().iterations.max(1);
-        for iteration in 0..iterations {
-            let x = self.filter.x.clone();
-            let mount = self.mount_of(slice.lidar, &x);
-            let mut evidence = PlaneEvidence::new(cols.len());
-            let mut level = 0u64;
-            for point in &slice.points {
-                let landed = lidar::land(
-                    point,
-                    &slice.origin,
-                    &mount,
-                    &x.position,
-                    &x.q,
-                    &x.velocity,
-                    &angular_velocity,
-                );
-                let Some(plane) = self.map.plane_at(&landed.world) else {
-                    continue;
-                };
-                let residual = -(plane.normal.dot(&landed.world) + plane.offset);
-                let row = lidar::plane_row(&plane, &x.q, &landed, mount_slot.is_some());
-                let before = evidence.matched;
-                evidence.add(
-                    &row,
-                    residual,
-                    point_variance + plane.variance,
-                    &block,
-                    gate,
-                );
-                if evidence.matched > before && plane.normal.z.abs() > 0.7 {
-                    level += 1;
-                }
-            }
-            let settle = iteration + 1 == iterations;
-            if settle {
-                self.level_points += level;
-                self.matched_points += evidence.matched as u64;
-                self.gated_points += evidence.gated as u64;
-            }
-            if evidence.matched == 0 {
-                // Nothing matched from here: keep the prior, untouched.
-                self.filter.x = prior;
-                self.filter.p_cov = prior_cov;
-                return;
-            }
-            self.filter.update_pose_information(
-                &prior,
-                &prior_cov,
-                &cols,
-                &evidence.information,
-                &evidence.weighted_residual,
-                evidence.weighted_residual_sq,
-                evidence.log_det_noise,
-                evidence.matched,
-                settle,
-            );
         }
     }
 
@@ -1341,7 +1035,6 @@ impl FusionCore {
                 self.blend(&measurement, ts_ns)
             }
             EventKind::Measurement(measurement) => self.apply(&measurement, replaying),
-            EventKind::Cloud(slice) => self.apply_cloud(&slice),
         }
     }
 
@@ -1850,27 +1543,6 @@ impl FusionCore {
             too_late = self.too_late,
             "odometry fusion counters"
         );
-        if !self.config.lidars.is_empty() {
-            info!(
-                slices = self.slices,
-                off_clock_scans = self.off_clock_scans,
-                matched_points = self.matched_points,
-                level_points = self.level_points,
-                mount_corrections_deg = ?self
-                    .filter
-                    .x
-                    .mounts
-                    .iter()
-                    .map(|q| {
-                        let (r, p, y) = q.euler_angles();
-                        [r.to_degrees(), p.to_degrees(), y.to_degrees()]
-                    })
-                    .collect::<Vec<_>>(),
-                gated_points = self.gated_points,
-                map_voxels = self.map.voxel_count(),
-                "lidar counters"
-            );
-        }
     }
 }
 
@@ -1951,8 +1623,6 @@ mod tests {
             zero_velocity_variances: [0.0; 6],
             no_imu_blend: false,
             imm: false,
-            lidars: Vec::new(),
-            lidar_map: LidarMapConfig::default(),
             imu_as_measurement: false,
         }
     }
@@ -2373,86 +2043,6 @@ mod tests {
         }
         let x = core.filter.x.position.x;
         assert!((x - 1.25).abs() < 1e-9, "{x}");
-    }
-
-    /// A scan of a box room (x -5.17..4.83, y -3.89..4.11, z -1.07..2.93: walls off the map's
-    /// voxel grid) from a sensor at `position(t)`, rays over the sphere in a scrambled order over
-    /// 100 ms, so each slice spans the room as a non-repetitive Livox pattern does.
-    fn room_scan(start_ns: i64, position: impl Fn(i64) -> Vector3<f64>) -> LidarScan {
-        let rays = 3000;
-        let (low, high) = (Vector3::new(-5.17, -3.89, -1.07), Vector3::new(4.83, 4.11, 2.93));
-        let mut scan = LidarScan {
-            timestamp_ns: start_ns,
-            frame_id: "lidar".into(),
-            ..LidarScan::default()
-        };
-        for ray in 0..rays {
-            // Fibonacci sphere: even coverage with no randomness.
-            let z = 1.0 - 2.0 * (ray as f64 + 0.5) / rays as f64;
-            let azimuth = ray as f64 * std::f64::consts::PI * (3.0 - 5f64.sqrt());
-            let radius = (1.0 - z * z).sqrt();
-            let direction = Vector3::new(radius * azimuth.cos(), radius * azimuth.sin(), z);
-            // 1543 is coprime with 3000, so this visits every slot once, scattered.
-            let offset = ((ray as i64 * 1543) % rays as i64 * 100 * MS) / rays as i64;
-            let origin = position(start_ns + offset);
-            let hit = (0..3)
-                .filter(|&axis| direction[axis].abs() > 1e-9)
-                .map(|axis| {
-                    let wall = if direction[axis] > 0.0 { high[axis] } else { low[axis] };
-                    (wall - origin[axis]) / direction[axis]
-                })
-                .fold(f64::INFINITY, f64::min);
-            let point = direction * hit;
-            scan.points.push([point.x as f32, point.y as f32, point.z as f32]);
-            scan.offsets_ns.push(offset as u32);
-        }
-        scan
-    }
-
-    /// Lidar alone, no IMU and no source: the constant-velocity model carries the pose between
-    /// slices and the planes of the room pull it back onto the true path.
-    #[test]
-    fn lidar_alone_tracks_a_drive_through_a_room() {
-        let mut config = base_config(false);
-        config.odom_sources.clear();
-        config.replay_buffer_seconds = 0.3;
-        config.lidars = vec![LidarConfig {
-            frame_id: "lidar".into(),
-            ..LidarConfig::default()
-        }];
-        let mut core = FusionCore::new(config);
-        let speed = 0.5;
-        // Still for a second while the map fills, then 0.5 m/s along x.
-        let position = |ts_ns: i64| {
-            let moving = ((ts_ns as f64 / 1e9) - 1.0).max(0.0);
-            Vector3::new(-2.0 + speed * moving, 0.5, 0.0)
-        };
-        let start = Vector3::new(-2.0, 0.5, 0.0);
-        let mut worst: f64 = 0.0;
-        for scan in 0..60 {
-            let start_ns = scan * 100 * MS;
-            // The sensor reports in its own frame: points relative to where it was then.
-            let mut room = room_scan(start_ns, position);
-            for (point, offset) in room.points.iter_mut().zip(&room.offsets_ns) {
-                let origin = position(start_ns + *offset as i64);
-                let world = Vector3::new(point[0] as f64, point[1] as f64, point[2] as f64) + origin;
-                let relative = world - origin;
-                *point = [relative.x as f32, relative.y as f32, relative.z as f32];
-            }
-            core.handle_cloud(&room, &Isometry3::identity());
-            let now = start_ns + 100 * MS;
-            if let Some(out) = core.maybe_publish_at(now) {
-                let truth = position(now) - start;
-                let error = (out.pose.translation.vector - truth).norm();
-                if scan > 15 {
-                    worst = worst.max(error);
-                }
-            }
-        }
-        let truth = position(6000 * MS) - start;
-        assert!(truth.x > 2.0, "the body moved {truth}");
-        assert!(worst < 0.05, "worst error {worst:.3} m");
-        assert!(core.matched_points > 0);
     }
 
     #[test]

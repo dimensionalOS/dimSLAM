@@ -58,7 +58,7 @@ pub mod types;
 pub use cuvslam_odometry::{CameraConfig, CuvslamCore, CuvslamOdometryConfig};
 pub use dim_slam_core::{DimSlamCore, DimSlamCoreConfig, PointLioEngineConfig};
 pub use odometry_fusion::{
-    FusionCore, ImuConfig, InitialStds, LidarConfig, LidarMapConfig, OdometryFusionConfig, ProcessNoise, SourceConfig,
+    FusionCore, ImuConfig, InitialStds, OdometryFusionConfig, ProcessNoise, SourceConfig,
     SourceKind,
 };
 pub use types::{

@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 
 use nalgebra::{Matrix3, Vector3};
 
-use super::lidar::SurfacePoint;
+use super::scan_points::SurfacePoint;
 
 /// m/s^2 per g, as IMU drivers convert.
 pub const STANDARD_GRAVITY: f64 = 9.80665;

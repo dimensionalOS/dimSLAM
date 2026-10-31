@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use nalgebra::{Matrix3, Vector3};
 
-use super::lidar::SurfacePoint;
+use super::scan_points::SurfacePoint;
 
 type Cube = [i32; 3];
 

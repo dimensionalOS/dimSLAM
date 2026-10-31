@@ -278,7 +278,7 @@ fn take_frame_set(queues: &mut [VecDeque<ImageFrame>], limit: i64) -> Option<Vec
         queues
             .iter_mut()
             .zip(positions)
-            .map(|(queue, position)| queue.drain(..=position).last().expect("nonempty drain"))
+            .map(|(queue, position)| queue.drain(..=position).next_back().expect("nonempty drain"))
             .collect(),
     )
 }
