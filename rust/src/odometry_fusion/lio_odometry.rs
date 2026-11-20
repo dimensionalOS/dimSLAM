@@ -515,6 +515,11 @@ impl LioOdometry {
         self.late_points
     }
 
+    /// Points the map holds; at rest it stops growing.
+    pub fn map_points(&self) -> usize {
+        self.map.point_count()
+    }
+
     /// Dropped until the lidar's mount is set.
     pub fn push_scan(&mut self, lidar: usize, scan: &LidarScan) {
         if !self.lidar_mounted(lidar) {
@@ -638,12 +643,15 @@ impl LioOdometry {
             self.used.resize(n, true);
         }
         let mut start = 0usize;
+        // Points the filter had already passed: never matched, so never grown into the map either.
+        let mut late = Vec::new();
         for run in self.runs() {
             let now = self.thinned[start + run - 1].time_ms as f64 / 1000.0 + scan.begin;
             let lidar = self.thinned_lidar[start];
             if !self.first_scan && now < self.state_at {
                 // Another lidar's points the filter has already passed.
                 self.late_points += run as u64;
+                late.push(start..start + run);
                 start += run;
                 continue;
             }
@@ -675,11 +683,24 @@ impl LioOdometry {
         }
         let pose = self.pose(ros_seconds(scan.end));
         if n > 4 {
-            self.map.grow(
-                &self.world[..n],
-                &self.neighbors[..n],
-                self.config.map_spacing,
-            );
+            if late.is_empty() {
+                self.map.grow(
+                    &self.world[..n],
+                    &self.neighbors[..n],
+                    self.config.map_spacing,
+                );
+            } else {
+                // A skipped point's world position and neighbors are a previous scan's, left in the buffers.
+                let mut fused = vec![true; n];
+                for range in late {
+                    fused[range].fill(false);
+                }
+                let (world, neighbors): (Vec<_>, Vec<_>) = (0..n)
+                    .filter(|&i| fused[i])
+                    .map(|i| (self.world[i], std::mem::take(&mut self.neighbors[i])))
+                    .unzip();
+                self.map.grow(&world, &neighbors, self.config.map_spacing);
+            }
         }
         Some(Some(pose))
     }
@@ -974,6 +995,76 @@ mod tests {
         // Nor which one to believe, so the turn is off by no more than the bias between them.
         let turn_error = (lio.state().angular_velocity - Vector3::new(0.0, 0.0, 1.0)).norm();
         assert!(turn_error < bias.norm(), "{turn_error}");
+    }
+
+    /// One 100 ms sweep of a 10 x 10 x 4 m box room seen from `origin` (body frame = lidar frame),
+    /// points on a `spacing` grid of each wall, timed by azimuth.
+    fn room_sweep(origin: Vector3<f64>, spacing: f64) -> Vec<([f32; 3], u32)> {
+        let mut points = Vec::new();
+        let steps = |lo: f64, hi: f64| {
+            (0..=((hi - lo) / spacing).round() as i32).map(move |i| lo + spacing * i as f64)
+        };
+        for a in steps(-5.0, 5.0) {
+            for z in steps(-1.0, 3.0) {
+                for wall in [
+                    Vector3::new(5.0, a, z),
+                    Vector3::new(-5.0, a, z),
+                    Vector3::new(a, 5.0, z),
+                    Vector3::new(a, -5.0, z),
+                ] {
+                    let p = wall - origin;
+                    let azimuth = p.y.atan2(p.x) + std::f64::consts::PI;
+                    let offset = (azimuth / (2.0 * std::f64::consts::PI) * 99e6) as u32;
+                    points.push(([p.x as f32, p.y as f32, p.z as f32], offset));
+                }
+            }
+        }
+        points.sort_by_key(|(_, t)| *t);
+        points
+    }
+
+    #[test]
+    fn late_points_never_grow_the_map_so_a_still_robot_costs_the_same_forever() {
+        // A second, denser lidar whose stream runs 0.4 s behind: the filter never waits for it,
+        // so all its points are late. They used to be grown into the map from whatever the
+        // per-point buffers held (a previous scan's points, or blanks at the origin), every scan.
+        let mut lio = LioOdometry::new(
+            LioConfig::default(),
+            vec![(point_lio_imu(), [0.0001, 0.0001])],
+            vec![0.01, 0.01],
+        );
+        lio.set_imu_mount(0, Matrix3::identity(), Vector3::zeros());
+        for lidar in 0..2 {
+            lio.set_lidar_mount(lidar, Matrix3::identity(), Vector3::zeros());
+        }
+        let origin = Vector3::new(0.3, -0.2, 0.0);
+        let sweeps = [room_sweep(origin, 0.5), room_sweep(origin, 0.2)];
+        let scan = |lidar: usize, start_s: f64| LidarScan {
+            timestamp_ns: (start_s * 1e9).round() as i64,
+            frame_id: format!("lidar{lidar}"),
+            points: sweeps[lidar].iter().map(|(p, _)| *p).collect(),
+            offsets_ns: sweeps[lidar].iter().map(|(_, t)| *t).collect(),
+            ..Default::default()
+        };
+        let mut imu_t = 0.0;
+        let mut sizes = Vec::new();
+        for k in 0..300usize {
+            let begin = 1.0 + k as f64 * 0.1;
+            while imu_t <= begin + 0.15 {
+                lio.push_imu(0, imu_t, Vector3::zeros(), Vector3::new(0.0, 0.0, 1.0));
+                imu_t += 0.005;
+            }
+            lio.push_scan(0, &scan(0, begin));
+            if k >= 4 {
+                lio.push_scan(1, &scan(1, begin - 0.4 + 0.005));
+            }
+            while lio.step().is_some() {}
+            sizes.push(lio.map_points());
+        }
+        assert!(lio.late_points() > 0, "the test must make late points");
+        let (early, late) = (sizes[150], sizes[299]);
+        assert!(late <= early + early / 50, "the map grew from {early} to {late} points at rest");
+        assert!(lio.state().position.norm() < 0.05, "{}", lio.state().position);
     }
 
     #[test]

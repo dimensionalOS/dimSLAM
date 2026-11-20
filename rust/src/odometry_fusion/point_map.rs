@@ -78,6 +78,11 @@ impl PointMap {
         self.cubes.len()
     }
 
+    /// Points held in all cubes: what a nearest-neighbor search walks through.
+    pub fn point_count(&self) -> usize {
+        self.cubes.values().map(|&cell| self.cells[cell].points.len()).sum()
+    }
+
     pub fn insert(&mut self, points: &[SurfacePoint]) {
         for &p in points {
             let cube = self.cube_of(&p);

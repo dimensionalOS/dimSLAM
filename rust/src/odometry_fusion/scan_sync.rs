@@ -54,17 +54,17 @@ pub struct SyncedScan {
 struct LidarTiming {
     newest_end: f64,
     scans: u32,
-    /// s: mean begin-to-begin interval, and mean time from a scan's end to its arrival, as
-    /// the newest IMU stamp measures it.
+    /// s: mean begin-to-begin interval.
     mean_period: f64,
-    mean_lag: f64,
     newest_begin: f64,
 }
 
 impl LidarTiming {
-    /// Its next scan is a whole interval later than its usual timing allows.
-    fn overdue(&self, now: f64) -> bool {
-        self.scans >= 2 && now > self.newest_end + 2.0 * self.mean_period + self.mean_lag
+    /// Quiet for a whole interval past its usual one, as the newest scan of any lidar measures
+    /// it: scans share their path to the filter, so a delay on it holds them all back alike,
+    /// while IMU samples (small, on their own path) can run far ahead of every scan.
+    fn overdue(&self, newest_scan_begin: f64) -> bool {
+        self.scans >= 2 && newest_scan_begin > self.newest_end + 2.0 * self.mean_period
     }
 }
 
@@ -154,7 +154,6 @@ impl ScanSync {
         if timing.scans > 0 {
             let n = timing.scans as f64;
             timing.mean_period += (stamp - timing.newest_begin - timing.mean_period) / n;
-            timing.mean_lag += ((self.newest_imu - end).max(0.0) - timing.mean_lag) / n;
         }
         timing.scans += 1;
         timing.newest_begin = stamp;
@@ -194,7 +193,11 @@ impl ScanSync {
             self.taken = Some(begin + latest_ms(points) as f64 / 1000.0);
         }
         let end = self.taken.expect("taken above");
-        let now = if self.inertial { self.newest_imu } else { end };
+        let newest_scan_begin = self
+            .timing
+            .iter()
+            .map(|t| t.newest_begin)
+            .fold(f64::NEG_INFINITY, f64::max);
         if self.inertial && self.newest_imu < end {
             return None;
         }
@@ -204,7 +207,7 @@ impl ScanSync {
             l != lead
                 && timing.scans >= 2
                 && timing.newest_begin + timing.mean_period < end
-                && !timing.overdue(now)
+                && !timing.overdue(newest_scan_begin)
         });
         if waiting && self.inertial {
             return None;
