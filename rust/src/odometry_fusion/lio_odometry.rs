@@ -515,6 +515,11 @@ impl LioOdometry {
         self.late_points
     }
 
+    /// Scans and IMU samples waiting for the filter to take them.
+    pub fn pending(&self) -> (usize, usize) {
+        (self.sync.pending_scans(), self.sync.imus.len())
+    }
+
     /// Points the map holds; at rest it stops growing.
     pub fn map_points(&self) -> usize {
         self.map.point_count()

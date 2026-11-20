@@ -384,6 +384,8 @@ impl DimSlamCore {
             scans = self.odometry.scans_pushed(),
             late_points = self.odometry.late_points(),
             map_points = self.odometry.map_points(),
+            pending_scans = self.odometry.pending().0,
+            pending_imu_samples = self.odometry.pending().1,
             "odometry counters"
         );
         for (index, source) in self.sources.iter().enumerate() {
