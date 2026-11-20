@@ -8,13 +8,16 @@ the per-platform SDK packaging live in
   estimator, grown to take any number of IMUs, lidars, cameras through cuVSLAM
   (via the `cu_vslam_rs` crate) and other odometry sources, each placed by tf).
   It is plain synchronous Rust over plain Rust types, owning no transport or
-  threads, so anything can drive it; dimos supplies its own LCM wrapper. Needs
-  `CUVSLAM_SDK_DIR` (a dir with `include/cuvslam/cuvslam2.h` and
-  `lib/libcuvslam.*`) to build.
+  threads, so anything can drive it; dimos supplies its own LCM wrapper.
+  Cameras need `CUVSLAM_SDK_DIR` (a dir with `include/cuvslam/cuvslam2.h` and
+  `lib/libcuvslam.*`) at build time; without it `cu_vslam_rs` builds as a stub
+  and everything but cameras (IMUs, lidars, odometry sources) still works, e.g.
+  on an RK3588 with no CUDA.
 - `flake.nix` — re-exports the cuVSLAM SDKs this arch can run as `sdk-<variant>`
   (`x86_64-cuda12` and `x86_64-cuda13` on x86 linux, `orin` and `thor` on arm
   linux, `metal` on arm macOS), and a devShell with `CUVSLAM_SDK_DIR` already
-  set to this machine's default.
+  set to this machine's default. `packages.lio` / `checks.lio` and
+  `devShells.lio` are the same library with no SDK (lidar-inertial only).
 
 ```rust
 use dim_slam::{DimSlamCore, DimSlamCoreConfig, ImuConfig, LidarConfig, SourceConfig, SourceKind};

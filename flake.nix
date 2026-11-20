@@ -43,24 +43,25 @@
           src = ./rust;
         };
 
-        checkFor = variant: let sdkPackage = sdkPackages."sdk-${variant}"; in
+        # null builds cu_vslam_rs as its SDK-less stub: IMU, lidar and source fusion only, for boards with no cuVSLAM (e.g. RK3588).
+        checkFor = variant:
           (import generatedCargoNix {
             inherit pkgs;
             buildRustCrateForPkgs = cratePkgs: cratePkgs.buildRustCrate.override {
-              defaultCrateOverrides = cratePkgs.defaultCrateOverrides // {
+              defaultCrateOverrides = cratePkgs.defaultCrateOverrides // nixpkgs.lib.optionalAttrs (variant != null) {
                 # cu_vslam_rs's build.rs compiles its shim against this SDK.
-                cu_vslam_rs = _: { CUVSLAM_SDK_DIR = sdkPackage; };
+                cu_vslam_rs = _: { CUVSLAM_SDK_DIR = sdkPackages."sdk-${variant}"; };
               };
             };
           # The rlib, not the empty default output a lib crate leaves behind.
           }).rootCrate.build.lib;
       in {
         # The library is consumed from cargo; what nix is for here is the SDK it builds against.
-        packages = sdkPackages // { default = sdkPackages."sdk-${defaultVariant}"; };
+        packages = sdkPackages // { default = sdkPackages."sdk-${defaultVariant}"; lio = checkFor null; };
 
         # One compile per SDK variant available on this arch, so a broken variant
         # shows up here rather than in whatever downstream binary links it.
-        checks = nixpkgs.lib.genAttrs variants checkFor;
+        checks = nixpkgs.lib.genAttrs variants checkFor // { lio = checkFor null; };
 
         devShells.default = let sdkPackage = sdkPackages."sdk-${defaultVariant}"; in
           pkgs.mkShell ({
@@ -72,5 +73,10 @@
             # read-only lookup it consults first.
             CUMETAL_PREBUILT_CACHE_DIR = "${sdkPackage}/share/cumetal-cache";
           });
+
+        # No CUVSLAM_SDK_DIR: cu_vslam_rs builds as its stub, so only cameras are missing.
+        devShells.lio = pkgs.mkShell {
+          packages = [ pkgs.cargo pkgs.rustc pkgs.clippy pkgs.rustfmt ];
+        };
       });
 }
