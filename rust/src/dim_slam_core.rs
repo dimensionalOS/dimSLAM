@@ -65,6 +65,11 @@ pub struct DimSlamCoreConfig {
     /// External sources, each identified by the transform its estimates carry.
     pub odom_sources: Vec<SourceConfig>,
     pub process_noise: ProcessNoise,
+    /// How each scan is thinned before it is fused: every `keep_every`th usable point, then one
+    /// point per `scan_cube` m cube. The defaults are Point-LIO's; the filter's cost is linear in
+    /// what is left.
+    pub keep_every: u32,
+    pub scan_cube: f32,
 }
 
 /// Defers to the tracker so a field's default cannot drift from the core that reads it.
@@ -88,6 +93,8 @@ impl Default for DimSlamCoreConfig {
             lidars: Vec::new(),
             odom_sources: Vec::new(),
             process_noise: ProcessNoise::default(),
+            keep_every: LioConfig::default().keep_every,
+            scan_cube: LioConfig::default().scan_cube,
         }
     }
 }
@@ -144,6 +151,8 @@ impl DimSlamCore {
         lio.process[0] = noise.velocity;
         lio.process[1] = noise.angular_velocity;
         lio.process[2] = noise.specific_force;
+        lio.keep_every = config.keep_every;
+        lio.scan_cube = config.scan_cube;
         let imus = config
             .imus
             .iter()

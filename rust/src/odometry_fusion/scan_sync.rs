@@ -227,12 +227,29 @@ impl ScanSync {
         let mut parts = vec![(lead, points)];
         for l in 0..self.scans.len() {
             while l != lead && self.scans[l].front().is_some_and(|(b, _)| *b < end) {
-                let (other_begin, mut points) = self.scans[l].pop_front().expect("checked");
+                // Another lidar's points up to this scan's end join it; the rest wait for the
+                // next one, so overlapping lidars never hand the filter a point it has passed.
+                let (other_begin, queued) = self.scans[l].front_mut().expect("checked");
+                let other_begin = *other_begin;
+                let cut = ((end - other_begin) * 1000.0) as f32;
+                let (mut points, later): (Vec<_>, Vec<_>) =
+                    queued.drain(..).partition(|p| p.time_ms <= cut);
+                let whole = later.is_empty();
+                if whole {
+                    self.scans[l].pop_front();
+                } else {
+                    *queued = later;
+                }
                 let shift = ((other_begin - begin) * 1000.0) as f32;
                 for p in &mut points {
                     p.time_ms += shift;
                 }
-                parts.push((l, points));
+                if !points.is_empty() {
+                    parts.push((l, points));
+                }
+                if !whole {
+                    break;
+                }
             }
         }
         let level = self.level(begin);
@@ -400,9 +417,41 @@ mod tests {
             .iter()
             .map(|(l, p)| (*l, p.iter().map(|p| p.time_ms).collect()))
             .collect();
-        assert_eq!(times, vec![(0, vec![0.0, 90.0]), (1, vec![50.0, 100.0])]);
-        // The first lidar's next scan began after the second's had: nothing left to merge in.
+        // The second lidar's point past the first's end (100 ms) waits for the next scan.
+        assert_eq!(times, vec![(0, vec![0.0, 90.0]), (1, vec![50.0])]);
+        let rest = sync.next_scan().expect("the second lidar's remainder");
+        assert_eq!((rest.begin, rest.parts.len()), (1.05, 1));
+        assert_eq!(rest.parts[0].1.iter().map(|p| p.time_ms).collect::<Vec<_>>(), vec![50.0]);
+        // The first lidar's next scan began as the remainder ended: nothing left to merge in.
         assert_eq!(sync.next_scan().expect("next").parts.len(), 1);
+    }
+
+    #[test]
+    fn overlapping_lidars_never_hand_over_a_point_past_the_scan_end() {
+        let at = |time_ms: f32| SurfacePoint {
+            position: [1.0, 0.0, 0.0],
+            reflectivity: 0.0,
+            time_ms,
+        };
+        let sweep = || (0..=100).map(|ms| at(ms as f32)).collect::<Vec<_>>();
+        let mut sync = ScanSync::new(false);
+        // Two 100 ms lidars, the second 5 ms behind the first, as the M20's Airys run.
+        for k in 0..6u64 {
+            sync.push_scan(0, 1_000_000_000 + k * 100_000_000, sweep());
+            sync.push_scan(1, 1_005_000_000 + k * 100_000_000, sweep());
+        }
+        let (mut previous_end, mut points) = (0.0f64, 0usize);
+        while let Some(scan) = sync.next_scan() {
+            for (_, part) in &scan.parts {
+                for p in part {
+                    let t = scan.begin + p.time_ms as f64 / 1000.0;
+                    assert!(t <= scan.end + 1e-6 && t >= previous_end - 1e-6, "{t} outside {previous_end}..{}", scan.end);
+                }
+                points += part.len();
+            }
+            previous_end = scan.end;
+        }
+        assert_eq!(points, 12 * 101, "every point handed over once");
     }
 
     #[test]
