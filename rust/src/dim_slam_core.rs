@@ -118,6 +118,8 @@ pub struct DimSlamCore {
     output_frame_id: String,
     odom_frame_id: String,
     imus: Vec<String>,
+    /// s, per IMU: added to its stamps.
+    imu_time_offsets: Vec<f64>,
     lidars: Vec<String>,
     /// The configured sources, then the tracker.
     sources: Vec<SourceState>,
@@ -209,6 +211,7 @@ impl DimSlamCore {
             )),
             output_frame_id: config.output_frame_id,
             odom_frame_id: config.odom_frame_id,
+            imu_time_offsets: config.imus.iter().map(|imu| imu.time_offset_s).collect(),
             imus: config.imus.into_iter().map(|imu| imu.frame_id).collect(),
             lidars: config
                 .lidars
@@ -297,7 +300,7 @@ impl DimSlamCore {
         }
         self.odometry.push_imu(
             imu,
-            header_seconds(sample.timestamp_ns),
+            header_seconds(sample.timestamp_ns) + self.imu_time_offsets[imu],
             sample.angular_velocity,
             sample.linear_acceleration / STANDARD_GRAVITY,
         );
@@ -380,6 +383,7 @@ impl DimSlamCore {
         tracing::info!(
             scans = self.odometry.scans_pushed(),
             late_points = self.odometry.late_points(),
+            map_points = self.odometry.map_points(),
             "odometry counters"
         );
         for (index, source) in self.sources.iter().enumerate() {

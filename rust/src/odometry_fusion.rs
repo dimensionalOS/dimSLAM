@@ -73,6 +73,9 @@ pub struct ImuConfig {
     /// Random-walk variances of the gyro and accelerometer biases, per s^2.
     pub gyro_bias_random_walk: f64,
     pub accel_bias_random_walk: f64,
+    /// s added to this IMU's stamps to put them on the clock the lidars' points are on (e.g. an
+    /// IMU stamped by its host after a serial read and a DDS hop, against PTP-stamped lidars).
+    pub time_offset_s: f64,
 }
 
 impl Default for ImuConfig {
@@ -85,6 +88,7 @@ impl Default for ImuConfig {
             accel_clip_g: 3.0,
             gyro_bias_random_walk: 0.0001,
             accel_bias_random_walk: 0.0001,
+            time_offset_s: 0.0,
         }
     }
 }
