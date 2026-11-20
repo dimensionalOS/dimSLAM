@@ -7,6 +7,7 @@
 // searched in its own cube and the six that share a face with it.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use nalgebra::{Matrix3, Vector3};
 
@@ -26,6 +27,32 @@ const FACE_NEIGHBORS: [Cube; 7] = [
 ];
 
 const NONE: usize = usize::MAX;
+
+/// A multiply-rotate hash (FxHash's) for cube keys: a lookup per searched cube made SipHash a visible cost.
+#[derive(Default)]
+struct CubeHasher(u64);
+
+impl Hasher for CubeHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+
+    fn write_i32(&mut self, value: i32) {
+        self.write_u64(u64::from(value as u32));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type Cubes = HashMap<Cube, usize, BuildHasherDefault<CubeHasher>>;
 
 struct Cell {
     cube: Cube,
@@ -50,7 +77,7 @@ pub struct PointMap {
     /// Point-LIO's neighbor order (partial sorts over every candidate) instead of a pruned exact k-nearest search.
     point_lio_order: bool,
     capacity: usize,
-    cubes: HashMap<Cube, usize>,
+    cubes: Cubes,
     cells: Vec<Cell>,
     free: Vec<usize>,
     newest: usize,
@@ -67,7 +94,7 @@ impl PointMap {
             point_lio_order,
             inverse_size: (1.0f64 / cube_size as f64) as f32,
             capacity,
-            cubes: HashMap::new(),
+            cubes: Cubes::default(),
             cells: Vec::new(),
             free: Vec::new(),
             newest: NONE,
@@ -192,13 +219,16 @@ impl PointMap {
     /// m^2: from `p` to the nearest face of `cube`, shrunk by a float's rounding so no point
     /// inside it computes nearer.
     fn cube_distance_sq(&self, cube: &Cube, p: &SurfacePoint) -> f64 {
-        let mut sum = 0.0f64;
-        for axis in 0..3 {
-            let low = cube[axis] as f64 * self.size as f64;
-            let v = p.position[axis] as f64;
-            let gap = (low - v).max(v - (low + self.size as f64)).max(0.0);
-            sum += gap * gap;
-        }
+        let size = self.size as f64;
+        let sum: f64 = cube
+            .iter()
+            .zip(p.position)
+            .map(|(&index, v)| {
+                let (low, v) = (index as f64 * size, v as f64);
+                let gap = (low - v).max(v - (low + size)).max(0.0);
+                gap * gap
+            })
+            .sum();
         sum * (1.0 - 1e-5)
     }
 

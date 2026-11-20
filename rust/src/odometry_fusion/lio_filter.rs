@@ -836,6 +836,21 @@ impl LioFilter {
         if used == 0 {
             return false;
         }
+        if used == 1 {
+            // One row, the usual run: the same update with a scalar innovation and no heap matrices.
+            let Some((j, plane)) = planes.iter().enumerate().find_map(|(j, p)| p.map(|p| (j, p))) else {
+                return false;
+            };
+            let (row, residual) = self.point_row(group, m, j, &plane);
+            let p_ht: SVector<f64, STATE_DIM> = self.p.fixed_view::<STATE_DIM, 12>(0, 0) * row;
+            let innovation = row.dot(&p_ht.fixed_rows::<12>(0)) + m.point_variance;
+            let gain = p_ht * (1.0 / innovation);
+            self.x.advance(&(gain * residual), 1.0);
+            let gain_h: SMatrix<f64, STATE_DIM, 12> = gain * row.transpose();
+            self.p -= gain_h * self.p.fixed_view::<12, STATE_DIM>(0, 0);
+            self.reproject(group, m);
+            return true;
+        }
         // Rows over position and rotation (12 columns; mount columns stay zero).
         let mut h = DMatrix::<f64>::zeros(used, 12);
         let mut residual = DVector::<f64>::zeros(used);
@@ -844,25 +859,9 @@ impl LioFilter {
             let Some(plane) = plane else {
                 continue;
             };
-            let normal = Vector3::new(plane[0] as f64, plane[1] as f64, plane[2] as f64);
-            let body = &group.body[j];
-            let lever = Vector3::new(
-                body.position[0] as f64,
-                body.position[1] as f64,
-                body.position[2] as f64,
-            );
-            let in_body = m.mount_rotation * lever + m.mount_translation;
-            let local_normal = self.x.rotation.transpose() * normal;
-            let turn = hat(&in_body) * local_normal;
-            let mut entries = SVector::<f64, 12>::zeros();
-            entries.fixed_rows_mut::<3>(0).copy_from(&normal);
-            entries.fixed_rows_mut::<3>(3).copy_from(&turn);
+            let (entries, distance) = self.point_row(group, m, j, plane);
             h.row_mut(row).copy_from(&entries.transpose());
-            let w = group.world[j].position;
-            residual[row] = -normal[0] * w[0] as f64
-                - normal[1] * w[1] as f64
-                - normal[2] * w[2] as f64
-                - plane[3] as f64;
+            residual[row] = distance;
             row += 1;
         }
         let noise = m.point_variance;
@@ -895,7 +894,42 @@ impl LioFilter {
         // Fixed-size from here: a dynamic product goes through a packing gemm that costs more than the math.
         let gain_h: SMatrix<f64, STATE_DIM, 12> = (&gain * &h).fixed_columns::<12>(0).into_owned();
         self.p -= gain_h * self.p.fixed_view::<12, STATE_DIM>(0, 0);
-        // The group's world positions from the updated pose.
+        self.reproject(group, m);
+        true
+    }
+
+    /// Point `j`'s row over position and rotation (mount columns stay zero) and its signed
+    /// distance to `plane`, the residual.
+    fn point_row(
+        &self,
+        group: &PointGroup,
+        m: &LidarMeasurement,
+        j: usize,
+        plane: &[f32; 4],
+    ) -> (SVector<f64, 12>, f64) {
+        let normal = Vector3::new(plane[0] as f64, plane[1] as f64, plane[2] as f64);
+        let body = &group.body[j];
+        let lever = Vector3::new(
+            body.position[0] as f64,
+            body.position[1] as f64,
+            body.position[2] as f64,
+        );
+        let in_body = m.mount_rotation * lever + m.mount_translation;
+        let local_normal = self.x.rotation.transpose() * normal;
+        let turn = hat(&in_body) * local_normal;
+        let mut entries = SVector::<f64, 12>::zeros();
+        entries.fixed_rows_mut::<3>(0).copy_from(&normal);
+        entries.fixed_rows_mut::<3>(3).copy_from(&turn);
+        let w = group.world[j].position;
+        let distance = -normal[0] * w[0] as f64
+            - normal[1] * w[1] as f64
+            - normal[2] * w[2] as f64
+            - plane[3] as f64;
+        (entries, distance)
+    }
+
+    /// The group's world positions from the updated pose.
+    fn reproject(&self, group: &mut PointGroup, m: &LidarMeasurement) {
         for j in 0..group.body.len() {
             let world = to_world(
                 &group.body[j],
@@ -907,7 +941,6 @@ impl LioFilter {
             group.world[j].position = world.position;
             group.world[j].reflectivity = world.reflectivity;
         }
-        true
     }
 }
 
