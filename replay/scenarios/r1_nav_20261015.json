@@ -1,0 +1,117 @@
+{
+ "name": "r1_nav_20261015",
+ "description": "R1 driving 29 m with two rests, Point-LIO + wheels, no IMU or cameras (r1pro_fused_odometry)",
+ "recording": "r1/cloud/r1_nav_20261015.db",
+ "mode": "slam",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom"
+ ],
+ "sources": [
+  {
+   "stream": "pointlio_odometry",
+   "frame_id": "pointlio_odom",
+   "carry_to": "base_link"
+  },
+  {
+   "stream": "odometry",
+   "frame_id": "wheel_odom"
+  }
+ ],
+ "reference": {
+  "stream": "pointlio_odometry",
+  "carry_to": "base_link"
+ },
+ "rest": {
+  "stream": "odometry",
+  "speed": 0.001,
+  "angular_speed": 0.001,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ },
+ "config": {
+  "odom_frame_id": "odom",
+  "output_frame_id": "base_link",
+  "imus": [],
+  "odom_sources": [
+   {
+    "parent_frame_id": "pointlio_odom",
+    "child_frame_id": "base_link",
+    "kind": "pose",
+    "pose_variances": [
+     0.0002,
+     0.0002,
+     0.0002,
+     3.3e-05,
+     3.3e-05,
+     3.3e-05
+    ],
+    "twist_variances": [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   {
+    "parent_frame_id": "wheel_odom",
+    "child_frame_id": "base_link",
+    "kind": "twist",
+    "pose_variances": [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "twist_variances": [
+     0.002,
+     0.002,
+     0.002,
+     0.0024,
+     0.0024,
+     0.0024
+    ],
+    "still_variance": 1e-06,
+    "still_speed": 0.001,
+    "still_angular_speed": 0.001
+   }
+  ],
+  "process_noise": {
+   "velocity": 2.0,
+   "angular_velocity": 30.0,
+   "specific_force": 500.0
+  }
+ },
+ "variants": {
+  "fixes": {}
+ },
+ "expect": {
+  "fixes": {
+   "error_mm_mean": {
+    "max": 9.5
+   },
+   "error_mm_p95": {
+    "max": 24.0
+   },
+   "moving_roughness_rms_mm": {
+    "max": 36.5
+   },
+   "rest_p2p_mm_mean": {
+    "max": 6.5
+   }
+  }
+ },
+ "baseline": {
+  "note": "2026-10-31 Mac, one filter: error is distance from the recorded Point-LIO this run fuses (the old ESKF tracked it closer: 5.83 mean; on the reference-instant roughness it scored 30.06)",
+  "fixes": {
+   "error_mm_mean": 9.0,
+   "error_mm_p95": 22.94,
+   "moving_roughness_rms_mm": 34.98,
+   "rest_p2p_mm_mean": 5.76
+  }
+ }
+}

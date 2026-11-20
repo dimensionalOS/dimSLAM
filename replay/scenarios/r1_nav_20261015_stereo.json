@@ -1,0 +1,184 @@
+{
+ "name": "r1_nav_20261015_stereo",
+ "description": "R1 driving 29 m with two rests: head stereo (cuVSLAM on the raw rational-polynomial images, recording tf, uncalibrated right-eye aim) + wheels, with and without Point-LIO as a third source; scored against Point-LIO all_three keeps the camera loose (its tf is uncalibrated, and Point-LIO's pose is there); stereo_wheels takes the tracker's own covariance.",
+ "recording": "r1/cloud/r1_nav_20261015.db",
+ "mode": "slam",
+ "tf_stream": "tf",
+ "tf_ignored_parents": [
+  "odom"
+ ],
+ "sources": [
+  {
+   "stream": "pointlio_odometry",
+   "frame_id": "pointlio_odom",
+   "carry_to": "base_link"
+  },
+  {
+   "stream": "odometry",
+   "frame_id": "wheel_odom"
+  }
+ ],
+ "reference": {
+  "stream": "pointlio_odometry",
+  "carry_to": "base_link"
+ },
+ "rest": {
+  "stream": "odometry",
+  "speed": 0.001,
+  "angular_speed": 0.001,
+  "min_seconds": 1.0,
+  "trim_seconds": 0.3
+ },
+ "config": {
+  "odom_frame_id": "odom",
+  "output_frame_id": "base_link",
+  "imus": [],
+  "odom_sources": [
+   {
+    "parent_frame_id": "pointlio_odom",
+    "child_frame_id": "base_link",
+    "kind": "pose",
+    "pose_variances": [
+     0.0002,
+     0.0002,
+     0.0002,
+     3.3e-05,
+     3.3e-05,
+     3.3e-05
+    ],
+    "twist_variances": [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   {
+    "parent_frame_id": "wheel_odom",
+    "child_frame_id": "base_link",
+    "kind": "twist",
+    "pose_variances": [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "twist_variances": [
+     0.002,
+     0.002,
+     0.002,
+     0.0024,
+     0.0024,
+     0.0024
+    ],
+    "still_variance": 1e-06,
+    "still_speed": 0.001,
+    "still_angular_speed": 0.001
+   }
+  ],
+  "camera_mode": "stereo",
+  "cameras": [
+   {
+    "frame_id": "camera_head_left_link",
+    "rectified": false
+   },
+   {
+    "frame_id": "camera_head_right_link",
+    "rectified": false
+   }
+  ],
+  "use_gpu": true,
+  "covariance_gate_translation_std": 0.0,
+  "speed_gate_max_linear": 5.0,
+  "speed_gate_max_angular": 12.0,
+  "process_noise": {
+   "velocity": 2.0,
+   "angular_velocity": 30.0,
+   "specific_force": 500.0
+  }
+ },
+ "variants": {
+  "all_three": {
+   "/visual_odom_pose_variances": [
+    0.01,
+    0.01,
+    0.0,
+    0.05,
+    0.05,
+    0.05
+   ]
+  },
+  "stereo_wheels": {
+   "/odom_sources": [
+    {
+     "parent_frame_id": "wheel_odom",
+     "child_frame_id": "base_link",
+     "kind": "twist",
+     "pose_variances": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     "twist_variances": [
+      0.002,
+      0.002,
+      0.002,
+      0.0024,
+      0.0024,
+      0.0024
+     ],
+     "still_variance": 1e-06,
+     "still_speed": 0.001,
+     "still_angular_speed": 0.001
+    }
+   ]
+  }
+ },
+ "expect": {
+  "all_three": {
+   "error_mm_mean": {
+    "max": 9.8
+   },
+   "error_mm_p95": {
+    "max": 24.0
+   },
+   "error_mm_max": {
+    "max": 85
+   }
+  },
+  "stereo_wheels": {
+   "error_mm_max": {
+    "max": 800
+   },
+   "error_mm_final": {
+    "max": 600
+   }
+  }
+ },
+ "baseline": {
+  "note": "2026-10-31 Mac, one filter",
+  "all_three": {
+   "error_mm_mean": 9.34,
+   "error_mm_max": 80.12
+  },
+  "stereo_wheels": {
+   "error_mm_max": 523.22,
+   "error_mm_final": 477.33
+  }
+ },
+ "images": [
+  "head_left_color",
+  "head_right_color"
+ ],
+ "camera_infos": [
+  "head_left_info",
+  "head_right_info"
+ ]
+}
