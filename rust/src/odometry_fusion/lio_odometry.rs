@@ -224,7 +224,7 @@ impl LioOdometry {
             config.process[4] = first.walks[1];
         }
         let [v, w, a, bg, ba] = config.process;
-        let map = PointMap::new(config.map.cube, config.map.capacity);
+        let map = PointMap::new(config.map.cube, config.map.capacity, config.map.point_lio_neighbor_order);
         let initial = initial_covariance(&config.initial);
         let mut filter = LioFilter {
             x: LioState::default(),

@@ -229,6 +229,8 @@ pub struct MapConfig {
     pub seed_points: usize,
     /// A scan grows the map only when it kept more than this many points.
     pub grow_min_points: usize,
+    /// Neighbors in Point-LIO's order, bit for bit; else a pruned exact five-nearest search, the same neighbors nearest first at a fraction of the cost.
+    pub point_lio_neighbor_order: bool,
 }
 
 impl Default for MapConfig {
@@ -239,6 +241,7 @@ impl Default for MapConfig {
             capacity: 1_000_000,
             seed_points: 10,
             grow_min_points: 4,
+            point_lio_neighbor_order: false,
         }
     }
 }

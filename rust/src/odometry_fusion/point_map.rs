@@ -45,7 +45,10 @@ struct Candidate {
 }
 
 pub struct PointMap {
+    size: f32,
     inverse_size: f32,
+    /// Point-LIO's neighbor order (partial sorts over every candidate) instead of a pruned exact k-nearest search.
+    point_lio_order: bool,
     capacity: usize,
     cubes: HashMap<Cube, usize>,
     cells: Vec<Cell>,
@@ -57,8 +60,11 @@ pub struct PointMap {
 
 impl PointMap {
     /// Cubes of side `cube_size` m; past `capacity` cubes the least recently touched goes.
-    pub fn new(cube_size: f32, capacity: usize) -> Self {
+    /// `point_lio_order` leaves neighbors in Point-LIO's order, bit for bit, at several times the cost.
+    pub fn new(cube_size: f32, capacity: usize, point_lio_order: bool) -> Self {
         Self {
+            size: cube_size,
+            point_lio_order,
             inverse_size: (1.0f64 / cube_size as f64) as f32,
             capacity,
             cubes: HashMap::new(),
@@ -130,8 +136,9 @@ impl PointMap {
         self.insert(&added);
     }
 
-    /// Up to `count` map points within `range` of `p`, nearest first, then the rest in the
-    /// order the partial sorts leave them. False, with `out` untouched, when there are none.
+    /// Up to `count` map points within `range` of `p`, nearest first (then, with
+    /// `point_lio_order`, the rest in the order Point-LIO's partial sorts leave them, else all
+    /// nearest first). False, with `out` untouched, when there are none.
     pub fn nearest(
         &mut self,
         p: &SurfacePoint,
@@ -139,6 +146,9 @@ impl PointMap {
         range: f64,
         out: &mut Vec<SurfacePoint>,
     ) -> bool {
+        if count == 0 {
+            return false;
+        }
         let center = self.cube_of(p);
         let mut candidates = std::mem::take(&mut self.candidates);
         candidates.clear();
@@ -148,17 +158,26 @@ impl PointMap {
                 center[1] + offset[1],
                 center[2] + offset[2],
             ];
-            if let Some(&cell) = self.cubes.get(&cube) {
+            let Some(&cell) = self.cubes.get(&cube) else {
+                continue;
+            };
+            if self.point_lio_order {
                 self.gather(cell, &mut candidates, p, count, range);
+            } else if candidates.len() < count
+                || self.cube_distance_sq(&cube, p) <= candidates[count - 1].distance_sq
+            {
+                self.keep_nearest(cell, &mut candidates, p, count, range);
             }
         }
         let found = !candidates.is_empty();
         if found {
-            if candidates.len() > count {
-                candidates.select_nth_unstable_by(count - 1, nearer);
-                candidates.truncate(count);
+            if self.point_lio_order {
+                if candidates.len() > count {
+                    candidates.select_nth_unstable_by(count - 1, nearer);
+                    candidates.truncate(count);
+                }
+                candidates.select_nth_unstable_by(0, nearer);
             }
-            candidates.select_nth_unstable_by(0, nearer);
             out.clear();
             out.extend(
                 candidates
@@ -168,6 +187,52 @@ impl PointMap {
         }
         self.candidates = candidates;
         found
+    }
+
+    /// m^2: from `p` to the nearest face of `cube`, shrunk by a float's rounding so no point
+    /// inside it computes nearer.
+    fn cube_distance_sq(&self, cube: &Cube, p: &SurfacePoint) -> f64 {
+        let mut sum = 0.0f64;
+        for axis in 0..3 {
+            let low = cube[axis] as f64 * self.size as f64;
+            let v = p.position[axis] as f64;
+            let gap = (low - v).max(v - (low + self.size as f64)).max(0.0);
+            sum += gap * gap;
+        }
+        sum * (1.0 - 1e-5)
+    }
+
+    /// Merges the cell's points within `range` into `best`, kept sorted nearest first and at
+    /// most `count` long (a tie keeps the one found last).
+    fn keep_nearest(
+        &self,
+        cell: usize,
+        best: &mut Vec<Candidate>,
+        p: &SurfacePoint,
+        count: usize,
+        range: f64,
+    ) {
+        let range_sq = range * range;
+        for (index, q) in self.cells[cell].points.iter().enumerate() {
+            let distance_sq = squared_distance(q, p);
+            if distance_sq >= range_sq
+                || (best.len() == count && distance_sq > best[count - 1].distance_sq)
+            {
+                continue;
+            }
+            let at = best.partition_point(|c| c.distance_sq < distance_sq);
+            if best.len() == count {
+                best.pop();
+            }
+            best.insert(
+                at,
+                Candidate {
+                    distance_sq,
+                    cell: cell as u32,
+                    index: index as u32,
+                },
+            );
+        }
     }
 
     /// The cell's points within `range`, at most its `count` nearest.
@@ -286,7 +351,7 @@ mod tests {
 
     #[test]
     fn nearest_searches_the_cube_and_its_faces_within_range() {
-        let mut map = PointMap::new(1.0, 1000);
+        let mut map = PointMap::new(1.0, 1000, false);
         map.insert(&[
             at(0.5, 0.5, 0.5),
             at(0.9, 0.5, 0.5),
@@ -309,7 +374,7 @@ mod tests {
 
     #[test]
     fn grow_skips_points_whose_cube_a_neighbor_already_fills() {
-        let mut map = PointMap::new(2.0, 1000);
+        let mut map = PointMap::new(2.0, 1000, false);
         let points = [at(0.1, 0.1, 0.1), at(0.6, 0.1, 0.1), at(3.1, 0.1, 0.1)];
         let neighbors = vec![vec![at(0.2, 0.3, 0.4)], vec![at(0.2, 0.3, 0.4)], Vec::new()];
         map.grow(&points, &neighbors, 0.5);
@@ -321,7 +386,7 @@ mod tests {
 
     #[test]
     fn past_capacity_the_least_recently_touched_cube_goes() {
-        let mut map = PointMap::new(1.0, 3);
+        let mut map = PointMap::new(1.0, 3, false);
         map.insert(&[at(0.5, 0.5, 0.5), at(1.5, 0.5, 0.5)]);
         map.insert(&[at(0.6, 0.5, 0.5)]); // touches the first cube again
         map.insert(&[at(5.5, 0.5, 0.5)]); // a third cube: the second goes
@@ -329,5 +394,29 @@ mod tests {
         let mut out = Vec::new();
         assert!(!map.nearest(&at(1.5, 0.5, 0.5), 5, 0.3, &mut out));
         assert!(map.nearest(&at(0.5, 0.5, 0.5), 5, 0.3, &mut out));
+    }
+
+    #[test]
+    fn the_pruned_search_finds_point_lios_neighbors_nearest_first() {
+        // A deterministic scatter (no exact ties) over several cubes.
+        let mut seed = 12345u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 40) as f32 / (1u64 << 24) as f32 * 6.0 - 3.0
+        };
+        let points: Vec<SurfacePoint> = (0..3000).map(|_| at(next(), next(), next())).collect();
+        let (mut fast, mut exact) = (PointMap::new(2.0, 1000, false), PointMap::new(2.0, 1000, true));
+        fast.insert(&points);
+        exact.insert(&points);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for _ in 0..500 {
+            let p = at(next(), next(), next());
+            assert_eq!(fast.nearest(&p, 5, 5.0, &mut a), exact.nearest(&p, 5, 5.0, &mut b));
+            let d = |v: &Vec<SurfacePoint>| v.iter().map(|q| squared_distance(q, &p)).collect::<Vec<_>>();
+            let (da, mut db) = (d(&a), d(&b));
+            assert!(da.windows(2).all(|w| w[0] <= w[1]), "nearest first");
+            db.sort_by(f64::total_cmp);
+            assert_eq!(da, db);
+        }
     }
 }

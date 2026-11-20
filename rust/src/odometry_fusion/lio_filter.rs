@@ -892,7 +892,9 @@ impl LioFilter {
         };
         let step: OMatrix<f64, Const<STATE_DIM>, nalgebra::U1> = &gain * &residual;
         self.x.advance(&StateVector::from(step), 1.0);
-        self.p -= gain * &h * self.p.fixed_view::<12, STATE_DIM>(0, 0);
+        // Fixed-size from here: a dynamic product goes through a packing gemm that costs more than the math.
+        let gain_h: SMatrix<f64, STATE_DIM, 12> = (&gain * &h).fixed_columns::<12>(0).into_owned();
+        self.p -= gain_h * self.p.fixed_view::<12, STATE_DIM>(0, 0);
         // The group's world positions from the updated pose.
         for j in 0..group.body.len() {
             let world = to_world(
