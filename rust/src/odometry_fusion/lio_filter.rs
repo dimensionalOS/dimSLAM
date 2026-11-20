@@ -9,7 +9,8 @@
 
 use nalgebra::{Const, DMatrix, DVector, Dyn, Matrix3, OMatrix, SMatrix, SVector, Vector3};
 
-use super::plane_fit::{fit_plane, PLANE_POINTS};
+use super::plane_fit::fit_plane;
+use super::InitialStds;
 use super::point_map::{to_world, PointMap};
 use super::scan_points::SurfacePoint;
 
@@ -239,14 +240,24 @@ pub fn process_noise(
     q
 }
 
-/// The covariance the filter starts from.
-pub fn initial_covariance() -> StateMatrix {
-    let mut p = StateMatrix::identity() * 0.01;
-    for i in 0..3 {
-        p[(21 + i, 21 + i)] = 0.0001;
-    }
-    for i in 0..6 {
-        p[(24 + i, 24 + i)] = 0.001;
+/// The covariance the filter starts from: each state block's variance its 1-sigma squared.
+pub fn initial_covariance(stds: &InitialStds) -> StateMatrix {
+    let mut p = StateMatrix::zeros();
+    for (at, std) in [
+        (0, stds.position),
+        (3, stds.rotation),
+        (6, stds.mount_rotation),
+        (9, stds.mount_translation),
+        (12, stds.velocity),
+        (15, stds.angular_velocity),
+        (18, stds.specific_force),
+        (21, stds.gravity),
+        (24, stds.bias),
+        (27, stds.bias),
+    ] {
+        for i in 0..3 {
+            p[(at + i, at + i)] = std * std;
+        }
     }
     p
 }
@@ -263,6 +274,9 @@ pub struct LioFilter {
     pub p_extra_extra: DMatrix<f64>,
     /// Random-walk variances of the extra states, scaled by dt^2 as Point-LIO scales its own.
     pub q_extra: DVector<f64>,
+    /// A gated measurement's bound: <0 the 99% chi-squared quantile of its rows, 0 no gate,
+    /// >0 this many times its row count (dimSLAM main's `outlier_rejection_allowed_variance`).
+    pub outlier_gate: f64,
 }
 
 impl Default for LioFilter {
@@ -274,6 +288,7 @@ impl Default for LioFilter {
             p_extra: OMatrix::<f64, Const<STATE_DIM>, Dyn>::zeros(0),
             p_extra_extra: DMatrix::zeros(0, 0),
             q_extra: DVector::zeros(0),
+            outlier_gate: -1.0,
         }
     }
 }
@@ -363,9 +378,10 @@ pub struct ImuMeasurement {
     /// Variances of one gyro (rad^2/s^2) and one accelerometer (m^2/s^4) reading.
     pub gyro_variance: f64,
     pub accel_variance: f64,
-    /// Readings within 1% of these are clipped and say nothing (rad/s, and the
+    /// Readings within `clip_fraction` of these are clipped and say nothing (rad/s, and the
     /// accelerometer's own unit); `None` trusts every reading.
     pub clip: Option<(f64, f64)>,
+    pub clip_fraction: f64,
     /// m/s^2 per accelerometer unit.
     pub accel_scale: f64,
 }
@@ -394,13 +410,13 @@ impl LioFilter {
         let mut clipped = [false; 6];
         if let Some((gyro_clip, accel_clip)) = m.clip {
             for axis in 0..3 {
-                if gyro[axis].abs() >= 0.99 * gyro_clip {
+                if gyro[axis].abs() >= m.clip_fraction * gyro_clip {
                     clipped[axis] = true;
                     residual[axis] = 0.0;
                 }
             }
             for axis in 0..3 {
-                if accel[axis].abs() >= 0.99 * accel_clip {
+                if accel[axis].abs() >= m.clip_fraction * accel_clip {
                     clipped[3 + axis] = true;
                     residual[3 + axis] = 0.0;
                 }
@@ -424,7 +440,11 @@ impl LioFilter {
                 m.accel_variance
             };
         }
-        let gain = p_ht * innovation.try_inverse().expect("IMU innovation singular");
+        // A singular innovation (a reading with no information) leaves the state as it was.
+        let Some(inverse) = innovation.try_inverse() else {
+            return;
+        };
+        let gain = p_ht * inverse;
         let step = gain * residual;
         self.p -= gain * h_p;
         self.x.advance(&step, 1.0);
@@ -537,7 +557,7 @@ impl LioFilter {
                     (axis, gyro[axis], gyro_clip),
                     (3 + axis, accel[axis], accel_clip),
                 ] {
-                    if reading.abs() >= 0.99 * clip {
+                    if reading.abs() >= m.clip_fraction * clip {
                         h.row_mut(row).fill(0.0);
                         residual[row] = 0.0;
                     }
@@ -591,8 +611,14 @@ impl LioFilter {
         let innovation = Innovation {
             squared: residual.dot(&(&unscaled * residual)),
             dof: rows,
-            accepted: !gate
-                || residual.dot(&(&inverse * residual)) <= CHI_SQUARED_99[rows.min(6) - 1],
+            accepted: !gate || self.outlier_gate == 0.0 || {
+                let bound = if self.outlier_gate < 0.0 {
+                    CHI_SQUARED_99[rows.clamp(1, 6) - 1]
+                } else {
+                    self.outlier_gate * rows as f64
+                };
+                residual.dot(&(&inverse * residual)) <= bound
+            },
         };
         if !innovation.accepted {
             return Some(innovation);
@@ -746,6 +772,8 @@ pub struct LidarMeasurement {
     pub point_variance: f64,
     /// m: map points farther than this are not neighbors.
     pub neighbor_range: f64,
+    /// Map neighbors a plane is fitted through.
+    pub plane_points: usize,
     pub mount_rotation: Matrix3<f64>,
     pub mount_translation: Vector3<f64>,
 }
@@ -788,10 +816,10 @@ impl LioFilter {
             );
             let range = norm(&lever);
             let near = &mut group.neighbors[j];
-            map.nearest(&group.world[j], PLANE_POINTS, m.neighbor_range, near);
+            map.nearest(&group.world[j], m.plane_points, m.neighbor_range, near);
             group.used[j] = false;
             planes.push(None);
-            if near.len() < PLANE_POINTS {
+            if near.len() < m.plane_points {
                 continue;
             }
             if let Some(plane) = fit_plane(near, m.plane_tolerance) {
@@ -844,14 +872,22 @@ impl LioFilter {
             for d in 0..used {
                 innovation[(d, d)] += noise;
             }
-            p_ht * innovation.try_inverse().expect("lidar innovation singular")
+            // A singular system (degenerate planes) leaves the state as it was.
+            let Some(inverse) = innovation.try_inverse() else {
+                return false;
+            };
+            p_ht * inverse
         } else {
             // Many points: through the information form, as Point-LIO weighs it.
             let information = noise * h.transpose() * &h;
-            let mut inverse = self.p.try_inverse().expect("covariance singular");
+            let Some(mut inverse) = self.p.try_inverse() else {
+                return false;
+            };
             let mut pose_block = inverse.fixed_view_mut::<12, 12>(0, 0);
             pose_block += information.fixed_view::<12, 12>(0, 0);
-            inverse = inverse.try_inverse().expect("information singular");
+            let Some(inverse) = inverse.try_inverse() else {
+                return false;
+            };
             inverse.fixed_view::<STATE_DIM, 12>(0, 0) * h.transpose() * noise
         };
         let step: OMatrix<f64, Const<STATE_DIM>, nalgebra::U1> = &gain * &residual;

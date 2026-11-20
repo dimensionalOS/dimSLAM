@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 use nalgebra::{Isometry3, Matrix3, Quaternion, Translation3, UnitQuaternion, Vector3};
 
 use crate::cuvslam_odometry::{CameraConfig, CuvslamCore, CuvslamOdometryConfig};
-use crate::odometry_fusion::lio_odometry::{point_lio_imu, LioConfig, LioOdometry, LioPose};
+use crate::odometry_fusion::lio_odometry::{
+    point_lio_imu, DeskewedScan, ImuSetup, LioConfig, LioOdometry, LioPose,
+};
 use crate::odometry_fusion::{
-    header_seconds, ImuConfig, LidarConfig, ProcessNoise, SourceConfig, SourceKind,
-    STANDARD_GRAVITY,
+    header_seconds, DeskewConfig, DeskewFrame, ImuConfig, InitialStds, LevelConfig,
+    LidarConfig, MapConfig, ProcessNoise, SourceConfig, SourceKind,
 };
 use crate::types::{
     CameraModel, ImageFrame, ImuSample, LidarScan, OdometryEstimate, PointCloud, TfLookup, Twist,
@@ -44,7 +46,7 @@ pub struct DimSlamCoreConfig {
     /// A teleport the covariance gate believes: m/s and rad/s against the previous raw pose.
     pub speed_gate_max_linear: f64,
     pub speed_gate_max_angular: f64,
-    /// Stamp spread one frame set may span, milliseconds; 0 keeps cuVSLAM's 1 ms contract.
+    /// Stamp spread one frame set may span, milliseconds; the default is cuVSLAM's 1 ms contract.
     pub max_skew_ms: f64,
     /// Noise of the tracker's frame-to-frame motion, [x y z roll pitch yaw], fused as a
     /// `pose_delta` source: <0 the tracker's own covariance (the default: a lost or
@@ -65,11 +67,29 @@ pub struct DimSlamCoreConfig {
     /// External sources, each identified by the transform its estimates carry.
     pub odom_sources: Vec<SourceConfig>,
     pub process_noise: ProcessNoise,
-    /// How each scan is thinned before it is fused: every `keep_every`th usable point, then one
-    /// point per `scan_cube` m cube. The defaults are Point-LIO's; the filter's cost is linear in
-    /// what is left.
-    pub keep_every: u32,
-    pub scan_cube: f32,
+    /// m/s^2 per g: IMU samples arrive in m/s^2 and are divided by this.
+    pub standard_gravity: f64,
+    /// m/s^2: the gravity of the filter's world, set when the first IMU levels it, and what one
+    /// g of an accelerometer is taken to read (Point-LIO's G_m_s2).
+    pub initial_gravity_estimate: f64,
+    pub initial_stds: InitialStds,
+    pub map: MapConfig,
+    /// Gate on source measurements: <0 the 99% chi-squared bound of their rows (Point-LIO's
+    /// own, the default), 0 no gate, >0 this many times their row count in squared
+    /// Mahalanobis distance.
+    pub outlier_rejection_allowed_variance: f64,
+    /// m: a pose farther than this from the origin is not published (the filter has run
+    /// away); 0 disables.
+    pub max_position_m: f64,
+    /// Virtual zero-twist [vx vy vz wx wy wz] fused after each source update (needs an IMU):
+    /// >0 pins that axis to zero with this variance (e.g. non-holonomic vy, vz), 0 frees it.
+    pub per_dimension_error_variance: [f64; 6],
+    /// Publishes every this-many-th pose the filter produces (one per scan with a lidar).
+    pub publish_every: u32,
+    /// s between repeats of one throttled warning.
+    pub warn_throttle_s: f64,
+    /// Each scan deskewed by the filter's own trajectory, read with `take_deskewed`. Off by default.
+    pub deskew: DeskewConfig,
 }
 
 /// Defers to the tracker so a field's default cannot drift from the core that reads it.
@@ -93,10 +113,30 @@ impl Default for DimSlamCoreConfig {
             lidars: Vec::new(),
             odom_sources: Vec::new(),
             process_noise: ProcessNoise::default(),
-            keep_every: LioConfig::default().keep_every,
-            scan_cube: LioConfig::default().scan_cube,
+            standard_gravity: 9.80665,
+            initial_gravity_estimate: LevelConfig::default().gravity,
+            initial_stds: InitialStds::default(),
+            map: MapConfig::default(),
+            outlier_rejection_allowed_variance: -1.0,
+            max_position_m: 0.0,
+            per_dimension_error_variance: [0.0; 6],
+            publish_every: 1,
+            warn_throttle_s: 10.0,
+            deskew: DeskewConfig::default(),
         }
     }
+}
+
+/// One input scan deskewed: stamped at its end, in the output frame at that instant or the
+/// odom frame (`deskew.frame`), with the lidar it came from.
+#[derive(Clone, Debug, Default)]
+pub struct DeskewedCloud {
+    pub cloud: PointCloud,
+    /// 0..255 per point, as the scan's intensities.
+    pub intensities: Vec<f32>,
+    /// Index of its lidar in `lidars`, and that lidar's frame.
+    pub lidar: usize,
+    pub lidar_frame_id: String,
 }
 
 /// A source's running state: its previous message (for its steps) and, for a `pose` source,
@@ -121,6 +161,12 @@ pub struct DimSlamCore {
     /// s, per IMU: added to its stamps.
     imu_time_offsets: Vec<f64>,
     lidars: Vec<String>,
+    standard_gravity: f64,
+    max_position_m: f64,
+    publish_every: u32,
+    /// Poses the filter has produced, for `publish_every`.
+    produced: u64,
+    deskew_frame_id: String,
     /// The configured sources, then the tracker.
     sources: Vec<SourceState>,
     /// rad^2: one frame's rotation variance from the camera's focal length, once known.
@@ -148,13 +194,22 @@ impl DimSlamCore {
             enable_imu: false,
             max_skew_ms: config.max_skew_ms,
         })?;
+        crate::log::set_throttle_interval(config.warn_throttle_s);
         let mut lio = LioConfig::default();
         let noise = config.process_noise;
         lio.process[0] = noise.velocity;
         lio.process[1] = noise.angular_velocity;
         lio.process[2] = noise.specific_force;
-        lio.keep_every = config.keep_every;
-        lio.scan_cube = config.scan_cube;
+        lio.initial = config.initial_stds;
+        lio.map = config.map;
+        lio.outlier_gate = config.outlier_rejection_allowed_variance;
+        lio.zero_twist = config.per_dimension_error_variance;
+        lio.deskew = config.deskew.clone();
+        lio.level = LevelConfig {
+            gravity: config.initial_gravity_estimate,
+            samples: config.imus.first().map_or(LevelConfig::default().samples, |imu| imu.init_samples),
+            gyro_limit: config.imus.first().map_or(0.0, |imu| imu.init_gyro_limit),
+        };
         let imus = config
             .imus
             .iter()
@@ -162,6 +217,8 @@ impl DimSlamCore {
                 let mut measurement = point_lio_imu();
                 measurement.gyro_variance = imu.gyro_variance;
                 measurement.accel_variance = imu.accel_variance;
+                measurement.clip_fraction = imu.clip_fraction;
+                measurement.accel_scale = config.initial_gravity_estimate / 1.0;
                 measurement.clip = (imu.gyro_clip > 0.0 || imu.accel_clip_g > 0.0).then_some((
                     if imu.gyro_clip > 0.0 {
                         imu.gyro_clip
@@ -174,10 +231,18 @@ impl DimSlamCore {
                         f64::INFINITY
                     },
                 ));
-                (
+                let mut setup = ImuSetup::new(
                     measurement,
                     [imu.gyro_bias_random_walk, imu.accel_bias_random_walk],
-                )
+                );
+                setup.densities = [
+                    imu.gyro_noise_density,
+                    imu.accel_noise_density,
+                    imu.gyro_random_walk,
+                    imu.accel_random_walk,
+                ];
+                setup.rate_samples = imu.init_samples;
+                setup
             })
             .collect();
         let mut sources: Vec<SourceState> = config
@@ -200,15 +265,15 @@ impl DimSlamCore {
         });
         Ok(Self {
             visual_odometry,
-            odometry: Box::new(LioOdometry::new(
-                lio,
-                imus,
-                config
-                    .lidars
-                    .iter()
-                    .map(|lidar| lidar.point_variance)
-                    .collect(),
-            )),
+            odometry: Box::new(LioOdometry::new(lio, imus, config.lidars.clone())),
+            standard_gravity: config.standard_gravity,
+            max_position_m: config.max_position_m,
+            publish_every: config.publish_every.max(1),
+            produced: 0,
+            deskew_frame_id: match config.deskew.frame {
+                DeskewFrame::Output => config.output_frame_id.clone(),
+                DeskewFrame::Odom => config.odom_frame_id.clone(),
+            },
             output_frame_id: config.output_frame_id,
             odom_frame_id: config.odom_frame_id,
             imu_time_offsets: config.imus.iter().map(|imu| imu.time_offset_s).collect(),
@@ -260,8 +325,12 @@ impl DimSlamCore {
         let Some(estimate) = tracked.filter(|e| e.timestamp_ns != 0) else {
             return;
         };
-        let visual = self.sources.len() - 1;
-        let mut variances = self.sources[visual].config.pose_variances;
+        let Some(visual) = self.sources.len().checked_sub(1) else {
+            return;
+        };
+        let Some(mut variances) = self.sources.get(visual).map(|s| s.config.pose_variances) else {
+            return;
+        };
         if self.mono {
             variances[..3].fill(0.0);
         }
@@ -286,7 +355,7 @@ impl DimSlamCore {
     pub fn handle_imu(&mut self, sample: &ImuSample, tf: &dyn TfLookup) {
         let Some(imu) = self.imus.iter().position(|frame| *frame == sample.frame_id) else {
             warn_throttled!(
-                std::time::Duration::from_secs(10),
+                key = (&sample.frame_id,);
                 imu_frame = %sample.frame_id,
                 "imu dropped: its frame is not in `imus`",
             );
@@ -298,11 +367,12 @@ impl DimSlamCore {
             };
             self.odometry.set_imu_mount(imu, mount.0, mount.1);
         }
+        let offset = self.imu_time_offsets.get(imu).copied().unwrap_or_default();
         self.odometry.push_imu(
             imu,
-            header_seconds(sample.timestamp_ns) + self.imu_time_offsets[imu],
+            header_seconds(sample.timestamp_ns) + offset,
             sample.angular_velocity,
-            sample.linear_acceleration / STANDARD_GRAVITY,
+            sample.linear_acceleration / self.standard_gravity,
         );
         self.drain();
     }
@@ -311,7 +381,7 @@ impl DimSlamCore {
     pub fn handle_cloud(&mut self, scan: &LidarScan, tf: &dyn TfLookup) {
         let Some(lidar) = self.lidars.iter().position(|frame| *frame == scan.frame_id) else {
             warn_throttled!(
-                std::time::Duration::from_secs(10),
+                key = (&scan.frame_id,);
                 lidar_frame = %scan.frame_id,
                 "scan dropped: its frame is not in `lidars`",
             );
@@ -334,7 +404,7 @@ impl DimSlamCore {
                 && source.config.child_frame_id == msg.child_frame_id
         }) else {
             warn_throttled!(
-                std::time::Duration::from_secs(10),
+                key = (&msg.frame_id, &msg.child_frame_id);
                 parent = %msg.frame_id,
                 child = %msg.child_frame_id,
                 "odometry dropped: no `odom_sources` entry carries this transform",
@@ -343,7 +413,7 @@ impl DimSlamCore {
         };
         let Some(child_from_output) = self.placed(&msg.child_frame_id, tf) else {
             warn_throttled!(
-                std::time::Duration::from_secs(10),
+                key = (&msg.child_frame_id, &self.output_frame_id);
                 child_frame = %msg.child_frame_id,
                 output_frame = %self.output_frame_id,
                 "odometry dropped: tf does not place its frame relative to the output frame",
@@ -411,7 +481,7 @@ impl DimSlamCore {
     fn mount(&self, frame: &str, tf: &dyn TfLookup) -> Option<(Matrix3<f64>, Vector3<f64>)> {
         let Some(output_from_frame) = self.placed(frame, tf).map(|t| t.inverse()) else {
             warn_throttled!(
-                std::time::Duration::from_secs(10),
+                key = (&frame, &self.output_frame_id);
                 frame = %frame,
                 output_frame = %self.output_frame_id,
                 "sensor dropped until tf places its frame relative to the output frame",
@@ -561,8 +631,41 @@ impl DimSlamCore {
     fn drain(&mut self) {
         while let Some(published) = self.odometry.step() {
             let Some(pose) = published else { continue };
+            self.produced += 1;
+            if !self.produced.is_multiple_of(u64::from(self.publish_every)) {
+                continue;
+            }
+            let distance = pose.position.norm();
+            // a NaN distance (a diverged filter) is not published either
+            if self.max_position_m > 0.0 && (distance.is_nan() || distance > self.max_position_m) {
+                warn_throttled!(
+                    distance_m = distance,
+                    max_position_m = self.max_position_m,
+                    "pose not published: the filter has run past max_position_m and likely \
+                     diverged. Check max_position_m and the sensors' variances.",
+                );
+                continue;
+            }
             self.newest = Some(estimate(&pose, &self.odom_frame_id, &self.output_frame_id));
         }
+    }
+
+    /// Each scan deskewed since the last call (with `deskew.enabled`), oldest first.
+    pub fn take_deskewed(&mut self) -> Vec<DeskewedCloud> {
+        let scans: Vec<DeskewedScan> = self.odometry.take_deskewed().collect();
+        scans
+            .into_iter()
+            .map(|scan| DeskewedCloud {
+                cloud: PointCloud {
+                    timestamp_ns: (scan.stamp * 1e9).round() as i64,
+                    frame_id: self.deskew_frame_id.clone(),
+                    points: scan.points.iter().map(|p| p.position).collect(),
+                },
+                intensities: scan.points.iter().map(|p| p.reflectivity).collect(),
+                lidar: scan.lidar,
+                lidar_frame_id: self.lidars.get(scan.lidar).cloned().unwrap_or_default(),
+            })
+            .collect()
     }
 }
 

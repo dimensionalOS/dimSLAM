@@ -7,9 +7,6 @@
 
 use super::scan_points::SurfacePoint;
 
-/// Points each plane is fitted through.
-pub const PLANE_POINTS: usize = 5;
-
 /// Lengths of the runs of equal time in a time-ordered scan: each run is one update.
 pub fn time_runs(points: &[SurfacePoint]) -> Vec<usize> {
     let mut runs = Vec::with_capacity(points.len());
@@ -25,19 +22,27 @@ pub fn time_runs(points: &[SurfacePoint]) -> Vec<usize> {
     runs
 }
 
-/// The unit-normal plane `[a, b, c, d]` (a x + b y + c z + d = 0) through the first
-/// `PLANE_POINTS` of `points`, or `None` when any of them lies farther than `tolerance` from it.
+/// The unit-normal plane `[a, b, c, d]` (a x + b y + c z + d = 0) through `points` (Point-LIO
+/// fits a point's five map neighbors), or `None` when there are fewer than three, the fit is
+/// degenerate, or any of them lies farther than `tolerance` from it.
 pub fn fit_plane(points: &[SurfacePoint], tolerance: f32) -> Option<[f32; 4]> {
-    let mut columns = [[0f32; PLANE_POINTS]; 3];
-    for (row, p) in points[..PLANE_POINTS].iter().enumerate() {
+    let n = points.len();
+    if n < 3 {
+        return None;
+    }
+    let mut columns = vec![vec![0f32; n]; 3];
+    for (row, p) in points.iter().enumerate() {
         for (column, value) in columns.iter_mut().zip(p.position) {
             column[row] = value;
         }
     }
-    let solution = least_squares(&mut columns, [-1.0; PLANE_POINTS]);
+    let solution = least_squares(&mut columns, vec![-1.0; n]);
     let length = (solution[0] * solution[0]
         + (solution[1] * solution[1] + solution[2] * solution[2]))
         .sqrt();
+    if !(length.is_finite() && length > 0.0) {
+        return None;
+    }
     let plane = [
         solution[0] / length,
         solution[1] / length,
@@ -48,7 +53,7 @@ pub fn fit_plane(points: &[SurfacePoint], tolerance: f32) -> Option<[f32; 4]> {
         (plane[0] * p.position[0] + plane[1] * p.position[1] + plane[2] * p.position[2] + plane[3])
             .abs()
     };
-    if points[..PLANE_POINTS].iter().any(|p| off(p) > tolerance) {
+    if points.iter().any(|p| off(p) > tolerance) {
         return None;
     }
     Some(plane)
@@ -59,8 +64,14 @@ fn square(x: f32) -> f32 {
 }
 
 /// A five-vector's length, summed as one four-wide packet then the last element.
-fn length5(v: &[f32; PLANE_POINTS]) -> f32 {
-    ((v[0] * v[0] + v[2] * v[2]) + (v[1] * v[1] + v[3] * v[3]) + v[4] * v[4]).sqrt()
+/// A column's length, for 5 rows summed in the order Eigen's packets sum them (so Point-LIO's
+/// fit is matched to the bit), any other length in order.
+fn column_length(v: &[f32]) -> f32 {
+    if let [a, b, c, d, e] = v {
+        ((a * a + c * c) + (b * b + d * d) + e * e).sqrt()
+    } else {
+        v.iter().fold(0.0f32, |sum, x| sum + x * x).sqrt()
+    }
 }
 
 /// Sum of products: a four-wide packet when there are exactly four, else in order.
@@ -109,20 +120,21 @@ fn reflect(column: &mut [f32], essential: &[f32], tau: f32) {
 }
 
 /// argmin |A x - b| for a 5x3 `columns` (overwritten by its factorization).
-fn least_squares(columns: &mut [[f32; PLANE_POINTS]; 3], mut b: [f32; PLANE_POINTS]) -> [f32; 3] {
+fn least_squares(columns: &mut [Vec<f32>], mut b: Vec<f32>) -> [f32; 3] {
+    let rows = b.len();
     let eps = f32::EPSILON;
     let mut taus = [0f32; 3];
     let mut swaps = [0usize; 3];
     let mut exact = [0f32; 3];
     let mut running = [0f32; 3];
     for k in 0..3 {
-        exact[k] = length5(&columns[k]);
+        exact[k] = column_length(&columns[k]);
         running[k] = exact[k];
     }
     let largest = running
         .iter()
         .fold(running[0], |m, &v| if m < v { v } else { m });
-    let negligible = square(largest * eps) / PLANE_POINTS as f32;
+    let negligible = square(largest * eps) / rows as f32;
     let recompute_below = eps.sqrt();
     let mut rank = 3;
     for k in 0..3 {
@@ -133,7 +145,7 @@ fn least_squares(columns: &mut [[f32; PLANE_POINTS]; 3], mut b: [f32; PLANE_POIN
                 pivot = j;
             }
         }
-        if rank == 3 && square(best) < negligible * (PLANE_POINTS - k) as f32 {
+        if rank == 3 && square(best) < negligible * (rows - k) as f32 {
             rank = k;
         }
         swaps[k] = pivot;
@@ -145,11 +157,9 @@ fn least_squares(columns: &mut [[f32; PLANE_POINTS]; 3], mut b: [f32; PLANE_POIN
         let (tau, beta) = reflector(&mut columns[k][k..]);
         taus[k] = tau;
         columns[k][k] = beta;
-        let mut essential = [0f32; PLANE_POINTS];
-        essential[..PLANE_POINTS - k - 1].copy_from_slice(&columns[k][k + 1..]);
-        let essential = &essential[..PLANE_POINTS - k - 1];
+        let essential = columns[k][k + 1..].to_vec();
         for column in columns.iter_mut().skip(k + 1) {
-            reflect(&mut column[k..], essential, tau);
+            reflect(&mut column[k..], &essential, tau);
         }
         // Shrink the remaining columns' norms by what this row took, recomputing when the
         // shrinking has lost too much precision.

@@ -44,6 +44,8 @@
 //! assert!((estimate.pose.translation.x - 0.5).abs() < 0.05);
 //! ```
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
 pub mod cuvslam_odometry;
 pub mod dim_slam_core;
 #[doc(hidden)]
@@ -52,8 +54,11 @@ pub mod odometry_fusion;
 pub mod types;
 
 pub use cuvslam_odometry::{CameraConfig, CuvslamCore, CuvslamOdometryConfig};
-pub use dim_slam_core::{DimSlamCore, DimSlamCoreConfig};
-pub use odometry_fusion::{ImuConfig, LidarConfig, ProcessNoise, SourceConfig, SourceKind};
+pub use dim_slam_core::{DeskewedCloud, DimSlamCore, DimSlamCoreConfig};
+pub use odometry_fusion::{
+    DeskewConfig, DeskewFrame, ImuConfig, InitialStds, LidarConfig, MapConfig, ProcessNoise,
+    SourceConfig, SourceKind,
+};
 pub use types::{
     CameraModel, ImageFrame, ImuNoiseModel, ImuSample, LidarScan, OdometryEstimate, PointCloud, TfLookup,
     Twist,

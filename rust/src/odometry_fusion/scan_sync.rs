@@ -13,12 +13,26 @@ use nalgebra::{Matrix3, Vector3};
 
 use super::scan_points::SurfacePoint;
 
-/// m/s^2 per g, as IMU drivers convert.
-pub const STANDARD_GRAVITY: f64 = 9.80665;
-/// m/s^2: the gravity the levelled world frame holds.
-const WORLD_GRAVITY: f64 = 9.81;
-/// The running mean is trusted once it has counted past this many samples.
-const LEVEL_SAMPLES: i32 = 100;
+/// How the filter is levelled from its first IMU.
+#[derive(Clone, Copy, Debug)]
+pub struct LevelConfig {
+    /// m/s^2: the gravity the levelled world frame holds.
+    pub gravity: f64,
+    /// The running mean is trusted once it has counted past this many samples.
+    pub samples: u32,
+    /// rad/s: a sample turning faster restarts levelling; 0 never restarts.
+    pub gyro_limit: f64,
+}
+
+impl Default for LevelConfig {
+    fn default() -> Self {
+        Self {
+            gravity: 9.81,
+            samples: 100,
+            gyro_limit: 0.0,
+        }
+    }
+}
 
 /// One IMU sample: seconds as ROS stamps them, rad/s and g.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -57,6 +71,8 @@ struct LidarTiming {
     /// s: mean begin-to-begin interval.
     mean_period: f64,
     newest_begin: f64,
+    /// Its own periods it may run quiet before another lidar's scan goes on without it.
+    max_wait_periods: f64,
 }
 
 impl LidarTiming {
@@ -64,7 +80,8 @@ impl LidarTiming {
     /// it: scans share their path to the filter, so a delay on it holds them all back alike,
     /// while IMU samples (small, on their own path) can run far ahead of every scan.
     fn overdue(&self, newest_scan_begin: f64) -> bool {
-        self.scans >= 2 && newest_scan_begin > self.newest_end + 2.0 * self.mean_period
+        self.scans >= 2
+            && newest_scan_begin > self.newest_end + self.max_wait_periods * self.mean_period
     }
 }
 
@@ -102,9 +119,10 @@ pub struct ScanSync {
     batch: Vec<StampedImu>,
     mean_accel: Vector3<f64>,
     mean_gyro: Vector3<f64>,
-    counted: i32,
+    counted: u64,
     started: bool,
     levelled: bool,
+    level_config: LevelConfig,
     /// The samples bracketing the scan start once levelled.
     pub imu_before: StampedImu,
     pub imu_after: StampedImu,
@@ -112,12 +130,39 @@ pub struct ScanSync {
 
 impl ScanSync {
     pub fn new(inertial: bool) -> Self {
+        Self::with_level(inertial, LevelConfig::default())
+    }
+
+    pub fn with_level(inertial: bool, level_config: LevelConfig) -> Self {
         Self {
             mean_accel: Vector3::new(0.0, 0.0, -1.0),
             counted: 1,
             inertial,
             levelled: !inertial,
+            level_config,
             ..Self::default()
+        }
+    }
+
+    /// How many of its own scan periods a lidar may run quiet before the others go on without
+    /// it (each lidar's own, by index; unset lidars wait 2 periods).
+    pub fn set_max_wait_periods(&mut self, lidar: usize, periods: f64) {
+        self.ensure_lidar(lidar);
+        if let Some(timing) = self.timing.get_mut(lidar) {
+            timing.max_wait_periods = periods;
+        }
+    }
+
+    fn ensure_lidar(&mut self, lidar: usize) {
+        if self.scans.len() <= lidar {
+            self.scans.resize_with(lidar + 1, VecDeque::new);
+            self.timing.resize(
+                lidar + 1,
+                LidarTiming {
+                    max_wait_periods: 2.0,
+                    ..LidarTiming::default()
+                },
+            );
         }
     }
 
@@ -141,12 +186,11 @@ impl ScanSync {
 
     /// `start_ns` the scan's stamp; a lidar's scans older than its newest are dropped.
     pub fn push_scan(&mut self, lidar: usize, start_ns: u64, points: Vec<SurfacePoint>) {
-        if self.scans.len() <= lidar {
-            self.scans.resize_with(lidar + 1, VecDeque::new);
-            self.timing.resize(lidar + 1, LidarTiming::default());
-        }
+        self.ensure_lidar(lidar);
         let stamp = ros_seconds(start_ns as f64 / 1e9);
-        let timing = &mut self.timing[lidar];
+        let Some(timing) = self.timing.get_mut(lidar) else {
+            return;
+        };
         if timing.scans > 0 && stamp < timing.newest_begin {
             return;
         }
@@ -158,7 +202,9 @@ impl ScanSync {
         timing.scans += 1;
         timing.newest_begin = stamp;
         timing.newest_end = timing.newest_end.max(end);
-        self.scans[lidar].push_back((stamp, points));
+        if let Some(queue) = self.scans.get_mut(lidar) {
+            queue.push_back((stamp, points));
+        }
     }
 
     /// The map has its first points: from here the filter takes the samples itself.
@@ -172,9 +218,12 @@ impl ScanSync {
 
     /// The lidar whose oldest pending scan began first.
     fn head(&self) -> Option<usize> {
-        (0..self.scans.len())
-            .filter(|&l| !self.scans[l].is_empty())
-            .min_by(|&a, &b| self.scans[a][0].0.total_cmp(&self.scans[b][0].0))
+        self.scans
+            .iter()
+            .enumerate()
+            .filter_map(|(l, queue)| queue.front().map(|(begin, _)| (l, *begin)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(l, _)| l)
     }
 
     /// The next scan whose samples have all arrived, if any. A scan before levelling comes
@@ -184,15 +233,21 @@ impl ScanSync {
         if self.inertial && self.imus.is_empty() {
             return None;
         }
-        if self.taken.is_none() {
-            let (begin, points) = &self.scans[lead][0];
-            if points.is_empty() {
-                self.scans[lead].pop_front();
-                return None;
+        let end = match self.taken {
+            Some(end) => end,
+            None => {
+                let (begin, points) = self.scans.get(lead)?.front()?;
+                if points.is_empty() {
+                    if let Some(queue) = self.scans.get_mut(lead) {
+                        queue.pop_front();
+                    }
+                    return None;
+                }
+                let end = begin + latest_ms(points) as f64 / 1000.0;
+                self.taken = Some(end);
+                end
             }
-            self.taken = Some(begin + latest_ms(points) as f64 / 1000.0);
-        }
-        let end = self.taken.expect("taken above");
+        };
         let newest_scan_begin = self
             .timing
             .iter()
@@ -202,8 +257,7 @@ impl ScanSync {
             return None;
         }
         // Another lidar may still deliver a scan that began before this one ended.
-        let waiting = (0..self.scans.len()).any(|l| {
-            let timing = &self.timing[l];
+        let waiting = self.timing.iter().enumerate().any(|(l, timing)| {
             l != lead
                 && timing.scans >= 2
                 && timing.newest_begin + timing.mean_period < end
@@ -213,33 +267,40 @@ impl ScanSync {
             return None;
         }
         if self.inertial && (!self.levelled || !self.map_ready) {
-            let mut stamp = self.imus[0].stamp;
-            while !self.imus.is_empty() && stamp < end {
-                stamp = self.imus[0].stamp;
+            let mut stamp = self.imus.front().map_or(end, |s| s.stamp);
+            while stamp < end {
+                let Some(front) = self.imus.front() else {
+                    break;
+                };
+                stamp = front.stamp;
                 if stamp > end {
                     break;
                 }
-                let sample = self.imus.pop_front().expect("checked non-empty");
+                let Some(sample) = self.imus.pop_front() else {
+                    break;
+                };
                 self.batch.push(sample);
                 self.imu_before = self.imu_after;
                 self.imu_after = sample;
             }
         }
-        let (begin, points) = self.scans[lead].pop_front().expect("checked non-empty");
+        let (begin, points) = self.scans.get_mut(lead)?.pop_front()?;
         self.taken = None;
         let mut parts = vec![(lead, points)];
-        for l in 0..self.scans.len() {
-            while l != lead && self.scans[l].front().is_some_and(|(b, _)| *b < end) {
-                // Another lidar's points up to this scan's end join it; the rest wait for the
-                // next one, so overlapping lidars never hand the filter a point it has passed.
-                let (other_begin, queued) = self.scans[l].front_mut().expect("checked");
+        for (l, queue) in self.scans.iter_mut().enumerate() {
+            if l == lead {
+                continue;
+            }
+            // Another lidar's points up to this scan's end join it; the rest wait for the
+            // next one, so overlapping lidars never hand the filter a point it has passed.
+            while let Some((other_begin, queued)) = queue.front_mut().filter(|(b, _)| *b < end) {
                 let other_begin = *other_begin;
                 let cut = ((end - other_begin) * 1000.0) as f32;
                 let (mut points, later): (Vec<_>, Vec<_>) =
                     queued.drain(..).partition(|p| p.time_ms <= cut);
                 let whole = later.is_empty();
                 if whole {
-                    self.scans[l].pop_front();
+                    queue.pop_front();
                 } else {
                     *queued = later;
                 }
@@ -286,11 +347,19 @@ impl ScanSync {
         if self.levelled || self.batch.is_empty() {
             return None;
         }
+        let limit = self.level_config.gyro_limit;
+        if limit > 0.0 && self.batch.iter().any(|sample| sample.gyro.norm() > limit) {
+            // the body turned: start again from the samples that follow
+            self.batch.clear();
+            self.started = false;
+            return None;
+        }
         if !self.started {
+            let first = self.batch.first()?;
             self.started = true;
             self.counted = 1;
-            self.mean_accel = self.batch[0].accel_g;
-            self.mean_gyro = self.batch[0].gyro;
+            self.mean_accel = first.accel_g;
+            self.mean_gyro = first.gyro;
         }
         for sample in &self.batch {
             let n = self.counted as f64;
@@ -298,7 +367,7 @@ impl ScanSync {
             self.mean_gyro += (sample.gyro - self.mean_gyro) / n;
             self.counted += 1;
         }
-        if self.counted <= LEVEL_SAMPLES {
+        if self.counted <= u64::from(self.level_config.samples) {
             return None;
         }
         self.levelled = true;
@@ -309,8 +378,9 @@ impl ScanSync {
             self.imu_before = self.imu_after;
             self.imu_after = next;
         }
-        let measured = (-1.0 * self.mean_accel) * WORLD_GRAVITY / 1.0;
-        let gravity = Vector3::new(0.0, 0.0, -WORLD_GRAVITY);
+        let world_gravity = self.level_config.gravity;
+        let measured = (-1.0 * self.mean_accel) * world_gravity / 1.0;
+        let gravity = Vector3::new(0.0, 0.0, -world_gravity);
         let rotation = rotation_onto(&measured, &gravity);
         Some(Level {
             rotation,
@@ -398,7 +468,7 @@ mod tests {
         let level = level.expect("levelled");
         let up = level.rotation * tilted;
         assert!((up - Vector3::z()).norm() < 1e-12, "{up}");
-        assert_eq!(level.gravity, Vector3::new(0.0, 0.0, -WORLD_GRAVITY));
+        assert_eq!(level.gravity, Vector3::new(0.0, 0.0, -LevelConfig::default().gravity));
     }
 
     #[test]

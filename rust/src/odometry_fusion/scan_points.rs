@@ -20,8 +20,14 @@ pub struct SurfacePoint {
 /// compared stage by stage: points whose tag marks a low-confidence return are skipped (a
 /// scan without tags has none), every `keep_every`th of the rest is kept, and of those, the
 /// ones nearer than `min_range` or repeating the scan's previous point (a point not kept there
-/// counts as the origin) are dropped. The scan's first point is never used.
-pub fn surface_points(scan: &LidarScan, min_range: f64, keep_every: u32) -> Vec<SurfacePoint> {
+/// counts as the origin; repeating means within `duplicate_tolerance` m on every axis) are
+/// dropped. The scan's first point is never used.
+pub fn surface_points(
+    scan: &LidarScan,
+    min_range: f64,
+    keep_every: u32,
+    duplicate_tolerance: f64,
+) -> Vec<SurfacePoint> {
     let n = scan.points.len();
     let tagged = scan.tags.len() == n;
     let timed = scan.offsets_ns.len() == n;
@@ -46,7 +52,7 @@ pub fn surface_points(scan: &LidarScan, min_range: f64, keep_every: u32) -> Vec<
             continue;
         }
         let previous = kept[i - 1];
-        if (0..3).any(|axis| (p[axis] - previous[axis]).abs() as f64 > 1e-7) {
+        if (0..3).any(|axis| (p[axis] - previous[axis]).abs() as f64 > duplicate_tolerance) {
             let offset = if timed { scan.offsets_ns[i] } else { 0 };
             let reflectivity = if lit {
                 f32::from((scan.intensities[i] * 255.0).round() as u16)
@@ -156,7 +162,7 @@ mod tests {
             (0..10).map(|i| i * 1_500_000).collect(),
         );
         scan.tags = vec![0, 0x10, 0x20, 0, 0, 0, 0, 0, 0, 0];
-        let kept = surface_points(&scan, 0.5, 2);
+        let kept = surface_points(&scan, 0.5, 2, 1e-7);
         assert_eq!(
             kept,
             vec![
@@ -173,7 +179,7 @@ mod tests {
             ]
         );
         // Kept twice in a row: the repeat is dropped.
-        let kept = surface_points(&scan, 0.5, 1);
+        let kept = surface_points(&scan, 0.5, 1, 1e-7);
         assert_eq!(kept.iter().filter(|p| p.position[0] == 7.0).count(), 1);
     }
 

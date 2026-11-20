@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use dim_slam::nalgebra::{Isometry3, Quaternion, Translation3, UnitQuaternion, Vector3};
 use dim_slam::nalgebra::Matrix3;
-use dim_slam::odometry_fusion::lio_odometry::{point_lio_imu, LioConfig, LioOdometry};
-use dim_slam::odometry_fusion::{header_seconds, STANDARD_GRAVITY};
+use dim_slam::odometry_fusion::lio_odometry::{point_lio_imu, ImuSetup, LioConfig, LioOdometry};
+use dim_slam::odometry_fusion::{header_seconds, LidarConfig};
 use dim_slam::{DimSlamCore, DimSlamCoreConfig, ImuSample, LidarScan, OdometryEstimate, TfLookup};
 
 use crate::db::Recording;
@@ -75,7 +75,7 @@ impl Core {
                 0,
                 header_seconds(sample.timestamp_ns),
                 sample.angular_velocity,
-                sample.linear_acceleration / STANDARD_GRAVITY,
+                sample.linear_acceleration / DimSlamCoreConfig::default().standard_gravity,
             );
         }
     }
@@ -212,8 +212,11 @@ pub fn run(scenario: &Scenario, variant: &str, options: &ReplayOptions) -> Resul
             }
             let lio = LioConfig::default();
             let walks = [lio.process[3], lio.process[4]];
-            let point_variance = lio.lidar.point_variance;
-            let mut odometry = LioOdometry::new(lio, vec![(imu, walks)], vec![point_variance]);
+            let mut odometry = LioOdometry::new(
+                lio,
+                vec![ImuSetup::new(imu, walks)],
+                vec![LidarConfig::default()],
+            );
             odometry.set_imu_mount(0, Matrix3::identity(), Vector3::zeros());
             (Core::Lio(Box::new(odometry), frame.clone()), frame)
         }

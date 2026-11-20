@@ -9,7 +9,6 @@ mod msg_convert;
 
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
-use std::time::Duration;
 
 use nalgebra::{Isometry3, Matrix3, Matrix6};
 use serde::{Deserialize, Serialize};
@@ -25,7 +24,6 @@ use crate::{error_throttled, warn_throttled};
 use cu_vslam_rs::{ffi, CameraParams, ImageRef, Tracker};
 
 /// cuVSLAM's Track() contract asks for stereo stamps within 1 ms.
-const MAX_PAIR_SKEW_NS: i64 = 1_000_000;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -109,11 +107,13 @@ fn depth_to_meters(depth: &ImageFrame, units: f64, out: &mut Vec<u8>) {
         let row = &depth.data[y * step..];
         for x in 0..width {
             let raw = if source_is_float {
-                let bytes = &row[x * 4..x * 4 + 4];
-                f32::from_le_bytes(bytes.try_into().expect("4 bytes")) as f64
+                row.get(x * 4..x * 4 + 4)
+                    .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                    .map_or(0.0, |bytes| f32::from_le_bytes(bytes) as f64)
             } else {
-                let bytes = &row[x * 2..x * 2 + 2];
-                f64::from(u16::from_le_bytes(bytes.try_into().expect("2 bytes")))
+                row.get(x * 2..x * 2 + 2)
+                    .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
+                    .map_or(0.0, |bytes| f64::from(u16::from_le_bytes(bytes)))
             };
             out.extend_from_slice(&((raw / units) as f32).to_le_bytes());
         }
@@ -211,7 +211,7 @@ pub struct CuvslamOdometryConfig {
     pub speed_gate_max_angular: f64,
     /// cuVSLAM's Inertial mode: stereo plus one IMU, whose noise model `handle_imu_info` supplies.
     pub enable_imu: bool,
-    /// Stamp spread one frame set may span, milliseconds; 0 keeps cuVSLAM's 1 ms contract.
+    /// Stamp spread one frame set may span, milliseconds; the default is cuVSLAM's 1 ms contract.
     /// A software-triggered rig needs this widened: Spot's images land within ~15 ms of each
     /// other and its depth trails its camera by up to ~90 ms, so every set is dropped at 1 ms.
     pub max_skew_ms: f64,
@@ -232,7 +232,7 @@ impl Default for CuvslamOdometryConfig {
             speed_gate_max_linear: 0.0,
             speed_gate_max_angular: 0.0,
             enable_imu: false,
-            max_skew_ms: 0.0,
+            max_skew_ms: 1.0,
         }
     }
 }
@@ -274,13 +274,11 @@ fn take_frame_set(queues: &mut [VecDeque<ImageFrame>], limit: i64) -> Option<Vec
         Some((at, partners))
     })?;
     let positions: Vec<usize> = std::iter::once(at).chain(partners).collect();
-    Some(
-        queues
-            .iter_mut()
-            .zip(positions)
-            .map(|(queue, position)| queue.drain(..=position).next_back().expect("nonempty drain"))
-            .collect(),
-    )
+    queues
+        .iter_mut()
+        .zip(positions)
+        .map(|(queue, position)| queue.drain(..=position).next_back())
+        .collect()
 }
 
 struct RigCamera {
@@ -449,7 +447,7 @@ impl CuvslamCore {
             if frames.len() != rig_size {
                 if frames.len() > rig_size {
                     error_throttled!(
-                        Duration::from_secs(10),
+                        key = (&self.config.camera_mode,);
                         found = frames.join(", "),
                         mode = %self.config.camera_mode,
                         "cuvslam found more cameras on camera_info than camera_mode uses, \
@@ -517,7 +515,7 @@ impl CuvslamCore {
             .any(|camera| camera.frame_id == frame_id)
         {
             warn_throttled!(
-                Duration::from_secs(30),
+                key = (&frame_id,);
                 frame_id = %frame_id,
                 depth_units_per_meter = CameraConfig::default().depth_units_per_meter,
                 "cuvslam has no config for this depth frame_id, using defaults. Add a \
@@ -588,7 +586,7 @@ impl CuvslamCore {
         let Some(index) = self.camera_index(&img.frame_id) else {
             self.unplaced_images += 1;
             warn_throttled!(
-                Duration::from_secs(10),
+                key = (&img.frame_id,);
                 frame_id = %img.frame_id,
                 dropped = self.unplaced_images,
                 rig_cameras = self.cameras.len(),
@@ -607,11 +605,7 @@ impl CuvslamCore {
     /// Stereo stamps within this of each other are one frame set (cuVSLAM's Track() contract,
     /// unless the config widens it).
     fn skew_limit_ns(&self) -> i64 {
-        if self.config.max_skew_ms > 0.0 {
-            (self.config.max_skew_ms * 1.0e6).round() as i64
-        } else {
-            MAX_PAIR_SKEW_NS
-        }
+        (self.config.max_skew_ms.max(0.0) * 1.0e6).round() as i64
     }
 
     /// Fills each camera's `image` with the newest set of queued images whose stamps agree.
@@ -644,7 +638,6 @@ impl CuvslamCore {
         let expected_bytes = img.step as usize * img.height as usize;
         if img.step < img.width * pixel_bytes || img.data.len() < expected_bytes {
             warn_throttled!(
-                Duration::from_secs(10),
                 width = img.width,
                 height = img.height,
                 step = img.step,
@@ -658,7 +651,7 @@ impl CuvslamCore {
             let Some(index) = self.camera_index(&img.frame_id) else {
                 if !self.cameras.is_empty() {
                     warn_throttled!(
-                        Duration::from_secs(10),
+                        key = (&img.frame_id,);
                         frame_id = %img.frame_id,
                         "cuvslam dropping depth with a frame_id not on the rig. Multisensor \
                          depth must arrive aligned to its rig camera.",
@@ -668,7 +661,7 @@ impl CuvslamCore {
             };
             if !self.camera_config(&img.frame_id).provides_depth {
                 warn_throttled!(
-                    Duration::from_secs(10),
+                    key = (&img.frame_id,);
                     frame_id = %img.frame_id,
                     "cuvslam ignoring depth for a rig camera whose config does not set \
                      provides_depth. Mark it, or stop publishing that depth.",
@@ -737,14 +730,14 @@ impl CuvslamCore {
 
     /// cuVSLAM's RGBD contract needs depth pixel-aligned with the rig camera.
     fn align_depth(&mut self, tf: &dyn TfLookup) -> Option<DepthChoice> {
-        let depth = self.depth.as_ref().expect("checked by try_track");
-        let camera = &self.cameras[0];
+        let depth = self.depth.as_ref()?;
+        let camera = self.cameras.first()?;
         if depth.frame_id == camera.frame {
             return Some(DepthChoice::Passthrough);
         }
         let Some(depth_info) = self.depth_info.as_ref() else {
             warn_throttled!(
-                Duration::from_secs(10),
+                key = (&depth.frame_id, &camera.frame);
                 depth_frame = %depth.frame_id,
                 camera_frame = %camera.frame,
                 "cuvslam: depth is in another frame than the camera. Publish \
@@ -755,7 +748,7 @@ impl CuvslamCore {
         if self.camera_from_depth.is_none() {
             let Some(camera_from_depth) = tf.latest(&camera.frame, &depth.frame_id) else {
                 warn_throttled!(
-                    Duration::from_secs(10),
+                    key = (&depth.frame_id, &camera.frame);
                     depth_frame = %depth.frame_id,
                     camera_frame = %camera.frame,
                     "cuvslam: tf does not connect the depth frame to the camera. Publish \
@@ -776,7 +769,7 @@ impl CuvslamCore {
             depth,
             depth_info,
             &camera.info,
-            self.camera_from_depth.as_ref().expect("set above"),
+            self.camera_from_depth.as_ref()?,
             depth_units_per_meter,
             &mut aligned,
         );
@@ -796,7 +789,7 @@ impl CuvslamCore {
         }
         let Some(base_from_rig) = tf.latest(&self.config.output_frame_id, self.rig_frame()) else {
             warn_throttled!(
-                Duration::from_secs(10),
+                key = (&self.config.output_frame_id,);
                 rig_frame = self.rig_frame(),
                 output_frame_id = %self.config.output_frame_id,
                 "cuvslam: tf does not place the rig frame against output_frame_id. Publish \
@@ -839,7 +832,6 @@ impl CuvslamCore {
         if self.config.enable_imu {
             let Some(imu_model) = &self.imu_model else {
                 warn_throttled!(
-                    Duration::from_secs(10),
                     "cuvslam: enable_imu is on but no imu_info has arrived. Publish \
                      imu_info, or turn enable_imu off.",
                 );
@@ -848,7 +840,7 @@ impl CuvslamCore {
             let imu_frame = &imu_model.frame_id;
             let Some(rig_from_imu) = tf.latest(self.rig_frame(), imu_frame) else {
                 warn_throttled!(
-                    Duration::from_secs(10),
+                    key = (&imu_frame,);
                     imu_frame = %imu_frame,
                     "cuvslam: enable_imu is on but tf does not place the IMU. Publish the \
                      transform from the rig frame to it, or turn enable_imu off.",
@@ -883,9 +875,8 @@ impl CuvslamCore {
             let depth_frame = self
                 .depth
                 .as_ref()
-                .expect("checked by try_track")
-                .frame_id
-                .clone();
+                .map(|depth| depth.frame_id.clone())
+                .unwrap_or_default();
             tracker_config.rgbd_depth_scale_factor =
                 self.depth_config(&depth_frame).depth_units_per_meter as f32;
             // align_depth delivers in cameras[0]'s frame; the -1 default silently ignores depth.
@@ -989,15 +980,15 @@ impl CuvslamCore {
         let stamps: Vec<i64> = self
             .cameras
             .iter()
-            .map(|camera| camera.image.as_ref().expect("checked above").timestamp_ns)
+            .filter_map(|camera| camera.image.as_ref().map(|image| image.timestamp_ns))
             .collect();
-        let oldest = *stamps.iter().min().expect("nonempty");
-        let newest = *stamps.iter().max().expect("nonempty");
+        let (Some(&oldest), Some(&newest)) = (stamps.iter().min(), stamps.iter().max()) else {
+            return None;
+        };
         let skew_limit_ns = self.skew_limit_ns();
         if newest - oldest > skew_limit_ns {
             self.skew_rejects += 1;
             warn_throttled!(
-                Duration::from_secs(10),
                 rejected = self.skew_rejects,
                 skew_ms = (newest - oldest) as f64 / 1.0e6,
                 limit_ms = skew_limit_ns as f64 / 1.0e6,
@@ -1035,20 +1026,24 @@ impl CuvslamCore {
                     depth_meters,
                     ..
                 } = &mut self.cameras[index];
-                depth_to_meters(depth.as_ref().expect("filtered above"), units, depth_meters);
+                if let Some(depth) = depth.as_ref() {
+                    depth_to_meters(depth, units, depth_meters);
+                }
             }
         }
 
-        let vslam = self.vslam.as_mut().expect("checked above");
+        let vslam = self.vslam.as_mut()?;
         // A late sample can leave the deque unsorted, so drain from the front.
         while self
             .pending_imu
             .front()
             .is_some_and(|m| m.timestamp_ns <= newest)
         {
-            let measurement = self.pending_imu.pop_front().expect("checked above");
+            let Some(measurement) = self.pending_imu.pop_front() else {
+                break;
+            };
             if let Err(message) = vslam.register_imu(&measurement) {
-                warn_throttled!(Duration::from_secs(10), error = %message, "cuvslam rejected an IMU sample");
+                warn_throttled!(key = (&message,); error = %message, "cuvslam rejected an IMU sample");
             }
         }
 
@@ -1057,9 +1052,9 @@ impl CuvslamCore {
                 .cameras
                 .iter()
                 .enumerate()
-                .map(|(index, camera)| {
-                    let image = camera.image.as_ref().expect("checked above");
-                    ImageRef {
+                .filter_map(|(index, camera)| {
+                    let image = camera.image.as_ref()?;
+                    Some(ImageRef {
                         pixels: &image.data,
                         width: image.width,
                         height: image.height,
@@ -1067,14 +1062,14 @@ impl CuvslamCore {
                         data_type: ffi::CUV_DATA_UINT8,
                         timestamp_ns: newest,
                         camera_index: index as u32,
-                    }
+                    })
                 })
                 .collect();
             let mut depths: Vec<ImageRef> = depth_choice
                 .iter()
                 .map(|choice| {
                     let depth = match choice {
-                        DepthChoice::Passthrough => self.depth.as_ref().expect("checked above"),
+                        DepthChoice::Passthrough => self.depth.as_ref().unwrap_or(&self.aligned_depth),
                         DepthChoice::Aligned => &self.aligned_depth,
                     };
                     ImageRef {
@@ -1084,7 +1079,7 @@ impl CuvslamCore {
                         encoding: ffi::CUV_ENCODING_MONO,
                         data_type: ffi::CUV_DATA_UINT16,
                         timestamp_ns: newest,
-                        camera_index: images[0].camera_index,
+                        camera_index: images.first().map_or(0, |image| image.camera_index),
                     }
                 })
                 .collect();
@@ -1146,8 +1141,10 @@ impl CuvslamCore {
             return None;
         };
         // cuVSLAM tracks rig_frame(); the published pose is output_frame_id.
-        let base_from_rig = self.base_from_rig.expect("set with the tracker");
-        let rig_from_base = self.rig_from_base.expect("set with the tracker");
+        let (Some(base_from_rig), Some(rig_from_base)) = (self.base_from_rig, self.rig_from_base)
+        else {
+            return None;
+        };
         let raw_pose = base_from_rig * cuv_pose_to_isometry(&pose) * rig_from_base;
         // NaN, the tracker's unconstrained marker, survives the product and still trips the gate.
         self.covariance = self.covariance_adjoint
@@ -1175,7 +1172,6 @@ impl CuvslamCore {
             gate_frame = true;
             self.covariance_gated += 1;
             warn_throttled!(
-                Duration::from_secs(5),
                 translation_std,
                 gated = self.covariance_gated,
                 limit = self.config.covariance_gate_translation_std,
@@ -1199,7 +1195,6 @@ impl CuvslamCore {
                     gate_frame = true;
                     self.speed_gated += 1;
                     warn_throttled!(
-                        Duration::from_secs(5),
                         linear_mps = linear_speed,
                         angular_rps = angular_speed,
                         gated = self.speed_gated,
