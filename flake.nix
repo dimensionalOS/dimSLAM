@@ -4,7 +4,8 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    cu-vslam-rs.url = "github:jeff-hykin/cu_vslam_rs";
+    # alt_support: the line with the macOS CuMetal SDK and the CUDA-free sdk-cpu (main has neither).
+    cu-vslam-rs.url = "github:jeff-hykin/cu_vslam_rs/alt_support";
     cu-vslam-rs.inputs.nixpkgs.follows = "nixpkgs";
     cu-vslam-rs.inputs.flake-utils.follows = "flake-utils";
     crate2nix.url = "github:nix-community/crate2nix";
