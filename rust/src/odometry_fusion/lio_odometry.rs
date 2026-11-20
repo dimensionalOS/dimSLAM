@@ -624,6 +624,7 @@ impl LioOdometry {
             self.map_seed = Vec::new();
             self.map_ready = true;
             self.sync.set_map_ready();
+            self.filter.anchor_pose();
             return Some(None);
         }
         let blank = SurfacePoint {

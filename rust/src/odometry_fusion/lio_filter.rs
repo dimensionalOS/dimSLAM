@@ -371,6 +371,18 @@ pub struct ImuMeasurement {
 }
 
 impl LioFilter {
+    /// The map was just built from this pose, so relative to it the pose is exact: position and
+    /// rotation lose their uncertainty (and its correlation with every other state). Without
+    /// this the first scans could move the pose by Point-LIO's initial 0.1 m / 6 deg against a
+    /// map that defines it.
+    pub fn anchor_pose(&mut self) {
+        for i in 0..6 {
+            self.p.row_mut(i).fill(0.0);
+            self.p.column_mut(i).fill(0.0);
+            self.p_extra.row_mut(i).fill(0.0);
+        }
+    }
+
     /// One IMU sample (`gyro` rad/s, `accel` in the accelerometer's unit) as a measurement of
     /// the angular velocity and specific force, each read with its bias added.
     pub fn update_imu(&mut self, gyro: &Vector3<f64>, accel: &Vector3<f64>, m: &ImuMeasurement) {
